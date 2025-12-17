@@ -1,2 +1,2 @@
-# ngiml
-Noise-Guided Multi-Stage EfficientNet–Swin–UNet for Image Manipulation Localization
+# NGIML
+Noise-Guided Image Manipulation Localization
