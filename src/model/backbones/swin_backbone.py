@@ -1,0 +1,110 @@
+"""Swin-Tiny backbone for NGIML contextual feature extraction."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Sequence, Tuple
+
+import timm
+import torch
+from torch import nn, Tensor
+
+
+@dataclass
+class SwinBackboneConfig:
+    """Configuration for the Swin Transformer feature extractor."""
+
+    model_name: str = "swin_tiny_patch4_window7_224"
+    pretrained: bool = True
+    out_indices: Sequence[int] = (0, 1, 2, 3)
+
+
+class SwinBackbone(nn.Module):
+    """Thin wrapper around timm Swin Transformer with multi-scale outputs."""
+
+    def __init__(self, config: SwinBackboneConfig | None = None) -> None:
+        super().__init__()
+        cfg = config or SwinBackboneConfig()
+        self.model = timm.create_model(
+            cfg.model_name,
+            pretrained=cfg.pretrained,
+            features_only=True,
+            out_indices=cfg.out_indices,
+        )
+        self.out_channels: List[int] = list(self.model.feature_info.channels())
+        patch = getattr(self.model, "patch_embed", None)
+        if patch is None:
+            raise ValueError("Swin backbone missing patch_embed; ensure model_name is a Swin variant")
+        self.patch_embed = patch
+        if isinstance(self.patch_embed.patch_size, tuple):
+            self.patch_size: Tuple[int, int] = self.patch_embed.patch_size
+        else:
+            self.patch_size = (self.patch_embed.patch_size, self.patch_embed.patch_size)
+        self.stages: List[nn.Module] = [
+            module
+            for name, module in self.model.named_children()
+            if name.startswith("layers_")
+        ]
+        if not self.stages:
+            raise ValueError("Swin backbone structure unexpected; layers_* modules not found")
+
+    def _propagate_spatial_metadata(self, height: int, width: int) -> None:
+        if height % self.patch_size[0] != 0 or width % self.patch_size[1] != 0:
+            raise ValueError("Input spatial dims must be multiples of patch size")
+
+        grid_h = height // self.patch_size[0]
+        grid_w = width // self.patch_size[1]
+
+        if (height, width) != self.patch_embed.img_size:
+            self.patch_embed.img_size = (height, width)
+            self.patch_embed.grid_size = (grid_h, grid_w)
+            self.patch_embed.num_patches = grid_h * grid_w
+
+        for stage_idx, stage in enumerate(self.stages):
+            scale = 2 ** stage_idx
+            stage_res = (grid_h // scale, grid_w // scale)
+            stage.input_resolution = stage_res
+            blocks = getattr(stage, "blocks", [])
+            for block in blocks:
+                block.input_resolution = stage_res
+                if hasattr(block, "attn_mask"):
+                    device = None
+                    dtype = None
+                    if isinstance(block.attn_mask, torch.Tensor):
+                        device = block.attn_mask.device
+                        dtype = block.attn_mask.dtype
+                    block.attn_mask = block.get_attn_mask(device=device, dtype=dtype)
+
+    def _ensure_channels_first(self, features: List[Tensor]) -> List[Tensor]:
+        if len(features) != len(self.out_channels):
+            raise ValueError(
+                "Unexpected number of Swin feature maps; review out_indices configuration"
+            )
+
+        normalized: List[Tensor] = []
+        for idx, (feat, expected_ch) in enumerate(zip(features, self.out_channels)):
+            if feat.ndim != 4:
+                raise ValueError(
+                    f"Swin feature map {idx} must be 4D (NCHW), got shape {tuple(feat.shape)}"
+                )
+
+            if feat.shape[1] == expected_ch:
+                normalized.append(feat)
+                continue
+
+            if feat.shape[-1] == expected_ch:
+                normalized.append(feat.permute(0, 3, 1, 2).contiguous())
+                continue
+
+            raise ValueError(
+                f"Swin feature map {idx} reports {feat.shape[1]} channels but expected {expected_ch}"
+            )
+
+        return normalized
+
+    def forward(self, x: Tensor) -> List[Tensor]:
+        self._propagate_spatial_metadata(x.shape[-2], x.shape[-1])
+        features = self.model(x)
+        return self._ensure_channels_first(features)
+
+
+__all__ = ["SwinBackbone", "SwinBackboneConfig"]
