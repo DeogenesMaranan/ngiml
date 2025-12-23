@@ -3,6 +3,9 @@ from __future__ import annotations
 import io
 import json
 import tarfile
+import atexit
+from collections import OrderedDict
+import pandas as pd
 from bisect import bisect_right
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
@@ -16,6 +19,36 @@ from torchvision.transforms.functional import InterpolationMode
 from .config import AugmentationConfig, Manifest, SampleRecord
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".npz"}
+
+# Per-process LRU cache of open tar archives to avoid reopening on every sample.
+_TAR_CACHE_LIMIT = 8
+_TAR_CACHE: "OrderedDict[str, tarfile.TarFile]" = OrderedDict()
+
+
+def _close_all_tars() -> None:
+    while _TAR_CACHE:
+        _, tar = _TAR_CACHE.popitem(last=False)
+        try:
+            tar.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_all_tars)
+
+
+def _get_tarfile(archive_path: str) -> tarfile.TarFile:
+    tar = _TAR_CACHE.pop(archive_path, None)
+    if tar is None or tar.closed:
+        tar = tarfile.open(archive_path, "r:*")
+    _TAR_CACHE[archive_path] = tar
+    if len(_TAR_CACHE) > _TAR_CACHE_LIMIT:
+        _, old_tar = _TAR_CACHE.popitem(last=False)
+        try:
+            old_tar.close()
+        except Exception:
+            pass
+    return tar
 
 
 def _load_image(path: str) -> torch.Tensor:
@@ -95,11 +128,11 @@ def _load_from_tar_npz(tar_spec: str) -> tuple[torch.Tensor, torch.Tensor | None
     if "::" not in tar_spec:
         raise ValueError(f"Invalid tar npz spec: {tar_spec}")
     archive_path, member_name = tar_spec.split("::", 1)
-    with tarfile.open(archive_path, "r:*") as tar:
-        member = tar.extractfile(member_name)
-        if member is None:
-            raise FileNotFoundError(f"Missing member {member_name} in {archive_path}")
-        npz_bytes = member.read()
+    tar = _get_tarfile(archive_path)
+    member = tar.extractfile(member_name)
+    if member is None:
+        raise FileNotFoundError(f"Missing member {member_name} in {archive_path}")
+    npz_bytes = member.read()
     return _load_from_npz(io.BytesIO(npz_bytes))
 
 
@@ -118,15 +151,12 @@ class PerDatasetDataset(Dataset):
         self.samples = list(samples)
         self.aug_cfg = aug_cfg
         self.training = training
-        self.multiplier = (aug_cfg.copies_per_sample + 1) if (training and aug_cfg.enable) else 1
 
     def __len__(self) -> int:  # type: ignore[override]
-        return len(self.samples) * self.multiplier
+        return len(self.samples)
 
     def __getitem__(self, index: int) -> dict[str, object]:  # type: ignore[override]
-        base_idx = index // self.multiplier
-        aug_pass = index % self.multiplier
-        record = self.samples[base_idx]
+        record = self.samples[index]
 
         if "::" in record.image_path and record.image_path.endswith(".npz"):
             image, mask, high_pass = _load_from_tar_npz(record.image_path)
@@ -146,7 +176,6 @@ class PerDatasetDataset(Dataset):
             "mask": mask,
             "label": label,
             "dataset": record.dataset,
-            "aug_pass": aug_pass,
             "high_pass": high_pass,
         }
 
@@ -320,25 +349,35 @@ def _collate_builder(
             else:
                 collect_high_pass = False
             aug_cfg = per_dataset_aug.get(dataset_name, AugmentationConfig(enable=False))
+            views = aug_cfg.views_per_sample if aug_cfg.enable else 1
+            views = max(1, views)
 
-            should_aug = training and aug_cfg.enable and (sample.get("aug_pass", 0) != 0 or aug_cfg.copies_per_sample == 0)
-            if should_aug:
-                image, mask, high_pass = _apply_gpu_augmentations(
-                    image,
-                    mask,
-                    aug_cfg,
-                    high_pass=high_pass,
-                    generator=aug_generator,
-                )
+            base_image = image
+            base_mask = mask
+            base_high_pass = high_pass
 
-            image = _normalize(image, normalization_mode)
+            for _ in range(views):
+                view_image = base_image
+                view_mask = base_mask
+                view_high_pass = base_high_pass
 
-            images.append(image)
-            masks.append(mask)
-            labels.append(label)
-            datasets.append(dataset_name)
-            if collect_high_pass and high_pass is not None:
-                high_passes.append(high_pass)
+                if training and aug_cfg.enable:
+                    view_image, view_mask, view_high_pass = _apply_gpu_augmentations(
+                        view_image,
+                        view_mask,
+                        aug_cfg,
+                        high_pass=view_high_pass,
+                        generator=aug_generator,
+                    )
+
+                view_image = _normalize(view_image, normalization_mode)
+
+                images.append(view_image)
+                masks.append(view_mask)
+                labels.append(label)
+                datasets.append(dataset_name)
+                if collect_high_pass and view_high_pass is not None:
+                    high_passes.append(view_high_pass)
 
         batch_dict = {
             "images": torch.stack(images, dim=0),
@@ -365,6 +404,10 @@ def _group_by(split: str, samples: Iterable[SampleRecord]) -> Dict[str, list[Sam
 
 
 def load_manifest(path: str | Path) -> Manifest:
+    path = Path(path)
+    if path.suffix.lower() == ".parquet":
+        df = pd.read_parquet(path)
+        return Manifest.from_dataframe(df)
     with open(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
     return Manifest.from_dict(data)

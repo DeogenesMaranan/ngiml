@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+import pandas as pd
+
 
 @dataclass
 class DatasetStructureConfig:
@@ -49,7 +51,7 @@ class PreparationConfig:
 @dataclass
 class AugmentationConfig:
     enable: bool = True
-    copies_per_sample: int = 0
+    views_per_sample: int = 1
     enable_flips: bool = True
     enable_rotations: bool = True
     max_rotation_degrees: float = 0.0
@@ -105,8 +107,36 @@ class Manifest:
             "samples": [s.to_dict() for s in self.samples],
         }
 
+    def to_dataframe(self) -> "pd.DataFrame":  # quoted for forward reference
+        records = []
+        for s in self.samples:
+            row = s.to_dict()
+            row["normalization_mode"] = self.normalization_mode
+            records.append(row)
+        return pd.DataFrame(records)
+
     @staticmethod
     def from_dict(data: dict[str, object]) -> "Manifest":
         samples = [SampleRecord.from_dict(s) for s in data.get("samples", [])]
         normalization_mode = str(data.get("normalization_mode", "zero_one"))
         return Manifest(samples=samples, normalization_mode=normalization_mode)
+
+    @staticmethod
+    def from_dataframe(df: "pd.DataFrame") -> "Manifest":
+        if df.empty:
+            return Manifest(samples=[], normalization_mode="zero_one")
+        norm_mode = "zero_one"
+        if "normalization_mode" in df.columns:
+            norm_mode = str(df["normalization_mode"].iloc[0])
+        samples = [
+            SampleRecord(
+                dataset=str(row.dataset),
+                split=str(row.split),
+                image_path=str(row.image_path),
+                mask_path=str(row.mask_path) if pd.notna(row.mask_path) else None,
+                label=int(row.label),
+                high_pass_path=str(row.high_pass_path) if hasattr(row, "high_pass_path") and pd.notna(row.high_pass_path) else None,
+            )
+            for row in df.itertuples(index=False)
+        ]
+        return Manifest(samples=samples, normalization_mode=norm_mode)

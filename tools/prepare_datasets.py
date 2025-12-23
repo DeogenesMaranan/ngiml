@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import io
-import json
 import random
 import sys
 import tarfile
@@ -12,6 +11,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 from PIL import Image
 
 try:  # tqdm makes progress clearer; fall back to no-op if missing
@@ -242,8 +242,8 @@ def prepare_all(
 
     manifest = Manifest(samples=all_records, normalization_mode=prep_cfg.normalization_mode)
     manifest_out.parent.mkdir(parents=True, exist_ok=True)
-    with open(manifest_out, "w", encoding="utf-8") as handle:
-        json.dump(manifest.to_dict(), handle, indent=2)
+    df = manifest.to_dataframe()
+    df.to_parquet(manifest_out, index=False)
     return manifest
 
 
@@ -290,8 +290,8 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Prepare datasets and emit manifest.json")
-    parser.add_argument("--manifest", type=str, default=None, help="Output manifest path. Defaults to <prepared_root>/manifest.json")
+    parser = argparse.ArgumentParser(description="Prepare datasets and emit manifest.parquet")
+    parser.add_argument("--manifest", type=str, default=None, help="Output manifest path. Defaults to <prepared_root>/manifest.parquet")
     return parser.parse_args()
 
 
@@ -300,7 +300,7 @@ def main() -> None:
     datasets, per_dataset_splits, prep_cfg = build_default_configs()
 
     prepared_root = Path(datasets[0].prepared_root)
-    manifest_out = Path(args.manifest) if args.manifest else prepared_root / "manifest.json"
+    manifest_out = Path(args.manifest) if args.manifest else prepared_root / "manifest.parquet"
 
     manifest = prepare_all(datasets, per_dataset_splits, prep_cfg, manifest_out)
     print(f"Wrote manifest with {len(manifest.samples)} samples to {manifest_out}")

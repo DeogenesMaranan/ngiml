@@ -46,7 +46,7 @@ class TrainConfig:
     prefetch_factor: Optional[int] = None
     persistent_workers: bool = False
     drop_last: bool = True
-    copies_per_sample: int = 0
+    views_per_sample: int = 1
     max_rotation_degrees: float = 5.0
     noise_std_max: float = 0.02
     disable_aug: bool = False
@@ -89,7 +89,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--prefetch-factor", type=int, default=None, help="DataLoader prefetch factor")
     parser.add_argument("--persistent-workers", action="store_true", help="Enable persistent workers")
     parser.add_argument("--drop-last", action="store_true", help="Drop last incomplete batch in training")
-    parser.add_argument("--copies-per-sample", type=int, default=0, help="On-the-fly GPU aug copies per sample")
+    parser.add_argument("--views-per-sample", type=int, default=1, help="Number of augmented views per sample (on-the-fly)")
     parser.add_argument("--max-rotation-degrees", type=float, default=5.0, help="Random rotation range (+/-)")
     parser.add_argument("--noise-std-max", type=float, default=0.02, help="Max Gaussian noise std")
     parser.add_argument("--disable-aug", action="store_true", help="Disable GPU augmentations")
@@ -110,7 +110,7 @@ def parse_args() -> TrainConfig:
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
         drop_last=args.drop_last,
-        copies_per_sample=args.copies_per_sample,
+        views_per_sample=args.views_per_sample,
         max_rotation_degrees=args.max_rotation_degrees,
         noise_std_max=args.noise_std_max,
         disable_aug=args.disable_aug,
@@ -137,7 +137,7 @@ def _coerce_aug(value) -> AugmentationConfig:
 def _build_aug_map(names: Sequence[str], cfg: TrainConfig) -> Dict[str, AugmentationConfig]:
     base_aug = cfg.default_aug or AugmentationConfig(
         enable=not cfg.disable_aug,
-        copies_per_sample=cfg.copies_per_sample,
+        views_per_sample=cfg.views_per_sample,
         enable_flips=True,
         enable_rotations=cfg.max_rotation_degrees > 0,
         max_rotation_degrees=cfg.max_rotation_degrees,
