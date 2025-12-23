@@ -39,8 +39,8 @@ class SplitConfig:
 @dataclass
 class PreparationConfig:
     target_sizes: Sequence[int] = (320,)
-    normalization_mode: str = "zero_one"
-    compute_high_pass: bool = False
+    normalization_mode: str = "imagenet"
+    tar_shard_size: int = 0  # 0 disables tar sharding; otherwise samples per shard
 
     def target_size_set(self) -> set[int]:
         return {int(s) for s in self.target_sizes}

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import tarfile
 from bisect import bisect_right
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
@@ -36,7 +38,7 @@ def _load_mask(mask_path: str | None, target_hw: Sequence[int]) -> torch.Tensor:
     return mask
 
 
-def _load_from_npz(path: str) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+def _load_from_npz(path: str | io.BytesIO) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     data = np.load(path)
     image_np = data["image"]
     image = torch.from_numpy(image_np)
@@ -89,6 +91,18 @@ def _load_from_npz(path: str) -> tuple[torch.Tensor, torch.Tensor | None, torch.
     return image, mask, high_pass
 
 
+def _load_from_tar_npz(tar_spec: str) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    if "::" not in tar_spec:
+        raise ValueError(f"Invalid tar npz spec: {tar_spec}")
+    archive_path, member_name = tar_spec.split("::", 1)
+    with tarfile.open(archive_path, "r:*") as tar:
+        member = tar.extractfile(member_name)
+        if member is None:
+            raise FileNotFoundError(f"Missing member {member_name} in {archive_path}")
+        npz_bytes = member.read()
+    return _load_from_npz(io.BytesIO(npz_bytes))
+
+
 def torchvision_load_image(path: str, as_mask: bool = False) -> torch.Tensor:
     # Lazy import to avoid hard dependency at module import time.
     from torchvision.io import read_image
@@ -114,7 +128,9 @@ class PerDatasetDataset(Dataset):
         aug_pass = index % self.multiplier
         record = self.samples[base_idx]
 
-        if record.image_path.endswith(".npz"):
+        if "::" in record.image_path and record.image_path.endswith(".npz"):
+            image, mask, high_pass = _load_from_tar_npz(record.image_path)
+        elif record.image_path.endswith(".npz"):
             image, mask, high_pass = _load_from_npz(record.image_path)
             if mask is None:
                 mask = torch.zeros((1, image.shape[-2], image.shape[-1]), dtype=torch.float32)

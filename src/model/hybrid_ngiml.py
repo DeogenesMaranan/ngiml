@@ -84,7 +84,7 @@ class HybridNGIML(nn.Module):
         layout = {
             "low_level": self.efficientnet.out_channels,
             "context": self.swin.out_channels,
-            "residual": [3],
+            "residual": self.noise.out_channels,
         }
         self.num_stages = len(self.cfg.fusion.fusion_channels)
         branch_channels: Dict[str, List[int]] = {}
@@ -115,9 +115,6 @@ class HybridNGIML(nn.Module):
             "residual": residual,
         }
 
-    def _broadcast_residual(self, residual: Tensor) -> List[Tensor]:
-        return [residual for _ in range(self.num_stages)]
-
     def forward_features(
         self,
         x: Tensor,
@@ -130,7 +127,7 @@ class HybridNGIML(nn.Module):
         if self.cfg.use_context:
             fusion_inputs["context"] = backbone_feats["context"]
         if self.cfg.use_residual:
-            fusion_inputs["residual"] = self._broadcast_residual(backbone_feats["residual"])
+            fusion_inputs["residual"] = backbone_feats["residual"]
         return self.fusion(fusion_inputs, target_size=target_size)
 
     def forward(

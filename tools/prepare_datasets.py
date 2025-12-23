@@ -1,18 +1,71 @@
-"""Prepare datasets into a common manifest with optional resizing and high-pass exports."""
+"""Prepare datasets into a common manifest with optional resizing."""
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import random
+import sys
+import tarfile
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image
+
+try:  # tqdm makes progress clearer; fall back to no-op if missing
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - lightweight fallback
+    def tqdm(iterable: Iterable | None = None, total: int | None = None, desc: str | None = None, **_: object):
+        return iterable if iterable is not None else []
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))  # allow running as a script without installing the package
 
 from src.data.config import DatasetStructureConfig, Manifest, PreparationConfig, SampleRecord, SplitConfig
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+
+class TarShardWriter:
+    """Utility to write NPZ payloads into sequential tar shards."""
+
+    def __init__(self, out_root: Path, shard_size: int) -> None:
+        self.out_root = out_root
+        self.shard_size = max(1, shard_size)
+        self.shard_idx = 0
+        self.current: tarfile.TarFile | None = None
+        self.current_path: Path | None = None
+        self.count_in_shard = 0
+
+    def _start_new_shard(self) -> None:
+        self.out_root.mkdir(parents=True, exist_ok=True)
+        tar_path = self.out_root / f"shard_{self.shard_idx:05d}.tar"
+        self.shard_idx += 1
+        self.count_in_shard = 0
+        if self.current is not None:
+            self.current.close()
+        self.current = tarfile.open(tar_path, mode="w")
+        self.current_path = tar_path
+
+    def add(self, payload_bytes: bytes, member_name: str) -> tuple[str, str]:
+        if self.current is None or self.count_in_shard >= self.shard_size:
+            self._start_new_shard()
+        assert self.current is not None and self.current_path is not None
+        info = tarfile.TarInfo(name=member_name)
+        info.size = len(payload_bytes)
+        info.mtime = time.time()
+        self.current.addfile(info, io.BytesIO(payload_bytes))
+        self.count_in_shard += 1
+        return str(self.current_path), member_name
+
+    def close(self) -> None:
+        if self.current is not None:
+            self.current.close()
+            self.current = None
+            self.current_path = None
 
 
 def _discover_images(directory: Path) -> List[Path]:
@@ -56,13 +109,11 @@ def _split_records(records: Sequence[SampleRecord], split_cfg: SplitConfig) -> D
     return splits
 
 
-def _save_npz_sample(
+def _build_npz_bytes(
     image_path: Path,
     mask_path: Path | None,
     target_size: int,
-    out_npz: Path,
-    compute_high_pass: bool,
-) -> None:
+) -> bytes:
     image = Image.open(image_path).convert("RGB")
     mask_img = Image.open(mask_path).convert("L") if mask_path is not None else None
 
@@ -79,14 +130,10 @@ def _save_npz_sample(
 
     payload = {"image": image_np, "mask": mask_np}
 
-    if compute_high_pass:
-        hp_img = ImageOps.autocontrast(image.filter(ImageFilter.FIND_EDGES))
-        hp_np = np.array(hp_img, dtype=np.uint8)
-        payload["high_pass"] = hp_np
-
-    out_npz.parent.mkdir(parents=True, exist_ok=True)
+    buf = io.BytesIO()
     # np.savez (not compressed) to avoid CPU overhead from compression.
-    np.savez(out_npz, **payload)
+    np.savez(buf, **payload)
+    return buf.getvalue()
 
 
 def prepare_single_dataset(
@@ -107,7 +154,7 @@ def prepare_single_dataset(
 
     records: List[SampleRecord] = []
 
-    for real_img in real_images:
+    for real_img in tqdm(real_images, desc=f"{cfg.dataset_name} real", leave=False):
         records.append(
             SampleRecord(
                 dataset=cfg.dataset_name,
@@ -118,10 +165,11 @@ def prepare_single_dataset(
             )
         )
 
-    for fake_img in fake_images:
+    for fake_img in tqdm(fake_images, desc=f"{cfg.dataset_name} fake", leave=False):
         mask_path = _find_mask(fake_img, mask_dir, cfg.mask_suffix)
         if mask_path is None:
-            raise FileNotFoundError(f"Mask not found for fake image {fake_img}")
+            print(f"Skipping fake image without mask: {fake_img}", file=sys.stderr)
+            continue
         records.append(
             SampleRecord(
                 dataset=cfg.dataset_name,
@@ -137,32 +185,44 @@ def prepare_single_dataset(
     prepared_records: List[SampleRecord] = []
     target_size = sorted(prep_cfg.target_size_set())[0]
     for split_name, split_records in splits.items():
-        for idx, rec in enumerate(split_records):
+        tar_writer: TarShardWriter | None = None
+        if prep_cfg.tar_shard_size > 0:
+            tar_root = cfg.prepared_dir() / split_name
+            tar_writer = TarShardWriter(tar_root, prep_cfg.tar_shard_size)
+
+        for idx, rec in enumerate(tqdm(split_records, desc=f"{cfg.dataset_name} {split_name}", leave=False)):
             image_path = Path(rec.image_path)
             mask_path = Path(rec.mask_path) if rec.mask_path is not None else None
-            out_root = cfg.prepared_dir() / f"size_{target_size}" / split_name / "npz"
-
-            stem = f"{cfg.dataset_name}_{split_name}_{'fake' if rec.label else 'real'}_{idx:06d}"
-            out_npz = out_root / (stem + ".npz")
-
-            _save_npz_sample(
+            npz_bytes = _build_npz_bytes(
                 image_path=image_path,
                 mask_path=mask_path,
                 target_size=target_size,
-                out_npz=out_npz,
-                compute_high_pass=prep_cfg.compute_high_pass,
             )
+
+            stem = f"{cfg.dataset_name}_{split_name}_{'fake' if rec.label else 'real'}_{idx:06d}"
+            if tar_writer is not None:
+                tar_path, member_name = tar_writer.add(npz_bytes, member_name=stem + ".npz")
+                sample_path = f"{tar_path}::{member_name}"
+            else:
+                out_root = cfg.prepared_dir() / split_name
+                out_npz = out_root / (stem + ".npz")
+                out_npz.parent.mkdir(parents=True, exist_ok=True)
+                out_npz.write_bytes(npz_bytes)
+                sample_path = str(out_npz)
 
             prepared_records.append(
                 SampleRecord(
                     dataset=rec.dataset,
                     split=split_name,
-                    image_path=str(out_npz),
+                    image_path=sample_path,
                     mask_path=None,
                     label=rec.label,
                     high_pass_path=None,
                 )
             )
+
+        if tar_writer is not None:
+            tar_writer.close()
     return prepared_records
 
 
@@ -173,7 +233,7 @@ def prepare_all(
     manifest_out: Path,
 ) -> Manifest:
     all_records: List[SampleRecord] = []
-    for cfg in datasets:
+    for cfg in tqdm(datasets, desc="datasets"):
         split_cfg = per_dataset_splits.get(cfg.dataset_name)
         if split_cfg is None:
             raise ValueError(f"Missing split config for dataset {cfg.dataset_name}")
@@ -196,7 +256,7 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
             fake_subdir="fake",
             mask_subdir="mask",
             mask_suffix="_mask",
-            prepared_root="prepared",
+            prepared_root="./prepared",
         ),
         DatasetStructureConfig(
             dataset_root="./datasets",
@@ -205,7 +265,7 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
             fake_subdir="fake",
             mask_subdir="mask",
             mask_suffix="_gt",
-            prepared_root="prepared",
+            prepared_root="./prepared",
         ),
         DatasetStructureConfig(
             dataset_root="./datasets",
@@ -214,7 +274,7 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
             fake_subdir="fake",
             mask_subdir="mask",
             mask_suffix="forged",
-            prepared_root="prepared",
+            prepared_root="./prepared",
         ),
     ]
 
@@ -224,7 +284,7 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
         "COVERAGE": SplitConfig(train=0.0, val=0.0, test=1.0, seed=4),
     }
 
-    prep_cfg = PreparationConfig(target_sizes=(320,), normalization_mode="zero_one", compute_high_pass=True)
+    prep_cfg = PreparationConfig(target_sizes=(320,), normalization_mode="imagenet", tar_shard_size=500)
 
     return datasets, per_dataset_splits, prep_cfg
 
