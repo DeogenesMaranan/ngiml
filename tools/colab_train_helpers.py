@@ -318,15 +318,22 @@ def build_training_config(
     }
 
 
-def apply_colab_runtime_settings(training_config: dict, balance_sampling: bool = True) -> dict:
+def apply_colab_runtime_settings(
+    training_config: dict,
+    balance_sampling: bool = True,
+    local_cache_dir: str | None = None,
+    tune_for_large_batch: bool = False,
+) -> dict:
     recommended_workers = max(2, min(8, (os.cpu_count() or 4) // 2))
+    cache_dir = local_cache_dir or "/content/cache"
     training_config.update(
         {
             "num_workers": recommended_workers,
             "persistent_workers": True,
             "pin_memory": True,
             "auto_local_cache": True,
-            "local_cache_dir": "/content/cache",
+            "local_cache_dir": cache_dir,
+            "reuse_local_cache_manifest": True,
             "compile_model": False,
             "compile_mode": "default",
             "channels_last": True,
@@ -341,6 +348,15 @@ def apply_colab_runtime_settings(training_config: dict, balance_sampling: bool =
         model_cfg.optimizer.swin.weight_decay = 5e-5
         model_cfg.optimizer.fusion.weight_decay = 1e-4
         model_cfg.optimizer.decoder.weight_decay = 1e-4
+
+        if tune_for_large_batch:
+            training_config["batch_size"] = 16
+            training_config["grad_accum_steps"] = 1
+            model_cfg.optimizer.efficientnet.lr = 4.5e-5
+            model_cfg.optimizer.swin.lr = 1.5e-5
+            model_cfg.optimizer.residual.lr = 3e-4
+            model_cfg.optimizer.fusion.lr = 3e-4
+            model_cfg.optimizer.decoder.lr = 3e-4
 
     if "per_dataset_aug" in training_config and "IMD2020" in training_config["per_dataset_aug"]:
         training_config["per_dataset_aug"]["IMD2020"].views_per_sample = 1 if balance_sampling else 2

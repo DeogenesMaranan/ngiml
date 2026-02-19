@@ -7,11 +7,6 @@ from typing import Sequence
 import torch
 import torch.nn.functional as F
 
-try:
-    from fvcore.nn import FlopCountAnalysis
-except Exception:
-    FlopCountAnalysis = None
-
 from src.data.dataloaders import _load_from_npz, _load_from_tar_npz, _load_image, load_manifest
 from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
@@ -151,28 +146,40 @@ def get_model_complexity_stats(
         "input_size": tuple(int(v) for v in input_size),
     }
 
-    if FlopCountAnalysis is None:
-        stats["flops"] = None
-        stats["macs"] = None
-        stats["flops_error"] = "fvcore not installed (pip install fvcore)"
-        return stats
-
     sample_device = next(model.parameters()).device
     sample = torch.randn(*input_size, device=sample_device)
 
     was_training = model.training
     model.eval()
     try:
-        with torch.no_grad():
-            analysis = FlopCountAnalysis(model, sample)
-            total_flops = float(analysis.total())
-        stats["flops"] = total_flops
-        stats["macs"] = total_flops / 2.0
-        stats["flops_error"] = None
-    except Exception as error:
-        stats["flops"] = None
-        stats["macs"] = None
-        stats["flops_error"] = str(error)
+        try:
+            from fvcore.nn import FlopCountAnalysis
+
+            with torch.no_grad():
+                analysis = FlopCountAnalysis(model, sample)
+                total_flops = float(analysis.total())
+            stats["flops"] = total_flops
+            stats["macs"] = total_flops / 2.0
+            stats["flops_error"] = None
+        except Exception as fv_error:
+            try:
+                from thop import profile as thop_profile
+
+                with torch.no_grad():
+                    macs, _ = thop_profile(model, inputs=(sample,), verbose=False)
+                macs = float(macs)
+                stats["macs"] = macs
+                stats["flops"] = macs * 2.0
+                stats["flops_error"] = f"fvcore unavailable ({fv_error}); used thop fallback"
+            except Exception as thop_error:
+                stats["flops"] = None
+                stats["macs"] = None
+                stats["flops_error"] = (
+                    "FLOPs unavailable. "
+                    f"fvcore error: {fv_error}. "
+                    f"thop error: {thop_error}. "
+                    "Try `%pip install fvcore iopath` (or `%pip install thop`) in the active notebook kernel."
+                )
     finally:
         model.train(was_training)
 
