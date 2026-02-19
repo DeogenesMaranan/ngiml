@@ -23,23 +23,23 @@ class OptimizerGroupConfig:
 
 
 def _default_efficientnet_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=5e-5, weight_decay=1e-3)
+    return OptimizerGroupConfig(lr=3e-5, weight_decay=1e-4)
 
 
 def _default_swin_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=2e-5, weight_decay=1e-2)
+    return OptimizerGroupConfig(lr=1e-5, weight_decay=5e-5)
 
 
 def _default_residual_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=1e-4, weight_decay=0.0)
+    return OptimizerGroupConfig(lr=2e-4, weight_decay=1e-4)
 
 
 def _default_fusion_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=1e-4, weight_decay=1e-5)
+    return OptimizerGroupConfig(lr=2e-4, weight_decay=1e-4)
 
 
 def _default_decoder_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=1e-4, weight_decay=1e-5)
+    return OptimizerGroupConfig(lr=2e-4, weight_decay=1e-4)
 
 
 @dataclass

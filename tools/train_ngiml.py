@@ -68,6 +68,7 @@ class TrainConfig:
     drop_last: bool = True
     auto_local_cache: bool = True
     local_cache_dir: Optional[str] = None
+    reuse_local_cache_manifest: bool = True
     views_per_sample: int = 1
     max_rotation_degrees: float = 5.0
     noise_std_max: float = 0.02
@@ -164,6 +165,12 @@ def parse_args() -> TrainConfig:
         default=None,
         help="Directory for local materialized samples (defaults to output_dir/local_cache)",
     )
+    parser.add_argument(
+        "--reuse-local-cache-manifest",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse existing local cached manifest when available to shorten startup",
+    )
     parser.add_argument("--views-per-sample", type=int, default=1, help="Number of augmented views per sample (on-the-fly)")
     parser.add_argument("--max-rotation-degrees", type=float, default=5.0, help="Random rotation range (+/-)")
     parser.add_argument("--noise-std-max", type=float, default=0.02, help="Max Gaussian noise std")
@@ -202,6 +209,7 @@ def parse_args() -> TrainConfig:
         drop_last=args.drop_last,
         auto_local_cache=args.auto_local_cache,
         local_cache_dir=args.local_cache_dir,
+        reuse_local_cache_manifest=args.reuse_local_cache_manifest,
         views_per_sample=args.views_per_sample,
         max_rotation_degrees=args.max_rotation_degrees,
         noise_std_max=args.noise_std_max,
@@ -352,6 +360,11 @@ def _resolve_manifest_for_training(cfg: TrainConfig, out_dir: Path) -> Path:
 
     cache_root = Path(cfg.local_cache_dir) if cfg.local_cache_dir else (out_dir / "local_cache")
     cache_root = cache_root / manifest_path.stem
+    resolved_manifest = cache_root / "manifest_local_cache.parquet"
+    if cfg.reuse_local_cache_manifest and resolved_manifest.exists():
+        print(f"Reusing pre-materialized local cache manifest: {resolved_manifest}")
+        return resolved_manifest
+
     print(f"Materializing tar::npz samples to local cache: {cache_root}")
     return _materialize_tar_npz_manifest(manifest_path, cache_root)
 
@@ -548,6 +561,7 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
 
 def run_training(cfg: TrainConfig) -> None:
     set_global_seed(cfg.seed, deterministic=cfg.deterministic)
+    startup_t0 = time.time()
 
     if cfg.cuda_expandable_segments and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -577,10 +591,12 @@ def run_training(cfg: TrainConfig) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     resolved_manifest = _resolve_manifest_for_training(cfg, out_dir)
+    t_after_manifest = time.time()
     if resolved_manifest != Path(cfg.manifest):
         cfg = replace(cfg, manifest=str(resolved_manifest))
 
     loaders = _prepare_dataloaders(cfg, device)
+    t_after_dataloaders = time.time()
     if "train" not in loaders:
         raise ValueError("Train split missing in manifest; cannot start training")
 
@@ -593,6 +609,15 @@ def run_training(cfg: TrainConfig) -> None:
     scaler = GradScaler(device.type, enabled=(cfg.amp and device.type == "cuda"))
     loss_cfg = cfg.loss_config or MultiStageLossConfig()
     loss_fn = MultiStageManipulationLoss(loss_cfg)
+    t_after_model = time.time()
+
+    print(
+        "Startup timings | "
+        f"manifest/cache {t_after_manifest - startup_t0:.1f}s | "
+        f"dataloaders {t_after_dataloaders - t_after_manifest:.1f}s | "
+        f"model+optim {t_after_model - t_after_dataloaders:.1f}s | "
+        f"total {t_after_model - startup_t0:.1f}s"
+    )
 
     checkpoint_dir = out_dir / "checkpoints"
     checkpoint_log_path = checkpoint_dir / "checkpoint_metrics.jsonl"
