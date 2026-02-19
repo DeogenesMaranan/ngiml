@@ -12,7 +12,8 @@ from typing import Dict, Iterable, List, Sequence
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, Sampler
+import torch.nn.functional as NN_F
+from torch.utils.data import DataLoader, Dataset, Sampler, WeightedRandomSampler
 from torchvision.transforms import functional as F
 from torchvision.transforms.functional import InterpolationMode
 
@@ -151,6 +152,7 @@ class PerDatasetDataset(Dataset):
         self.samples = list(samples)
         self.aug_cfg = aug_cfg
         self.training = training
+        self.sample_labels = [int(sample.label) for sample in self.samples]
 
     def __len__(self) -> int:  # type: ignore[override]
         return len(self.samples)
@@ -198,6 +200,51 @@ class CombinedDataset(Dataset):
         ds_idx = bisect_right(self.offsets, index) - 1
         local_index = index - self.offsets[ds_idx]
         return self.datasets[ds_idx][local_index]
+
+
+def _build_real_fake_balanced_sampler(
+    combined_dataset: CombinedDataset,
+    pos_ratio: float,
+    seed: int | None,
+    num_samples: int | None = None,
+) -> WeightedRandomSampler | None:
+    labels: list[int] = []
+    for ds in combined_dataset.datasets:
+        ds_labels = getattr(ds, "sample_labels", None)
+        if ds_labels is None:
+            return None
+        labels.extend(int(v) for v in ds_labels)
+
+    if not labels:
+        return None
+
+    label_tensor = torch.tensor(labels, dtype=torch.long)
+    class_counts = torch.bincount(label_tensor, minlength=2).float()
+    if class_counts.sum().item() <= 0:
+        return None
+
+    pos_ratio = float(min(max(pos_ratio, 0.05), 0.95))
+    neg_ratio = 1.0 - pos_ratio
+
+    class_weights = torch.zeros_like(class_counts)
+    class_weights[0] = neg_ratio / class_counts[0].clamp_min(1.0)
+    class_weights[1] = pos_ratio / class_counts[1].clamp_min(1.0)
+    sample_weights = class_weights[label_tensor]
+
+    target_num_samples = int(num_samples) if num_samples is not None else len(labels)
+    target_num_samples = max(1, target_num_samples)
+
+    generator = None
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+
+    return WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=target_num_samples,
+        replacement=True,
+        generator=generator,
+    )
 
 
 class RoundRobinSampler(Sampler[int]):
@@ -251,6 +298,101 @@ class RoundRobinSampler(Sampler[int]):
         return sum(self.lengths)
 
 
+class RoundRobinBalancedClassSampler(Sampler[int]):
+    """Round-robin across datasets while balancing real/fake sampling within each dataset."""
+
+    def __init__(
+        self,
+        datasets: Sequence[Dataset],
+        pos_ratio: float = 0.5,
+        shuffle: bool = True,
+        seed: int | None = None,
+        balance: bool = True,
+    ) -> None:
+        self.datasets = list(datasets)
+        self.pos_ratio = float(min(max(pos_ratio, 0.05), 0.95))
+        self.shuffle = shuffle
+        self.seed = seed
+        self.balance = balance
+        self._iteration = 0
+
+        self.lengths = [len(ds) for ds in self.datasets]
+        self.offsets: List[int] = []
+        total = 0
+        for length in self.lengths:
+            self.offsets.append(total)
+            total += length
+
+    def __iter__(self):  # type: ignore[override]
+        generator = torch.Generator()
+        if self.seed is not None:
+            generator.manual_seed(int(self.seed) + self._iteration)
+        self._iteration += 1
+
+        per_dataset_pos: List[List[int]] = []
+        per_dataset_neg: List[List[int]] = []
+        for ds_idx, ds in enumerate(self.datasets):
+            labels = getattr(ds, "sample_labels", None)
+            if labels is None or len(labels) != self.lengths[ds_idx]:
+                labels = [0 for _ in range(self.lengths[ds_idx])]
+
+            pos_indices = [i for i, lbl in enumerate(labels) if int(lbl) == 1]
+            neg_indices = [i for i, lbl in enumerate(labels) if int(lbl) == 0]
+
+            if self.shuffle:
+                if pos_indices:
+                    perm_pos = torch.randperm(len(pos_indices), generator=generator).tolist()
+                    pos_indices = [pos_indices[i] for i in perm_pos]
+                if neg_indices:
+                    perm_neg = torch.randperm(len(neg_indices), generator=generator).tolist()
+                    neg_indices = [neg_indices[i] for i in perm_neg]
+
+            per_dataset_pos.append(pos_indices)
+            per_dataset_neg.append(neg_indices)
+
+        pos_cursors = [0 for _ in self.datasets]
+        neg_cursors = [0 for _ in self.datasets]
+
+        def _next_from(pool: List[int], cursor_list: List[int], ds_idx: int) -> int | None:
+            if not pool:
+                return None
+            cursor = cursor_list[ds_idx]
+            idx = pool[cursor % len(pool)]
+            cursor_list[ds_idx] = cursor + 1
+            return idx
+
+        max_len = max(self.lengths) if self.lengths else 0
+        total_rounds = max_len
+        for offset in range(total_rounds):
+            for ds_idx, ds_len in enumerate(self.lengths):
+                if ds_len == 0:
+                    continue
+                if not self.balance and offset >= ds_len:
+                    continue
+
+                draw_pos = bool(torch.rand((), generator=generator).item() < self.pos_ratio)
+                pos_pool = per_dataset_pos[ds_idx]
+                neg_pool = per_dataset_neg[ds_idx]
+
+                if draw_pos:
+                    local_idx = _next_from(pos_pool, pos_cursors, ds_idx)
+                    if local_idx is None:
+                        local_idx = _next_from(neg_pool, neg_cursors, ds_idx)
+                else:
+                    local_idx = _next_from(neg_pool, neg_cursors, ds_idx)
+                    if local_idx is None:
+                        local_idx = _next_from(pos_pool, pos_cursors, ds_idx)
+
+                if local_idx is None:
+                    continue
+                yield self.offsets[ds_idx] + local_idx
+
+    def __len__(self) -> int:  # type: ignore[override]
+        if self.balance:
+            return max(self.lengths) * len(self.datasets)
+        return sum(self.lengths)
+
+
 def _normalize(
     image: torch.Tensor,
     mode: str,
@@ -279,6 +421,71 @@ def _apply_gpu_augmentations(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     def _rand_scalar() -> torch.Tensor:
         return torch.rand((), device=image.device, generator=generator)
+
+    def _rand_int(low: int, high: int) -> int:
+        if high <= low:
+            return low
+        return int(torch.randint(low, high, (), device=image.device, generator=generator).item())
+
+    def _smooth_displacement(field: torch.Tensor, sigma: float) -> torch.Tensor:
+        kernel = max(3, int(2 * round(float(max(0.5, sigma))) + 1))
+        if kernel % 2 == 0:
+            kernel += 1
+        smoothed = NN_F.avg_pool2d(field, kernel_size=kernel, stride=1, padding=kernel // 2)
+        return NN_F.avg_pool2d(smoothed, kernel_size=kernel, stride=1, padding=kernel // 2)
+
+    def _elastic_deform(
+        image_t: torch.Tensor,
+        mask_t: torch.Tensor,
+        high_pass_t: torch.Tensor | None,
+        alpha: float,
+        sigma: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        _, h, w = image_t.shape
+        if h < 4 or w < 4:
+            return image_t, mask_t, high_pass_t
+
+        dx = torch.rand((1, 1, h, w), device=image_t.device, generator=generator) * 2.0 - 1.0
+        dy = torch.rand((1, 1, h, w), device=image_t.device, generator=generator) * 2.0 - 1.0
+        dx = _smooth_displacement(dx, sigma=sigma) * alpha
+        dy = _smooth_displacement(dy, sigma=sigma) * alpha
+
+        y_lin = torch.linspace(-1.0, 1.0, h, device=image_t.device)
+        x_lin = torch.linspace(-1.0, 1.0, w, device=image_t.device)
+        grid_y, grid_x = torch.meshgrid(y_lin, x_lin, indexing="ij")
+        base_grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)
+
+        disp_x = (dx.squeeze(0).squeeze(0) / max(w - 1, 1)) * 2.0
+        disp_y = (dy.squeeze(0).squeeze(0) / max(h - 1, 1)) * 2.0
+        disp_grid = torch.stack((disp_x, disp_y), dim=-1).unsqueeze(0)
+        grid = torch.clamp(base_grid + disp_grid, -1.0, 1.0)
+
+        image_out = NN_F.grid_sample(
+            image_t.unsqueeze(0),
+            grid,
+            mode="bilinear",
+            padding_mode="reflection",
+            align_corners=True,
+        ).squeeze(0)
+        mask_out = NN_F.grid_sample(
+            mask_t.unsqueeze(0),
+            grid,
+            mode="nearest",
+            padding_mode="zeros",
+            align_corners=True,
+        ).squeeze(0)
+
+        high_pass_out = None
+        if high_pass_t is not None:
+            high_pass_out = NN_F.grid_sample(
+                high_pass_t.unsqueeze(0),
+                grid,
+                mode="bilinear",
+                padding_mode="reflection",
+                align_corners=True,
+            ).squeeze(0)
+
+        return image_out, mask_out, high_pass_out
 
     if cfg.enable_flips:
         if _rand_scalar() < 0.5:
@@ -311,17 +518,49 @@ def _apply_gpu_augmentations(
         if crop_h < h or crop_w < w:
             top = int(_rand_scalar() * (h - crop_h + 1))
             left = int(_rand_scalar() * (w - crop_w + 1))
+
+            object_crop_prob = float(min(max(getattr(cfg, "object_crop_bias_prob", 0.0), 0.0), 1.0))
+            min_fg = int(max(1, getattr(cfg, "min_fg_pixels_for_object_crop", 1)))
+            if object_crop_prob > 0 and _rand_scalar() < object_crop_prob:
+                fg_coords = torch.nonzero(mask[0] > 0.5, as_tuple=False)
+                if fg_coords.shape[0] >= min_fg:
+                    coord_idx = _rand_int(0, fg_coords.shape[0])
+                    center_y = int(fg_coords[coord_idx, 0].item())
+                    center_x = int(fg_coords[coord_idx, 1].item())
+                    max_top = h - crop_h
+                    max_left = w - crop_w
+                    top = max(0, min(center_y - crop_h // 2, max_top))
+                    left = max(0, min(center_x - crop_w // 2, max_left))
+
             image = F.resized_crop(image, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.BILINEAR)
             mask = F.resized_crop(mask, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.NEAREST)
             if high_pass is not None:
                 high_pass = F.resized_crop(high_pass, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.BILINEAR)
 
+    if getattr(cfg, "enable_elastic", False):
+        elastic_prob = float(min(max(getattr(cfg, "elastic_prob", 0.0), 0.0), 1.0))
+        elastic_alpha = float(max(0.0, getattr(cfg, "elastic_alpha", 0.0)))
+        elastic_sigma = float(max(0.5, getattr(cfg, "elastic_sigma", 1.0)))
+        if elastic_prob > 0 and elastic_alpha > 0 and _rand_scalar() < elastic_prob:
+            image, mask, high_pass = _elastic_deform(
+                image,
+                mask,
+                high_pass,
+                alpha=elastic_alpha,
+                sigma=elastic_sigma,
+            )
+
     if cfg.enable_color_jitter:
-        factor = float(
-            cfg.color_jitter_factors[0]
-            + _rand_scalar() * (cfg.color_jitter_factors[1] - cfg.color_jitter_factors[0])
-        )
-        image = torch.clamp(image * factor, 0.0, 1.0)
+        brightness_range = getattr(cfg, "brightness_jitter_factors", getattr(cfg, "color_jitter_factors", (0.9, 1.1)))
+        contrast_range = getattr(cfg, "contrast_jitter_factors", (0.9, 1.1))
+
+        brightness = float(brightness_range[0] + _rand_scalar() * (brightness_range[1] - brightness_range[0]))
+        contrast = float(contrast_range[0] + _rand_scalar() * (contrast_range[1] - contrast_range[0]))
+
+        mean = image.mean(dim=(1, 2), keepdim=True)
+        image = (image - mean) * contrast + mean
+        image = image * brightness
+        image = torch.clamp(image, 0.0, 1.0)
 
     if cfg.enable_noise and cfg.noise_std_range[1] > 0:
         std = float(cfg.noise_std_range[0] + _rand_scalar() * (cfg.noise_std_range[1] - cfg.noise_std_range[0]))
@@ -448,6 +687,10 @@ def create_dataloaders(
     aug_seed: int | None = None,
     prefetch_factor: int | None = None,
     persistent_workers: bool = False,
+    balance_real_fake: bool = False,
+    balanced_positive_ratio: float = 0.5,
+    balanced_sampler_seed: int | None = 42,
+    balanced_sampler_num_samples: int | None = None,
 ) -> Dict[str, DataLoader]:
     manifest = load_manifest(manifest_path)
     normalization_mode = manifest.normalization_mode
@@ -472,12 +715,21 @@ def create_dataloaders(
         combined = CombinedDataset(datasets)
 
         if training:
-            sampler = RoundRobinSampler(
-                datasets,
-                shuffle=True,
-                seed=round_robin_seed,
-                balance=balance_sampling,
-            )
+            if balance_real_fake:
+                sampler = RoundRobinBalancedClassSampler(
+                    datasets,
+                    pos_ratio=balanced_positive_ratio,
+                    shuffle=True,
+                    seed=balanced_sampler_seed if balanced_sampler_seed is not None else round_robin_seed,
+                    balance=balance_sampling,
+                )
+            else:
+                sampler = RoundRobinSampler(
+                    datasets,
+                    shuffle=True,
+                    seed=round_robin_seed,
+                    balance=balance_sampling,
+                )
         else:
             sampler = None
 

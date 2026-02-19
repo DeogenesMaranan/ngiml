@@ -54,11 +54,19 @@ class AugmentationConfig:
     views_per_sample: int = 1
     enable_flips: bool = True
     enable_rotations: bool = True
-    max_rotation_degrees: float = 0.0
+    max_rotation_degrees: float = 5.0
     enable_random_crop: bool = True
     crop_scale_range: Sequence[float] = (0.9, 1.0)
+    object_crop_bias_prob: float = 0.7
+    min_fg_pixels_for_object_crop: int = 16
+    enable_elastic: bool = True
+    elastic_prob: float = 0.3
+    elastic_alpha: float = 8.0
+    elastic_sigma: float = 5.0
     enable_color_jitter: bool = True
     color_jitter_factors: Sequence[float] = (0.9, 1.1)
+    brightness_jitter_factors: Sequence[float] = (0.9, 1.1)
+    contrast_jitter_factors: Sequence[float] = (0.9, 1.1)
     enable_noise: bool = True
     noise_std_range: Sequence[float] = (0.0, 0.0)
 

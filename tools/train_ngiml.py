@@ -64,6 +64,10 @@ class TrainConfig:
     auto_resume: bool = False
     round_robin_seed: Optional[int] = 42
     balance_sampling: bool = False
+    balance_real_fake: bool = True
+    balanced_positive_ratio: float = 0.5
+    balanced_sampler_seed: int = 42
+    balanced_sampler_num_samples: Optional[int] = None
     prefetch_factor: Optional[int] = 2
     persistent_workers: bool = True
     drop_last: bool = True
@@ -77,8 +81,27 @@ class TrainConfig:
     device: Optional[str] = None
     aug_seed: Optional[int] = None
     seed: int = 42
-    early_stopping_patience: int = 8
+    early_stopping_patience: int = 5
     early_stopping_min_delta: float = 1e-4
+    early_stopping_monitor: str = "iou"
+    metric_threshold: float = 0.5
+    optimize_threshold: bool = True
+    threshold_metric: str = "iou"
+    threshold_start: float = 0.1
+    threshold_end: float = 0.9
+    threshold_step: float = 0.1
+    compute_foreground_ratio: bool = True
+    auto_pos_weight: bool = True
+    pos_weight_min: float = 1.0
+    pos_weight_max: float = 20.0
+    loss_hybrid_mode: str = "dice_bce"
+    dice_weight: float = 1.0
+    bce_weight: float = 1.0
+    focal_gamma: float = 2.0
+    focal_alpha: float = 0.25
+    tversky_weight: float = 0.2
+    tversky_alpha: float = 0.3
+    tversky_beta: float = 0.7
     default_aug: Optional[AugmentationConfig] = None
     per_dataset_aug: Optional[Dict[str, AugmentationConfig]] = None
     model_config: Optional[HybridNGIMLConfig] = None
@@ -142,6 +165,30 @@ def parse_args() -> TrainConfig:
         default=False,
         help="Balance per-dataset sampling by oversampling smaller datasets",
     )
+    parser.add_argument(
+        "--balance-real-fake",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable weighted sampling to match a target fake-positive ratio in train batches",
+    )
+    parser.add_argument(
+        "--balanced-positive-ratio",
+        type=float,
+        default=0.5,
+        help="Target fake-positive sampling ratio when --balance-real-fake is enabled",
+    )
+    parser.add_argument(
+        "--balanced-sampler-seed",
+        type=int,
+        default=42,
+        help="Random seed used by the real/fake balanced sampler",
+    )
+    parser.add_argument(
+        "--balanced-sampler-num-samples",
+        type=int,
+        default=None,
+        help="Optional number of sampled training items per epoch for real/fake balancing",
+    )
     parser.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor")
     parser.add_argument(
         "--persistent-workers",
@@ -179,8 +226,27 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--disable-aug", action="store_true", help="Disable GPU augmentations")
     parser.add_argument("--device", type=str, default=None, help="Override device (e.g., cuda:0 or cpu)")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducibility")
-    parser.add_argument("--early-stopping-patience", type=int, default=8, help="Stop after N validations without improvement; <=0 disables")
-    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4, help="Minimum Dice improvement to reset early stopping")
+    parser.add_argument("--early-stopping-patience", type=int, default=5, help="Stop after N validations without improvement; <=0 disables")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4, help="Minimum monitored-metric improvement to reset early stopping")
+    parser.add_argument("--early-stopping-monitor", type=str, default="iou", choices=["iou", "dice", "recall", "precision", "accuracy", "loss"], help="Validation metric used for early stopping and best checkpoint")
+    parser.add_argument("--metric-threshold", type=float, default=0.5, help="Fixed threshold for sigmoid outputs when threshold optimization is disabled")
+    parser.add_argument("--optimize-threshold", action=argparse.BooleanOptionalAction, default=True, help="Search validation thresholds and use the best for metric reporting")
+    parser.add_argument("--threshold-metric", type=str, default="iou", choices=["iou", "dice"], help="Metric used to select best threshold")
+    parser.add_argument("--threshold-start", type=float, default=0.1, help="Threshold search range start")
+    parser.add_argument("--threshold-end", type=float, default=0.9, help="Threshold search range end")
+    parser.add_argument("--threshold-step", type=float, default=0.1, help="Threshold search step size")
+    parser.add_argument("--compute-foreground-ratio", action=argparse.BooleanOptionalAction, default=True, help="Compute foreground pixel ratio from train loader")
+    parser.add_argument("--auto-pos-weight", action=argparse.BooleanOptionalAction, default=True, help="Auto-compute BCE pos_weight from foreground ratio")
+    parser.add_argument("--pos-weight-min", type=float, default=1.0, help="Lower clamp for auto pos_weight")
+    parser.add_argument("--pos-weight-max", type=float, default=20.0, help="Upper clamp for auto pos_weight")
+    parser.add_argument("--loss-hybrid-mode", type=str, default="dice_bce", choices=["dice_bce", "dice_focal"], help="Hybrid loss type")
+    parser.add_argument("--dice-weight", type=float, default=1.0, help="Dice loss weight")
+    parser.add_argument("--bce-weight", type=float, default=1.0, help="BCE/Focal term weight in hybrid loss")
+    parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (used when loss-hybrid-mode=dice_focal)")
+    parser.add_argument("--focal-alpha", type=float, default=0.25, help="Focal loss alpha (used when loss-hybrid-mode=dice_focal)")
+    parser.add_argument("--tversky-weight", type=float, default=0.2, help="Optional Tversky loss weight to improve recall")
+    parser.add_argument("--tversky-alpha", type=float, default=0.3, help="Tversky alpha (FP penalty)")
+    parser.add_argument("--tversky-beta", type=float, default=0.7, help="Tversky beta (FN penalty)")
     args = parser.parse_args()
     return TrainConfig(
         manifest=args.manifest,
@@ -207,6 +273,10 @@ def parse_args() -> TrainConfig:
         auto_resume=args.auto_resume,
         round_robin_seed=args.round_robin_seed,
         balance_sampling=args.balance_sampling,
+        balance_real_fake=args.balance_real_fake,
+        balanced_positive_ratio=args.balanced_positive_ratio,
+        balanced_sampler_seed=args.balanced_sampler_seed,
+        balanced_sampler_num_samples=args.balanced_sampler_num_samples,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
         drop_last=args.drop_last,
@@ -221,6 +291,25 @@ def parse_args() -> TrainConfig:
         seed=args.seed,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        early_stopping_monitor=args.early_stopping_monitor,
+        metric_threshold=args.metric_threshold,
+        optimize_threshold=args.optimize_threshold,
+        threshold_metric=args.threshold_metric,
+        threshold_start=args.threshold_start,
+        threshold_end=args.threshold_end,
+        threshold_step=args.threshold_step,
+        compute_foreground_ratio=args.compute_foreground_ratio,
+        auto_pos_weight=args.auto_pos_weight,
+        pos_weight_min=args.pos_weight_min,
+        pos_weight_max=args.pos_weight_max,
+        loss_hybrid_mode=args.loss_hybrid_mode,
+        dice_weight=args.dice_weight,
+        bce_weight=args.bce_weight,
+        focal_gamma=args.focal_gamma,
+        focal_alpha=args.focal_alpha,
+        tversky_weight=args.tversky_weight,
+        tversky_alpha=args.tversky_alpha,
+        tversky_beta=args.tversky_beta,
     )
 
 
@@ -258,7 +347,15 @@ def _build_aug_map(names: Sequence[str], cfg: TrainConfig) -> Dict[str, Augmenta
         enable_rotations=cfg.max_rotation_degrees > 0,
         max_rotation_degrees=cfg.max_rotation_degrees,
         enable_random_crop=True,
+        object_crop_bias_prob=0.7,
+        min_fg_pixels_for_object_crop=16,
+        enable_elastic=True,
+        elastic_prob=0.3,
+        elastic_alpha=8.0,
+        elastic_sigma=5.0,
         enable_color_jitter=True,
+        brightness_jitter_factors=(0.9, 1.1),
+        contrast_jitter_factors=(0.9, 1.1),
         enable_noise=cfg.noise_std_max > 0,
         noise_std_range=(0.0, max(0.0, cfg.noise_std_max)),
     )
@@ -285,6 +382,10 @@ def _prepare_dataloaders(cfg: TrainConfig, device: torch.device):
         num_workers=cfg.num_workers,
         round_robin_seed=cfg.round_robin_seed,
         balance_sampling=cfg.balance_sampling,
+        balance_real_fake=cfg.balance_real_fake,
+        balanced_positive_ratio=cfg.balanced_positive_ratio,
+        balanced_sampler_seed=cfg.balanced_sampler_seed,
+        balanced_sampler_num_samples=cfg.balanced_sampler_num_samples,
         drop_last=cfg.drop_last,
         aug_seed=cfg.aug_seed if cfg.aug_seed is not None else cfg.seed,
         prefetch_factor=cfg.prefetch_factor,
@@ -391,37 +492,54 @@ def _build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
 
-def _dice_coefficient(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def _segmentation_counts(logits: torch.Tensor, target: torch.Tensor, threshold: float = 0.5) -> Dict[str, float]:
     probs = torch.sigmoid(logits)
-    target = target.float()
-    dims = (1, 2, 3)
-    intersection = torch.sum(probs * target, dim=dims)
-    denom = torch.sum(probs, dim=dims) + torch.sum(target, dim=dims)
-    return ((2 * intersection + eps) / (denom + eps)).mean()
-
-
-def _segmentation_metrics(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> Dict[str, float]:
-    probs = torch.sigmoid(logits)
-    pred = (probs >= 0.5).float()
+    pred = (probs >= float(threshold)).float()
     target = target.float()
 
-    dims = (1, 2, 3)
-    tp = torch.sum(pred * target, dim=dims)
-    tn = torch.sum((1.0 - pred) * (1.0 - target), dim=dims)
-    fp = torch.sum(pred * (1.0 - target), dim=dims)
-    fn = torch.sum((1.0 - pred) * target, dim=dims)
+    tp = torch.sum(pred * target).item()
+    tn = torch.sum((1.0 - pred) * (1.0 - target)).item()
+    fp = torch.sum(pred * (1.0 - target)).item()
+    fn = torch.sum((1.0 - pred) * target).item()
+    return {"tp": float(tp), "tn": float(tn), "fp": float(fp), "fn": float(fn)}
 
+
+def _metrics_from_counts(tp: float, tn: float, fp: float, fn: float, eps: float = 1e-6) -> Dict[str, float]:
     iou = (tp + eps) / (tp + fp + fn + eps)
+    dice = (2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)
     precision = (tp + eps) / (tp + fp + eps)
     recall = (tp + eps) / (tp + fn + eps)
     accuracy = (tp + tn + eps) / (tp + tn + fp + fn + eps)
 
     return {
-        "iou": float(iou.mean().item()),
-        "precision": float(precision.mean().item()),
-        "recall": float(recall.mean().item()),
-        "accuracy": float(accuracy.mean().item()),
+        "dice": float(dice),
+        "iou": float(iou),
+        "precision": float(precision),
+        "recall": float(recall),
+        "accuracy": float(accuracy),
     }
+
+
+def _build_threshold_grid(cfg: TrainConfig) -> Sequence[float]:
+    start = float(min(max(cfg.threshold_start, 0.0), 1.0))
+    end = float(min(max(cfg.threshold_end, 0.0), 1.0))
+    step = float(max(cfg.threshold_step, 1e-6))
+    if end < start:
+        start, end = end, start
+
+    values = []
+    t = start
+    while t <= (end + 1e-9):
+        values.append(round(t, 4))
+        t += step
+
+    if not values:
+        values = [0.5]
+
+    if 0.5 not in values:
+        values.append(0.5)
+    values = sorted(set(values))
+    return values
 
 
 def save_checkpoint(
@@ -486,6 +604,29 @@ def find_latest_checkpoint(output_dir: Path) -> Optional[Path]:
     return candidates[-1] if candidates else None
 
 
+@torch.inference_mode()
+def compute_foreground_pixel_ratio(loader) -> float:
+    foreground = 0.0
+    total = 0.0
+    for batch in loader:
+        masks = batch["masks"]
+        masks = (masks > 0.5).float()
+        foreground += float(masks.sum().item())
+        total += float(masks.numel())
+    if total <= 0:
+        return 0.0
+    return foreground / total
+
+
+def _metric_for_monitor(metrics: dict, monitor: str) -> float:
+    key = str(monitor).strip().lower()
+    if key == "loss":
+        return -float(metrics["loss"])
+    if key not in metrics:
+        raise KeyError(f"Unsupported monitor metric: {monitor}")
+    return float(metrics[key])
+
+
 def train_one_epoch(model: HybridNGIML, loader, optimizer, scaler: GradScaler, loss_fn, device: torch.device, cfg: TrainConfig, epoch: int, global_step: int):
     model.train()
     running_loss = 0.0
@@ -529,15 +670,64 @@ def train_one_epoch(model: HybridNGIML, loader, optimizer, scaler: GradScaler, l
 
 
 @torch.inference_mode()
+def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: TrainConfig) -> dict:
+    model.eval()
+    thresholds = _build_threshold_grid(cfg)
+    threshold_stats = {
+        float(th): {"tp": 0.0, "tn": 0.0, "fp": 0.0, "fn": 0.0}
+        for th in thresholds
+    }
+
+    for batch in loader:
+        images = batch["images"].to(device, non_blocking=True)
+        masks = batch["masks"].to(device, non_blocking=True)
+        if cfg.channels_last and device.type == "cuda":
+            images = images.contiguous(memory_format=torch.channels_last)
+        use_amp = cfg.amp and device.type == "cuda"
+        with autocast(device_type=device.type, enabled=use_amp):
+            preds = model(images, target_size=masks.shape[-2:])
+        logits = preds[-1]
+
+        for threshold in thresholds:
+            counts = _segmentation_counts(logits, masks, threshold=threshold)
+            threshold_stats[float(threshold)]["tp"] += counts["tp"]
+            threshold_stats[float(threshold)]["tn"] += counts["tn"]
+            threshold_stats[float(threshold)]["fp"] += counts["fp"]
+            threshold_stats[float(threshold)]["fn"] += counts["fn"]
+
+    optimize_key = cfg.threshold_metric.lower()
+    if optimize_key not in {"iou", "dice"}:
+        optimize_key = "iou"
+
+    scored_thresholds: list[tuple[float, dict]] = []
+    for threshold in thresholds:
+        stats = threshold_stats[float(threshold)]
+        metrics = _metrics_from_counts(stats["tp"], stats["tn"], stats["fp"], stats["fn"])
+        scored_thresholds.append((float(threshold), metrics))
+
+    best_threshold, best_metrics = max(scored_thresholds, key=lambda item: item[1][optimize_key])
+    return {
+        "threshold": float(best_threshold),
+        "threshold_metric": optimize_key,
+        "dice": float(best_metrics["dice"]),
+        "iou": float(best_metrics["iou"]),
+        "precision": float(best_metrics["precision"]),
+        "recall": float(best_metrics["recall"]),
+        "accuracy": float(best_metrics["accuracy"]),
+    }
+
+
+@torch.inference_mode()
 def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: TrainConfig) -> dict:
     model.eval()
     total_loss = 0.0
-    total_dice = 0.0
-    total_iou = 0.0
-    total_precision = 0.0
-    total_recall = 0.0
-    total_accuracy = 0.0
     batches = 0
+    thresholds = _build_threshold_grid(cfg) if cfg.optimize_threshold else [float(cfg.metric_threshold)]
+    threshold_stats = {
+        float(th): {"tp": 0.0, "tn": 0.0, "fp": 0.0, "fn": 0.0}
+        for th in thresholds
+    }
+
     progress = tqdm(loader, desc="Validation", leave=False, dynamic_ncols=True)
     for batch in progress:
         images = batch["images"].to(device, non_blocking=True)
@@ -549,25 +739,50 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
             preds = model(images, target_size=masks.shape[-2:])
             loss = loss_fn(preds, masks)
         logits = preds[-1]
-        dice = _dice_coefficient(logits, masks)
-        extra_metrics = _segmentation_metrics(logits, masks)
+
+        for threshold in thresholds:
+            counts = _segmentation_counts(logits, masks, threshold=threshold)
+            threshold_stats[float(threshold)]["tp"] += counts["tp"]
+            threshold_stats[float(threshold)]["tn"] += counts["tn"]
+            threshold_stats[float(threshold)]["fp"] += counts["fp"]
+            threshold_stats[float(threshold)]["fn"] += counts["fn"]
+
         total_loss += loss.item()
-        total_dice += dice.item()
-        total_iou += extra_metrics["iou"]
-        total_precision += extra_metrics["precision"]
-        total_recall += extra_metrics["recall"]
-        total_accuracy += extra_metrics["accuracy"]
         batches += 1
         progress.set_postfix(loss=f"{(total_loss / max(1, batches)):.4f}", step=f"{batches:05d}")
+
+    optimize_key = cfg.threshold_metric.lower()
+    if optimize_key not in {"iou", "dice"}:
+        optimize_key = "iou"
+
+    scored_thresholds: list[tuple[float, dict]] = []
+    for threshold in thresholds:
+        stats = threshold_stats[float(threshold)]
+        metrics = _metrics_from_counts(
+            stats["tp"],
+            stats["tn"],
+            stats["fp"],
+            stats["fn"],
+        )
+        scored_thresholds.append((float(threshold), metrics))
+
+    if cfg.optimize_threshold:
+        best_threshold, best_metrics = max(scored_thresholds, key=lambda item: item[1][optimize_key])
+    else:
+        fixed_threshold = float(cfg.metric_threshold)
+        nearest_threshold, best_metrics = min(scored_thresholds, key=lambda item: abs(item[0] - fixed_threshold))
+        best_threshold = float(nearest_threshold)
 
     normalizer = max(1, batches)
     return {
         "loss": total_loss / normalizer,
-        "dice": total_dice / normalizer,
-        "iou": total_iou / normalizer,
-        "precision": total_precision / normalizer,
-        "recall": total_recall / normalizer,
-        "accuracy": total_accuracy / normalizer,
+        "dice": float(best_metrics["dice"]),
+        "iou": float(best_metrics["iou"]),
+        "precision": float(best_metrics["precision"]),
+        "recall": float(best_metrics["recall"]),
+        "accuracy": float(best_metrics["accuracy"]),
+        "threshold": float(best_threshold),
+        "threshold_metric": optimize_key,
     }
 
 
@@ -611,6 +826,17 @@ def run_training(cfg: TrainConfig) -> None:
     t_after_dataloaders = time.time()
     if "train" not in loaders:
         raise ValueError("Train split missing in manifest; cannot start training")
+    if cfg.balance_real_fake:
+        print(
+            "Train sampler: round-robin + real/fake balanced | "
+            f"target_positive_ratio={cfg.balanced_positive_ratio:.3f} | "
+            f"num_samples={cfg.balanced_sampler_num_samples or 'dataset_len'}"
+        )
+
+    foreground_ratio = None
+    if cfg.compute_foreground_ratio:
+        foreground_ratio = compute_foreground_pixel_ratio(loaders["train"])
+        print(f"Foreground pixel ratio (train): {foreground_ratio:.6f}")
 
     model_cfg = cfg.model_config or HybridNGIMLConfig()
     model = HybridNGIML(model_cfg).to(device)
@@ -619,7 +845,22 @@ def run_training(cfg: TrainConfig) -> None:
     optimizer = model.build_optimizer()
     scheduler = _build_lr_scheduler(optimizer, cfg)
     scaler = GradScaler(device.type, enabled=(cfg.amp and device.type == "cuda"))
-    loss_cfg = cfg.loss_config or MultiStageLossConfig()
+    loss_cfg = cfg.loss_config or MultiStageLossConfig(
+        hybrid_mode=cfg.loss_hybrid_mode,
+        dice_weight=cfg.dice_weight,
+        bce_weight=cfg.bce_weight,
+        focal_gamma=cfg.focal_gamma,
+        focal_alpha=cfg.focal_alpha,
+        tversky_weight=cfg.tversky_weight,
+        tversky_alpha=cfg.tversky_alpha,
+        tversky_beta=cfg.tversky_beta,
+    )
+    if cfg.auto_pos_weight and foreground_ratio is not None:
+        ratio = max(1e-6, min(1.0 - 1e-6, foreground_ratio))
+        pos_weight = (1.0 - ratio) / ratio
+        pos_weight = float(min(max(pos_weight, cfg.pos_weight_min), cfg.pos_weight_max))
+        loss_cfg = replace(loss_cfg, pos_weight=pos_weight)
+        print(f"Auto pos_weight from foreground ratio: {pos_weight:.4f}")
     loss_fn = MultiStageManipulationLoss(loss_cfg)
     t_after_model = time.time()
 
@@ -672,7 +913,8 @@ def run_training(cfg: TrainConfig) -> None:
     with open(out_dir / "train_config.json", "w", encoding="utf-8") as handle:
         json.dump(asdict(cfg), handle, indent=2)
 
-    best_val_dice = float("-inf")
+    best_monitor_value = float("-inf")
+    best_val_iou = float("-inf")
     no_improve_epochs = 0
     early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
 
@@ -704,6 +946,7 @@ def run_training(cfg: TrainConfig) -> None:
         val_precision = None
         val_recall = None
         val_accuracy = None
+        val_threshold = None
         if "val" in loaders and (epoch + 1) % cfg.val_every == 0:
             metrics = evaluate(model, loaders["val"], loss_fn, device, cfg)
             val_loss = float(metrics["loss"])
@@ -712,23 +955,36 @@ def run_training(cfg: TrainConfig) -> None:
             val_precision = float(metrics["precision"])
             val_recall = float(metrics["recall"])
             val_accuracy = float(metrics["accuracy"])
+            val_threshold = float(metrics["threshold"])
             print(
                 f"Val | loss {val_loss:.4f} | dice {val_dice:.4f} | iou {val_iou:.4f} "
-                f"| precision {val_precision:.4f} | recall {val_recall:.4f} | accuracy {val_accuracy:.4f}"
+                f"| precision {val_precision:.4f} | recall {val_recall:.4f} | accuracy {val_accuracy:.4f} "
+                f"| threshold {val_threshold:.2f}"
             )
 
-            improved = val_dice > (best_val_dice + cfg.early_stopping_min_delta)
+            iou_improved = val_iou > (best_val_iou + cfg.early_stopping_min_delta)
+            if iou_improved:
+                best_val_iou = val_iou
+                best_iou_path = checkpoint_dir / "best_iou_checkpoint.pt"
+                save_checkpoint(best_iou_path, model, optimizer, scaler, epoch + 1, global_step, cfg, scheduler=scheduler)
+                print(f"New best val iou {best_val_iou:.4f}; saved to {best_iou_path}")
+
+            monitor_value = _metric_for_monitor(metrics, cfg.early_stopping_monitor)
+            improved = monitor_value > (best_monitor_value + cfg.early_stopping_min_delta)
             if improved:
-                best_val_dice = val_dice
+                best_monitor_value = monitor_value
                 no_improve_epochs = 0
-                best_path = checkpoint_dir / "best_checkpoint.pt"
-                save_checkpoint(best_path, model, optimizer, scaler, epoch + 1, global_step, cfg, scheduler=scheduler)
-                print(f"New best val dice {best_val_dice:.4f}; saved to {best_path}")
+                best_alias_path = checkpoint_dir / "best_checkpoint.pt"
+                save_checkpoint(best_alias_path, model, optimizer, scaler, epoch + 1, global_step, cfg, scheduler=scheduler)
+                print(
+                    f"New best val {cfg.early_stopping_monitor} {monitor_value:.4f}; "
+                    f"saved to {best_alias_path}"
+                )
             elif early_stopping_enabled:
                 no_improve_epochs += 1
                 print(
                     f"Early stopping patience: {no_improve_epochs}/{cfg.early_stopping_patience} "
-                    f"without val dice improvement"
+                    f"without val {cfg.early_stopping_monitor} improvement"
                 )
 
         should_checkpoint = ((epoch + 1) % cfg.checkpoint_every == 0) or (epoch + 1 == cfg.epochs)
@@ -747,6 +1003,7 @@ def run_training(cfg: TrainConfig) -> None:
                     "val_precision": val_precision,
                     "val_recall": val_recall,
                     "val_accuracy": val_accuracy,
+                    "val_threshold": val_threshold,
                     "epoch_seconds": float(elapsed),
                     "checkpoint_path": str(ckpt_path),
                 },
