@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Tuple
 
@@ -362,3 +363,48 @@ def apply_colab_runtime_settings(
         training_config["per_dataset_aug"]["IMD2020"].views_per_sample = 1 if balance_sampling else 2
 
     return training_config
+
+
+def stage_persistent_cache_to_runtime(
+    persistent_cache_dir: str | Path,
+    runtime_cache_dir: str | Path = "/content/cache",
+    force: bool = False,
+) -> dict[str, object]:
+    persistent = Path(persistent_cache_dir)
+    runtime = Path(runtime_cache_dir)
+    runtime.mkdir(parents=True, exist_ok=True)
+
+    if not persistent.exists():
+        return {
+            "staged": False,
+            "reason": f"Persistent cache not found: {persistent}",
+            "persistent_cache_dir": str(persistent),
+            "runtime_cache_dir": str(runtime),
+        }
+
+    runtime_has_content = any(runtime.iterdir())
+    if runtime_has_content and not force:
+        return {
+            "staged": False,
+            "reason": "Runtime cache already populated; skipping copy",
+            "persistent_cache_dir": str(persistent),
+            "runtime_cache_dir": str(runtime),
+        }
+
+    copied_entries = 0
+    for src in persistent.iterdir():
+        dst = runtime / src.name
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+            copied_entries += 1
+        elif src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied_entries += 1
+
+    return {
+        "staged": True,
+        "copied_entries": copied_entries,
+        "persistent_cache_dir": str(persistent),
+        "runtime_cache_dir": str(runtime),
+    }
