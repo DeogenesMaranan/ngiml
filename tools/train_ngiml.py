@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
 from torch.nn.utils import clip_grad_norm_
+from tqdm.auto import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 import sys
@@ -211,12 +213,14 @@ def train_one_epoch(model: HybridNGIML, loader, optimizer, scaler: GradScaler, l
     model.train()
     running_loss = 0.0
     num_batches = 0
-    for step, batch in enumerate(loader):
+    progress = tqdm(loader, desc=f"Epoch {epoch:03d}", leave=False, dynamic_ncols=True)
+    for step, batch in enumerate(progress):
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast(enabled=cfg.amp):
+        use_amp = cfg.amp and device.type == "cuda"
+        with autocast(device_type=device.type, enabled=use_amp):
             preds = model(images, target_size=masks.shape[-2:])
             loss = loss_fn(preds, masks)
         scaler.scale(loss).backward()
@@ -232,9 +236,8 @@ def train_one_epoch(model: HybridNGIML, loader, optimizer, scaler: GradScaler, l
         num_batches += 1
         global_step += 1
 
-        if step % 10 == 0:
-            avg_loss = running_loss / max(1, num_batches)
-            print(f"Epoch {epoch:03d} | Step {step:05d} | Loss {avg_loss:.4f}")
+        avg_loss = running_loss / max(1, num_batches)
+        progress.set_postfix(loss=f"{avg_loss:.4f}", step=f"{step:05d}")
 
     return running_loss / max(1, num_batches), global_step
 
