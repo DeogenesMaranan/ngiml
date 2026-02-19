@@ -7,6 +7,11 @@ from typing import Sequence
 import torch
 import torch.nn.functional as F
 
+try:
+    from fvcore.nn import FlopCountAnalysis
+except Exception:
+    FlopCountAnalysis = None
+
 from src.data.dataloaders import _load_from_npz, _load_from_tar_npz, _load_image, load_manifest
 from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
@@ -129,3 +134,46 @@ def infer_from_image_path(model: HybridNGIML, image_path: Path, device: torch.de
         image = image / 255.0
     pred = predict_probability_map(model, image, device)
     return image, pred
+
+
+def get_model_complexity_stats(
+    model: HybridNGIML,
+    input_size: tuple[int, int, int, int] = (1, 3, 320, 320),
+) -> dict[str, object]:
+    total_params = sum(parameter.numel() for parameter in model.parameters())
+    trainable_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    frozen_params = total_params - trainable_params
+
+    stats: dict[str, object] = {
+        "total_params": int(total_params),
+        "trainable_params": int(trainable_params),
+        "frozen_params": int(frozen_params),
+        "input_size": tuple(int(v) for v in input_size),
+    }
+
+    if FlopCountAnalysis is None:
+        stats["flops"] = None
+        stats["macs"] = None
+        stats["flops_error"] = "fvcore not installed (pip install fvcore)"
+        return stats
+
+    sample_device = next(model.parameters()).device
+    sample = torch.randn(*input_size, device=sample_device)
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            analysis = FlopCountAnalysis(model, sample)
+            total_flops = float(analysis.total())
+        stats["flops"] = total_flops
+        stats["macs"] = total_flops / 2.0
+        stats["flops_error"] = None
+    except Exception as error:
+        stats["flops"] = None
+        stats["macs"] = None
+        stats["flops_error"] = str(error)
+    finally:
+        model.train(was_training)
+
+    return stats
