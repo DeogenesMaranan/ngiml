@@ -49,9 +49,10 @@ class TrainConfig:
     pin_memory: bool = True
     channels_last: bool = True
     compile_model: bool = False
-    compile_mode: str = "reduce-overhead"
+    compile_mode: str = "default"
     deterministic: bool = False
     use_tf32: bool = True
+    cuda_expandable_segments: bool = True
     lr_schedule: bool = True
     warmup_epochs: int = 2
     min_lr_scale: float = 0.1
@@ -105,9 +106,15 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--no-pin-memory", action="store_true", help="Disable DataLoader pinned memory")
     parser.add_argument("--no-channels-last", action="store_true", help="Disable channels-last memory format on CUDA")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile on model")
-    parser.add_argument("--compile-mode", type=str, default="reduce-overhead", help="torch.compile mode")
+    parser.add_argument("--compile-mode", type=str, default="default", help="torch.compile mode")
     parser.add_argument("--deterministic", action="store_true", help="Enable deterministic kernels (slower)")
     parser.add_argument("--no-tf32", action="store_true", help="Disable TF32 matrix math on CUDA")
+    parser.add_argument(
+        "--cuda-expandable-segments",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True when CUDA is used",
+    )
     parser.add_argument("--no-lr-schedule", action="store_true", help="Disable warmup+cosine LR schedule")
     parser.add_argument("--warmup-epochs", type=int, default=2, help="Number of warmup epochs")
     parser.add_argument("--min-lr-scale", type=float, default=0.1, help="Final LR scale for cosine schedule")
@@ -179,6 +186,7 @@ def parse_args() -> TrainConfig:
         compile_mode=args.compile_mode,
         deterministic=args.deterministic,
         use_tf32=not args.no_tf32,
+        cuda_expandable_segments=args.cuda_expandable_segments,
         lr_schedule=not args.no_lr_schedule,
         warmup_epochs=args.warmup_epochs,
         min_lr_scale=args.min_lr_scale,
@@ -540,13 +548,30 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
 
 def run_training(cfg: TrainConfig) -> None:
     set_global_seed(cfg.seed, deterministic=cfg.deterministic)
+
+    if cfg.cuda_expandable_segments and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
     device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
 
     if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = cfg.use_tf32
-        torch.backends.cudnn.allow_tf32 = cfg.use_tf32
         torch.set_float32_matmul_precision("high" if cfg.use_tf32 else "highest")
+
+        # PyTorch 2.9+ prefers fp32_precision knobs over allow_tf32 flags.
+        cudnn_backend = getattr(torch.backends, "cudnn", None)
+        cuda_backend = getattr(torch.backends, "cuda", None)
+        cudnn_conv = getattr(cudnn_backend, "conv", None)
+        cuda_matmul = getattr(cuda_backend, "matmul", None)
+        if cudnn_conv is not None and hasattr(cudnn_conv, "fp32_precision"):
+            cudnn_conv.fp32_precision = "tf32" if cfg.use_tf32 else "ieee"
+        elif cudnn_backend is not None and hasattr(cudnn_backend, "allow_tf32"):
+            cudnn_backend.allow_tf32 = cfg.use_tf32
+
+        if cuda_matmul is not None and hasattr(cuda_matmul, "fp32_precision"):
+            cuda_matmul.fp32_precision = "tf32" if cfg.use_tf32 else "ieee"
+        elif cuda_matmul is not None and hasattr(cuda_matmul, "allow_tf32"):
+            cuda_matmul.allow_tf32 = cfg.use_tf32
 
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -593,6 +618,15 @@ def run_training(cfg: TrainConfig) -> None:
 
     if cfg.compile_model:
         if hasattr(torch, "compile"):
+            if device.type == "cuda" and cfg.compile_mode == "reduce-overhead":
+                try:
+                    import torch._inductor.config as inductor_config
+
+                    if hasattr(inductor_config, "triton") and hasattr(inductor_config.triton, "cudagraphs"):
+                        inductor_config.triton.cudagraphs = False
+                        print("Disabled Triton CUDA graphs for reduce-overhead compile mode to reduce memory pressure")
+                except Exception:
+                    pass
             model = torch.compile(model, mode=cfg.compile_mode)
             print(f"torch.compile enabled with mode={cfg.compile_mode}")
         else:

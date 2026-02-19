@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.optim import AdamW
 
@@ -128,15 +129,23 @@ class HybridNGIML(nn.Module):
             fusion_inputs["context"] = backbone_feats["context"]
         if self.cfg.use_residual:
             fusion_inputs["residual"] = backbone_feats["residual"]
-        return self.fusion(fusion_inputs, target_size=target_size)
+        return self.fusion(fusion_inputs, target_size=None)
 
     def forward(
         self,
         x: Tensor,
         target_size: Optional[Tuple[int, int]] = None,
     ) -> List[Tensor]:
-        fused = self.forward_features(x, target_size=target_size)
-        return self.decoder(fused)
+        fused = self.forward_features(x, target_size=None)
+        preds = self.decoder(fused)
+        if target_size is None:
+            return preds
+        return [
+            F.interpolate(pred, size=target_size, mode="bilinear", align_corners=False)
+            if pred.shape[-2:] != target_size
+            else pred
+            for pred in preds
+        ]
 
     def optimizer_parameter_groups(self) -> List[Dict[str, object]]:
         """Return AdamW-ready parameter groups with branch-specific LRs/decays."""
