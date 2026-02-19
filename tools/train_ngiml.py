@@ -54,7 +54,7 @@ class TrainConfig:
     use_tf32: bool = True
     cuda_expandable_segments: bool = True
     lr_schedule: bool = True
-    warmup_epochs: int = 2
+    warmup_epochs: int = 3
     min_lr_scale: float = 0.1
     grad_clip: float = 1.0
     grad_accum_steps: int = 1
@@ -90,6 +90,8 @@ class TrainConfig:
     threshold_start: float = 0.1
     threshold_end: float = 0.9
     threshold_step: float = 0.1
+    small_mask_ratio_max: float = 0.01
+    medium_mask_ratio_max: float = 0.05
     compute_foreground_ratio: bool = True
     auto_pos_weight: bool = True
     pos_weight_min: float = 1.0
@@ -102,6 +104,12 @@ class TrainConfig:
     tversky_weight: float = 0.2
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.7
+    ema_enabled: bool = True
+    ema_decay: float = 0.999
+    hard_mining_enabled: bool = True
+    hard_mining_start_epoch: int = 3
+    hard_mining_weight: float = 0.2
+    hard_mining_gamma: float = 2.0
     default_aug: Optional[AugmentationConfig] = None
     per_dataset_aug: Optional[Dict[str, AugmentationConfig]] = None
     model_config: Optional[HybridNGIMLConfig] = None
@@ -113,6 +121,8 @@ class Checkpoint:
     epoch: int
     global_step: int
     model_state: dict
+    raw_model_state: Optional[dict]
+    ema_state: Optional[dict]
     optimizer_state: dict
     scheduler_state: Optional[dict]
     scaler_state: Optional[dict]
@@ -235,6 +245,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--threshold-start", type=float, default=0.1, help="Threshold search range start")
     parser.add_argument("--threshold-end", type=float, default=0.9, help="Threshold search range end")
     parser.add_argument("--threshold-step", type=float, default=0.1, help="Threshold search step size")
+    parser.add_argument("--small-mask-ratio-max", type=float, default=0.01, help="Upper foreground-ratio bound for small-mask validation bin")
+    parser.add_argument("--medium-mask-ratio-max", type=float, default=0.05, help="Upper foreground-ratio bound for medium-mask validation bin")
     parser.add_argument("--compute-foreground-ratio", action=argparse.BooleanOptionalAction, default=True, help="Compute foreground pixel ratio from train loader")
     parser.add_argument("--auto-pos-weight", action=argparse.BooleanOptionalAction, default=True, help="Auto-compute BCE pos_weight from foreground ratio")
     parser.add_argument("--pos-weight-min", type=float, default=1.0, help="Lower clamp for auto pos_weight")
@@ -247,6 +259,12 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--tversky-weight", type=float, default=0.2, help="Optional Tversky loss weight to improve recall")
     parser.add_argument("--tversky-alpha", type=float, default=0.3, help="Tversky alpha (FP penalty)")
     parser.add_argument("--tversky-beta", type=float, default=0.7, help="Tversky beta (FN penalty)")
+    parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=True, help="Use EMA weights for validation and best checkpoints")
+    parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay factor")
+    parser.add_argument("--hard-mining-enabled", action=argparse.BooleanOptionalAction, default=True, help="Enable low-IoU hard-example weighting")
+    parser.add_argument("--hard-mining-start-epoch", type=int, default=2, help="Epoch to start hard-example weighting")
+    parser.add_argument("--hard-mining-weight", type=float, default=0.2, help="Weight of hard-example auxiliary loss")
+    parser.add_argument("--hard-mining-gamma", type=float, default=2.0, help="Scale for low-IoU hard-example weights")
     args = parser.parse_args()
     return TrainConfig(
         manifest=args.manifest,
@@ -298,6 +316,8 @@ def parse_args() -> TrainConfig:
         threshold_start=args.threshold_start,
         threshold_end=args.threshold_end,
         threshold_step=args.threshold_step,
+        small_mask_ratio_max=args.small_mask_ratio_max,
+        medium_mask_ratio_max=args.medium_mask_ratio_max,
         compute_foreground_ratio=args.compute_foreground_ratio,
         auto_pos_weight=args.auto_pos_weight,
         pos_weight_min=args.pos_weight_min,
@@ -310,6 +330,12 @@ def parse_args() -> TrainConfig:
         tversky_weight=args.tversky_weight,
         tversky_alpha=args.tversky_alpha,
         tversky_beta=args.tversky_beta,
+        ema_enabled=args.ema_enabled,
+        ema_decay=args.ema_decay,
+        hard_mining_enabled=args.hard_mining_enabled,
+        hard_mining_start_epoch=args.hard_mining_start_epoch,
+        hard_mining_weight=args.hard_mining_weight,
+        hard_mining_gamma=args.hard_mining_gamma,
     )
 
 
@@ -551,11 +577,16 @@ def save_checkpoint(
     global_step: int,
     cfg: TrainConfig,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    ema_model: Optional[HybridNGIML] = None,
+    use_ema_for_model_state: bool = False,
 ) -> None:
+    model_state = ema_model.state_dict() if (use_ema_for_model_state and ema_model is not None) else model.state_dict()
     ckpt = Checkpoint(
         epoch=epoch,
         global_step=global_step,
-        model_state=model.state_dict(),
+        model_state=model_state,
+        raw_model_state=model.state_dict() if (use_ema_for_model_state and ema_model is not None) else None,
+        ema_state=ema_model.state_dict() if ema_model is not None else None,
         optimizer_state=optimizer.state_dict(),
         scheduler_state=scheduler.state_dict() if scheduler is not None else None,
         scaler_state=scaler.state_dict() if scaler.is_enabled() else None,
@@ -578,9 +609,16 @@ def load_checkpoint(
     scaler: GradScaler,
     device: torch.device,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    ema_model: Optional[HybridNGIML] = None,
 ) -> Tuple[int, int]:
     data = torch.load(path, map_location=device)
-    model.load_state_dict(data["model_state"])
+    model_state = data.get("raw_model_state") or data["model_state"]
+    model.load_state_dict(model_state)
+    if ema_model is not None:
+        if data.get("ema_state") is not None:
+            ema_model.load_state_dict(data["ema_state"])
+        else:
+            ema_model.load_state_dict(model.state_dict())
     optimizer.load_state_dict(data["optimizer_state"])
     if scheduler is not None and data.get("scheduler_state") is not None:
         scheduler.load_state_dict(data["scheduler_state"])
@@ -627,16 +665,190 @@ def _metric_for_monitor(metrics: dict, monitor: str) -> float:
     return float(metrics[key])
 
 
-def train_one_epoch(model: HybridNGIML, loader, optimizer, scaler: GradScaler, loss_fn, device: torch.device, cfg: TrainConfig, epoch: int, global_step: int):
+def _get_git_hash() -> str | None:
+    git_dir = ROOT
+    head_path = git_dir / ".git" / "HEAD"
+    if not head_path.exists():
+        return None
+
+    try:
+        head = head_path.read_text(encoding="utf-8").strip()
+        if head.startswith("ref:"):
+            ref = head.split("ref:", 1)[1].strip()
+            ref_path = git_dir / ".git" / ref
+            if ref_path.exists():
+                return ref_path.read_text(encoding="utf-8").strip()
+            return None
+        return head
+    except Exception:
+        return None
+
+
+def _init_ema_model(model: HybridNGIML, enabled: bool) -> Optional[HybridNGIML]:
+    if not enabled:
+        return None
+    ema_model = HybridNGIML(model.config)
+    ema_model.load_state_dict(model.state_dict())
+    ema_model.eval()
+    for p in ema_model.parameters():
+        p.requires_grad_(False)
+    return ema_model
+
+
+@torch.no_grad()
+def _update_ema_model(ema_model: Optional[HybridNGIML], model: HybridNGIML, decay: float) -> None:
+    if ema_model is None:
+        return
+    decay = float(min(max(decay, 0.0), 0.999999))
+    msd = model.state_dict()
+    for key, value in ema_model.state_dict().items():
+        model_value = msd[key].detach()
+        if not torch.is_floating_point(value):
+            value.copy_(model_value)
+        else:
+            value.mul_(decay).add_(model_value, alpha=1.0 - decay)
+
+
+def _size_bin_name(fg_ratio: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
+    small_max = float(max(0.0, cfg.small_mask_ratio_max))
+    medium_max = float(max(small_max, cfg.medium_mask_ratio_max))
+    bins = torch.full_like(fg_ratio, 2, dtype=torch.long)
+    bins = torch.where(fg_ratio <= small_max, torch.zeros_like(bins), bins)
+    bins = torch.where((fg_ratio > small_max) & (fg_ratio <= medium_max), torch.ones_like(bins), bins)
+    return bins
+
+
+def _empty_bin_stats() -> Dict[str, Dict[str, float]]:
+    return {
+        "small": {"tp": 0.0, "tn": 0.0, "fp": 0.0, "fn": 0.0, "count": 0.0},
+        "medium": {"tp": 0.0, "tn": 0.0, "fp": 0.0, "fn": 0.0, "count": 0.0},
+        "large": {"tp": 0.0, "tn": 0.0, "fp": 0.0, "fn": 0.0, "count": 0.0},
+    }
+
+
+def _finalize_bin_stats(bin_stats: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for name, stats in bin_stats.items():
+        metrics = _metrics_from_counts(stats["tp"], stats["tn"], stats["fp"], stats["fn"])
+        out[name] = {
+            "count": float(stats["count"]),
+            "dice": float(metrics["dice"]),
+            "iou": float(metrics["iou"]),
+            "precision": float(metrics["precision"]),
+            "recall": float(metrics["recall"]),
+            "accuracy": float(metrics["accuracy"]),
+        }
+    return out
+
+
+def _to_float_label_ratio(labels: torch.Tensor) -> tuple[float, float]:
+    labels_f = labels.float()
+    positives = float((labels_f >= 0.5).sum().item())
+    total = float(labels_f.numel())
+    return positives, total
+
+
+def _write_experiment_fingerprint(
+    out_dir: Path,
+    cfg: TrainConfig,
+    resolved_manifest: Path,
+    class_ratio: float | None = None,
+    chosen_threshold: float | None = None,
+) -> Path:
+    cfg_dict = asdict(cfg)
+    cfg_json = json.dumps(cfg_dict, sort_keys=True, default=str)
+    fingerprint = hashlib.sha1(cfg_json.encode("utf-8")).hexdigest()
+
+    payload = {
+        "fingerprint": fingerprint,
+        "created_at_unix": float(time.time()),
+        "git_hash": _get_git_hash(),
+        "manifest": str(resolved_manifest),
+        "seed": int(cfg.seed),
+        "class_ratio": float(class_ratio) if class_ratio is not None else None,
+        "chosen_threshold": float(chosen_threshold) if chosen_threshold is not None else None,
+        "sampler": {
+            "mode": "round_robin_balanced" if cfg.balance_real_fake else "round_robin",
+            "balance_sampling": bool(cfg.balance_sampling),
+            "balance_real_fake": bool(cfg.balance_real_fake),
+            "balanced_positive_ratio": float(cfg.balanced_positive_ratio),
+            "round_robin_seed": cfg.round_robin_seed,
+            "balanced_sampler_seed": cfg.balanced_sampler_seed,
+        },
+        "loss": {
+            "hybrid_mode": cfg.loss_hybrid_mode,
+            "dice_weight": float(cfg.dice_weight),
+            "bce_weight": float(cfg.bce_weight),
+            "tversky_weight": float(cfg.tversky_weight),
+            "tversky_alpha": float(cfg.tversky_alpha),
+            "tversky_beta": float(cfg.tversky_beta),
+            "hard_mining_enabled": bool(cfg.hard_mining_enabled),
+            "hard_mining_start_epoch": int(cfg.hard_mining_start_epoch),
+            "hard_mining_weight": float(cfg.hard_mining_weight),
+            "hard_mining_gamma": float(cfg.hard_mining_gamma),
+        },
+        "ema": {
+            "enabled": bool(cfg.ema_enabled),
+            "decay": float(cfg.ema_decay),
+        },
+        "threshold_search": {
+            "enabled": bool(cfg.optimize_threshold),
+            "metric": cfg.threshold_metric,
+            "start": float(cfg.threshold_start),
+            "end": float(cfg.threshold_end),
+            "step": float(cfg.threshold_step),
+            "fixed_threshold": float(cfg.metric_threshold),
+        },
+    }
+
+    path = out_dir / "experiment_fingerprint.json"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return path
+
+
+def _update_experiment_fingerprint(path: Path, updates: dict) -> None:
+    if not path.exists():
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return
+
+    payload.update(updates)
+    payload["updated_at_unix"] = float(time.time())
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def train_one_epoch(
+    model: HybridNGIML,
+    loader,
+    optimizer,
+    scaler: GradScaler,
+    loss_fn,
+    device: torch.device,
+    cfg: TrainConfig,
+    epoch: int,
+    global_step: int,
+    ema_model: Optional[HybridNGIML] = None,
+):
     model.train()
     running_loss = 0.0
     num_batches = 0
+    sampled_pos = 0.0
+    sampled_total = 0.0
     accum_steps = max(1, int(cfg.grad_accum_steps))
     progress = tqdm(loader, desc=f"Epoch {epoch:03d}", leave=False, dynamic_ncols=True)
     optimizer.zero_grad(set_to_none=True)
     for step, batch in enumerate(progress):
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
+        labels = batch["labels"]
+        pos_count, total_count = _to_float_label_ratio(labels)
+        sampled_pos += pos_count
+        sampled_total += total_count
         if cfg.channels_last and device.type == "cuda":
             images = images.contiguous(memory_format=torch.channels_last)
 
@@ -644,6 +856,35 @@ def train_one_epoch(model: HybridNGIML, loader, optimizer, scaler: GradScaler, l
         with autocast(device_type=device.type, enabled=use_amp):
             preds = model(images, target_size=masks.shape[-2:])
             loss = loss_fn(preds, masks)
+
+            if cfg.hard_mining_enabled and epoch >= int(max(0, cfg.hard_mining_start_epoch)):
+                final_logits = preds[-1]
+                if final_logits.shape[-2:] != masks.shape[-2:]:
+                    final_logits = torch.nn.functional.interpolate(
+                        final_logits,
+                        size=masks.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+
+                bce_per_sample = torch.nn.functional.binary_cross_entropy_with_logits(
+                    final_logits,
+                    masks,
+                    reduction="none",
+                ).mean(dim=(1, 2, 3))
+
+                with torch.no_grad():
+                    pred_bin = (torch.sigmoid(final_logits) >= 0.5).float()
+                    tp = (pred_bin * masks).sum(dim=(1, 2, 3))
+                    fp = (pred_bin * (1.0 - masks)).sum(dim=(1, 2, 3))
+                    fn = ((1.0 - pred_bin) * masks).sum(dim=(1, 2, 3))
+                    iou = (tp + 1e-6) / (tp + fp + fn + 1e-6)
+                    difficulty = (1.0 - iou).clamp(0.0, 1.0)
+                    hard_weights = 1.0 + float(max(0.0, cfg.hard_mining_gamma)) * difficulty
+                    hard_weights = hard_weights / hard_weights.mean().clamp_min(1e-6)
+
+                hard_loss = (hard_weights * bce_per_sample).mean()
+                loss = loss + float(max(0.0, cfg.hard_mining_weight)) * hard_loss
 
         scaled_loss = loss / accum_steps
         scaler.scale(scaled_loss).backward()
@@ -658,6 +899,7 @@ def train_one_epoch(model: HybridNGIML, loader, optimizer, scaler: GradScaler, l
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            _update_ema_model(ema_model, model, cfg.ema_decay)
 
         running_loss += loss.item()
         num_batches += 1
@@ -666,7 +908,8 @@ def train_one_epoch(model: HybridNGIML, loader, optimizer, scaler: GradScaler, l
         avg_loss = running_loss / max(1, num_batches)
         progress.set_postfix(loss=f"{avg_loss:.4f}", step=f"{step:05d}", accum=f"{accum_steps}")
 
-    return running_loss / max(1, num_batches), global_step
+    sampled_positive_ratio = sampled_pos / max(sampled_total, 1.0)
+    return running_loss / max(1, num_batches), global_step, sampled_positive_ratio
 
 
 @torch.inference_mode()
@@ -727,6 +970,10 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         float(th): {"tp": 0.0, "tn": 0.0, "fp": 0.0, "fn": 0.0}
         for th in thresholds
     }
+    threshold_bin_stats = {
+        float(th): _empty_bin_stats()
+        for th in thresholds
+    }
 
     progress = tqdm(loader, desc="Validation", leave=False, dynamic_ncols=True)
     for batch in progress:
@@ -740,12 +987,35 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
             loss = loss_fn(preds, masks)
         logits = preds[-1]
 
+        with torch.no_grad():
+            fg_ratio = masks.float().mean(dim=(1, 2, 3))
+            size_bin_idx = _size_bin_name(fg_ratio, cfg)
+
         for threshold in thresholds:
             counts = _segmentation_counts(logits, masks, threshold=threshold)
             threshold_stats[float(threshold)]["tp"] += counts["tp"]
             threshold_stats[float(threshold)]["tn"] += counts["tn"]
             threshold_stats[float(threshold)]["fp"] += counts["fp"]
             threshold_stats[float(threshold)]["fn"] += counts["fn"]
+
+            pred = (torch.sigmoid(logits) >= float(threshold)).float()
+            target = masks.float()
+            tp_b = (pred * target).sum(dim=(1, 2, 3))
+            tn_b = ((1.0 - pred) * (1.0 - target)).sum(dim=(1, 2, 3))
+            fp_b = (pred * (1.0 - target)).sum(dim=(1, 2, 3))
+            fn_b = ((1.0 - pred) * target).sum(dim=(1, 2, 3))
+
+            bin_names = ["small", "medium", "large"]
+            for bin_id, bin_name in enumerate(bin_names):
+                mask_sel = size_bin_idx == bin_id
+                if not torch.any(mask_sel):
+                    continue
+                stats = threshold_bin_stats[float(threshold)][bin_name]
+                stats["tp"] += float(tp_b[mask_sel].sum().item())
+                stats["tn"] += float(tn_b[mask_sel].sum().item())
+                stats["fp"] += float(fp_b[mask_sel].sum().item())
+                stats["fn"] += float(fn_b[mask_sel].sum().item())
+                stats["count"] += float(mask_sel.sum().item())
 
         total_loss += loss.item()
         batches += 1
@@ -773,6 +1043,8 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         nearest_threshold, best_metrics = min(scored_thresholds, key=lambda item: abs(item[0] - fixed_threshold))
         best_threshold = float(nearest_threshold)
 
+    best_bin_metrics = _finalize_bin_stats(threshold_bin_stats[float(best_threshold)])
+
     normalizer = max(1, batches)
     return {
         "loss": total_loss / normalizer,
@@ -783,6 +1055,7 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         "accuracy": float(best_metrics["accuracy"]),
         "threshold": float(best_threshold),
         "threshold_metric": optimize_key,
+        "size_bins": best_bin_metrics,
     }
 
 
@@ -845,6 +1118,11 @@ def run_training(cfg: TrainConfig) -> None:
     optimizer = model.build_optimizer()
     scheduler = _build_lr_scheduler(optimizer, cfg)
     scaler = GradScaler(device.type, enabled=(cfg.amp and device.type == "cuda"))
+    ema_model = _init_ema_model(model, cfg.ema_enabled)
+    if ema_model is not None:
+        ema_model = ema_model.to(device)
+        if cfg.channels_last and device.type == "cuda":
+            ema_model = ema_model.to(memory_format=torch.channels_last)
     loss_cfg = cfg.loss_config or MultiStageLossConfig(
         hybrid_mode=cfg.loss_hybrid_mode,
         dice_weight=cfg.dice_weight,
@@ -887,7 +1165,15 @@ def run_training(cfg: TrainConfig) -> None:
 
     if resume_path:
         if resume_path.is_file():
-            start_epoch, global_step = load_checkpoint(resume_path, model, optimizer, scaler, device, scheduler=scheduler)
+            start_epoch, global_step = load_checkpoint(
+                resume_path,
+                model,
+                optimizer,
+                scaler,
+                device,
+                scheduler=scheduler,
+                ema_model=ema_model,
+            )
             print(f"Resumed from {resume_path} at epoch {start_epoch} step {global_step}")
         else:
             print(f"Resume path {resume_path} not found; starting fresh")
@@ -895,7 +1181,9 @@ def run_training(cfg: TrainConfig) -> None:
         print("Auto-resume enabled but no checkpoint found; starting fresh")
 
     if cfg.compile_model:
-        if hasattr(torch, "compile"):
+        if ema_model is not None:
+            print("torch.compile skipped because EMA is enabled (keeps EMA/state_dict keys consistent)")
+        elif hasattr(torch, "compile"):
             if device.type == "cuda" and cfg.compile_mode == "reduce-overhead":
                 try:
                     import torch._inductor.config as inductor_config
@@ -912,15 +1200,23 @@ def run_training(cfg: TrainConfig) -> None:
 
     with open(out_dir / "train_config.json", "w", encoding="utf-8") as handle:
         json.dump(asdict(cfg), handle, indent=2)
+    fingerprint_path = _write_experiment_fingerprint(
+        out_dir,
+        cfg,
+        Path(cfg.manifest),
+        class_ratio=foreground_ratio,
+        chosen_threshold=None,
+    )
 
     best_monitor_value = float("-inf")
     best_val_iou = float("-inf")
     no_improve_epochs = 0
     early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
+    best_threshold_path = checkpoint_dir / "best_threshold.json"
 
     for epoch in range(start_epoch, cfg.epochs):
         start_time = time.time()
-        train_loss, global_step = train_one_epoch(
+        train_loss, global_step, train_positive_ratio = train_one_epoch(
             model,
             loaders["train"],
             optimizer,
@@ -930,15 +1226,22 @@ def run_training(cfg: TrainConfig) -> None:
             cfg,
             epoch,
             global_step,
+            ema_model=ema_model,
         )
 
         elapsed = time.time() - start_time
         if scheduler is not None:
             scheduler.step()
             current_lr = optimizer.param_groups[0]["lr"]
-            print(f"Epoch {epoch:03d} done | loss {train_loss:.4f} | lr {current_lr:.6e} | time {elapsed:.1f}s")
+            print(
+                f"Epoch {epoch:03d} done | loss {train_loss:.4f} | "
+                f"sample_pos_ratio {train_positive_ratio:.3f} | lr {current_lr:.6e} | time {elapsed:.1f}s"
+            )
         else:
-            print(f"Epoch {epoch:03d} done | loss {train_loss:.4f} | time {elapsed:.1f}s")
+            print(
+                f"Epoch {epoch:03d} done | loss {train_loss:.4f} | "
+                f"sample_pos_ratio {train_positive_ratio:.3f} | time {elapsed:.1f}s"
+            )
 
         val_loss = None
         val_dice = None
@@ -947,8 +1250,10 @@ def run_training(cfg: TrainConfig) -> None:
         val_recall = None
         val_accuracy = None
         val_threshold = None
+        val_size_bins = None
         if "val" in loaders and (epoch + 1) % cfg.val_every == 0:
-            metrics = evaluate(model, loaders["val"], loss_fn, device, cfg)
+            eval_model = ema_model if ema_model is not None else model
+            metrics = evaluate(eval_model, loaders["val"], loss_fn, device, cfg)
             val_loss = float(metrics["loss"])
             val_dice = float(metrics["dice"])
             val_iou = float(metrics["iou"])
@@ -956,17 +1261,37 @@ def run_training(cfg: TrainConfig) -> None:
             val_recall = float(metrics["recall"])
             val_accuracy = float(metrics["accuracy"])
             val_threshold = float(metrics["threshold"])
+            val_size_bins = metrics.get("size_bins")
             print(
                 f"Val | loss {val_loss:.4f} | dice {val_dice:.4f} | iou {val_iou:.4f} "
                 f"| precision {val_precision:.4f} | recall {val_recall:.4f} | accuracy {val_accuracy:.4f} "
                 f"| threshold {val_threshold:.2f}"
             )
+            if isinstance(val_size_bins, dict):
+                small_iou = float(val_size_bins.get("small", {}).get("iou", 0.0))
+                medium_iou = float(val_size_bins.get("medium", {}).get("iou", 0.0))
+                large_iou = float(val_size_bins.get("large", {}).get("iou", 0.0))
+                print(
+                    "Val bins | "
+                    f"small_iou {small_iou:.4f} | medium_iou {medium_iou:.4f} | large_iou {large_iou:.4f}"
+                )
 
             iou_improved = val_iou > (best_val_iou + cfg.early_stopping_min_delta)
             if iou_improved:
                 best_val_iou = val_iou
                 best_iou_path = checkpoint_dir / "best_iou_checkpoint.pt"
-                save_checkpoint(best_iou_path, model, optimizer, scaler, epoch + 1, global_step, cfg, scheduler=scheduler)
+                save_checkpoint(
+                    best_iou_path,
+                    model,
+                    optimizer,
+                    scaler,
+                    epoch + 1,
+                    global_step,
+                    cfg,
+                    scheduler=scheduler,
+                    ema_model=ema_model,
+                    use_ema_for_model_state=(ema_model is not None),
+                )
                 print(f"New best val iou {best_val_iou:.4f}; saved to {best_iou_path}")
 
             monitor_value = _metric_for_monitor(metrics, cfg.early_stopping_monitor)
@@ -975,10 +1300,49 @@ def run_training(cfg: TrainConfig) -> None:
                 best_monitor_value = monitor_value
                 no_improve_epochs = 0
                 best_alias_path = checkpoint_dir / "best_checkpoint.pt"
-                save_checkpoint(best_alias_path, model, optimizer, scaler, epoch + 1, global_step, cfg, scheduler=scheduler)
+                save_checkpoint(
+                    best_alias_path,
+                    model,
+                    optimizer,
+                    scaler,
+                    epoch + 1,
+                    global_step,
+                    cfg,
+                    scheduler=scheduler,
+                    ema_model=ema_model,
+                    use_ema_for_model_state=(ema_model is not None),
+                )
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                with open(best_threshold_path, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "epoch": int(epoch + 1),
+                            "threshold": float(val_threshold) if val_threshold is not None else None,
+                            "threshold_metric": str(metrics.get("threshold_metric", cfg.threshold_metric)),
+                            "monitor": cfg.early_stopping_monitor,
+                            "monitor_value": float(monitor_value),
+                            "val_iou": float(val_iou) if val_iou is not None else None,
+                            "val_dice": float(val_dice) if val_dice is not None else None,
+                            "val_precision": float(val_precision) if val_precision is not None else None,
+                            "val_recall": float(val_recall) if val_recall is not None else None,
+                            "val_accuracy": float(val_accuracy) if val_accuracy is not None else None,
+                            "val_size_bins": val_size_bins,
+                        },
+                        handle,
+                        indent=2,
+                    )
+                _update_experiment_fingerprint(
+                    fingerprint_path,
+                    {
+                        "chosen_threshold": float(val_threshold) if val_threshold is not None else None,
+                        "best_monitor": cfg.early_stopping_monitor,
+                        "best_monitor_value": float(monitor_value),
+                        "best_val_iou": float(val_iou) if val_iou is not None else None,
+                    },
+                )
                 print(
                     f"New best val {cfg.early_stopping_monitor} {monitor_value:.4f}; "
-                    f"saved to {best_alias_path}"
+                    f"saved to {best_alias_path} (threshold metadata: {best_threshold_path})"
                 )
             elif early_stopping_enabled:
                 no_improve_epochs += 1
@@ -990,13 +1354,25 @@ def run_training(cfg: TrainConfig) -> None:
         should_checkpoint = ((epoch + 1) % cfg.checkpoint_every == 0) or (epoch + 1 == cfg.epochs)
         if should_checkpoint:
             ckpt_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1:03d}.pt"
-            save_checkpoint(ckpt_path, model, optimizer, scaler, epoch + 1, global_step, cfg, scheduler=scheduler)
+            save_checkpoint(
+                ckpt_path,
+                model,
+                optimizer,
+                scaler,
+                epoch + 1,
+                global_step,
+                cfg,
+                scheduler=scheduler,
+                ema_model=ema_model,
+                use_ema_for_model_state=False,
+            )
             append_checkpoint_log(
                 checkpoint_log_path,
                 {
                     "epoch": epoch + 1,
                     "global_step": global_step,
                     "train_loss": float(train_loss),
+                    "train_positive_ratio": float(train_positive_ratio),
                     "val_loss": val_loss,
                     "val_dice": val_dice,
                     "val_iou": val_iou,
@@ -1004,6 +1380,7 @@ def run_training(cfg: TrainConfig) -> None:
                     "val_recall": val_recall,
                     "val_accuracy": val_accuracy,
                     "val_threshold": val_threshold,
+                    "val_size_bins": val_size_bins,
                     "epoch_seconds": float(elapsed),
                     "checkpoint_path": str(ckpt_path),
                 },

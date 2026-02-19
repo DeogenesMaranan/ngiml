@@ -34,6 +34,27 @@ def ensure_local_manifest(prepared_root: Path, manifest_path: Path | None = None
     return build_manifest_from_prepared(prepared_root, manifest_out=default_manifest)
 
 
+def load_default_threshold(checkpoint_path: Path, fallback: float = 0.5) -> float:
+    checkpoint_path = Path(checkpoint_path)
+    candidate_files = [
+        checkpoint_path.parent / "best_threshold.json",
+        checkpoint_path.parent.parent / "best_threshold.json",
+    ]
+    for candidate in candidate_files:
+        if not candidate.exists():
+            continue
+        try:
+            import json
+
+            with open(candidate, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            threshold = payload.get("threshold", fallback)
+            return float(threshold)
+        except Exception:
+            continue
+    return float(fallback)
+
+
 def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | None = None) -> tuple[HybridNGIML, torch.device, dict]:
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -49,7 +70,9 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
         "epoch": int(checkpoint.get("epoch", -1)),
         "missing_keys": len(missing),
         "unexpected_keys": len(unexpected),
+        "default_threshold": float(load_default_threshold(Path(checkpoint_path), fallback=0.5)),
     }
+    setattr(model, "default_threshold", float(info["default_threshold"]))
     return model, device, info
 
 
@@ -121,6 +144,18 @@ def predict_probability_map(model: HybridNGIML, image: torch.Tensor, device: tor
         logits = model(x, target_size=image.shape[-2:])[-1]
         prob = torch.sigmoid(logits)[0, 0].detach().cpu()
     return prob
+
+
+def predict_binary_map(
+    model: HybridNGIML,
+    image: torch.Tensor,
+    device: torch.device,
+    threshold: float | None = None,
+) -> torch.Tensor:
+    prob = predict_probability_map(model, image, device)
+    if threshold is None:
+        threshold = float(getattr(model, "default_threshold", 0.5))
+    return (prob >= float(threshold)).float()
 
 
 def infer_from_image_path(model: HybridNGIML, image_path: Path, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
