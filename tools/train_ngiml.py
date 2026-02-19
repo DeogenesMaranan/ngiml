@@ -14,6 +14,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
+import re
 
 import torch
 from torch.amp import GradScaler, autocast
@@ -43,6 +44,7 @@ class TrainConfig:
     val_every: int = 1
     checkpoint_every: int = 1
     resume: Optional[str] = None
+    auto_resume: bool = False
     round_robin_seed: Optional[int] = 0
     prefetch_factor: Optional[int] = None
     persistent_workers: bool = False
@@ -86,6 +88,11 @@ def parse_args() -> TrainConfig:
         help="Write checkpoint every N epochs (includes last epoch)",
     )
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint path to resume from")
+    parser.add_argument(
+        "--auto-resume",
+        action="store_true",
+        help="Automatically resume from latest checkpoint in output_dir/checkpoints when available",
+    )
     parser.add_argument("--round-robin-seed", type=int, default=0, help="Seed for round-robin sampler")
     parser.add_argument("--prefetch-factor", type=int, default=None, help="DataLoader prefetch factor")
     parser.add_argument("--persistent-workers", action="store_true", help="Enable persistent workers")
@@ -107,6 +114,7 @@ def parse_args() -> TrainConfig:
         val_every=args.val_every,
         checkpoint_every=args.checkpoint_every,
         resume=args.resume,
+        auto_resume=args.auto_resume,
         round_robin_seed=args.round_robin_seed,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
@@ -215,6 +223,19 @@ def load_checkpoint(path: Path, model: HybridNGIML, optimizer: torch.optim.Optim
     return start_epoch, global_step
 
 
+def _checkpoint_epoch(path: Path) -> int:
+    match = re.search(r"checkpoint_epoch_(\d+)\.pt$", path.name)
+    return int(match.group(1)) if match else -1
+
+
+def find_latest_checkpoint(output_dir: Path) -> Optional[Path]:
+    checkpoint_dir = output_dir / "checkpoints"
+    if not checkpoint_dir.exists():
+        return None
+    candidates = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pt"), key=_checkpoint_epoch)
+    return candidates[-1] if candidates else None
+
+
 def train_one_epoch(model: HybridNGIML, loader, optimizer, scaler: GradScaler, loss_fn, device: torch.device, cfg: TrainConfig, epoch: int, global_step: int):
     model.train()
     running_loss = 0.0
@@ -283,20 +304,30 @@ def run_training(cfg: TrainConfig) -> None:
     loss_cfg = cfg.loss_config or MultiStageLossConfig()
     loss_fn = MultiStageManipulationLoss(loss_cfg)
 
+    out_dir = Path(cfg.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = out_dir / "checkpoints"
+    checkpoint_log_path = checkpoint_dir / "checkpoint_metrics.jsonl"
+
     start_epoch = 0
     global_step = 0
+    resume_path: Optional[Path] = None
     if cfg.resume:
         resume_path = Path(cfg.resume)
+    elif cfg.auto_resume:
+        resume_path = find_latest_checkpoint(out_dir)
+        if resume_path is not None:
+            print(f"Auto-resume selected latest checkpoint: {resume_path}")
+
+    if resume_path:
         if resume_path.is_file():
             start_epoch, global_step = load_checkpoint(resume_path, model, optimizer, scaler, device)
             print(f"Resumed from {resume_path} at epoch {start_epoch} step {global_step}")
         else:
             print(f"Resume path {resume_path} not found; starting fresh")
+    elif cfg.auto_resume:
+        print("Auto-resume enabled but no checkpoint found; starting fresh")
 
-    out_dir = Path(cfg.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir = out_dir / "checkpoints"
-    checkpoint_log_path = checkpoint_dir / "checkpoint_metrics.jsonl"
     with open(out_dir / "train_config.json", "w", encoding="utf-8") as handle:
         json.dump(asdict(cfg), handle, indent=2)
 
