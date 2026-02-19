@@ -16,8 +16,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
-from torch.amp import autocast
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
 from tqdm.auto import tqdm
 
@@ -198,6 +197,12 @@ def save_checkpoint(path: Path, model: HybridNGIML, optimizer: torch.optim.Optim
     torch.save(ckpt.__dict__, path)
 
 
+def append_checkpoint_log(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
 def load_checkpoint(path: Path, model: HybridNGIML, optimizer: torch.optim.Optimizer, scaler: GradScaler, device: torch.device) -> Tuple[int, int]:
     data = torch.load(path, map_location=device)
     model.load_state_dict(data["model_state"])
@@ -273,7 +278,7 @@ def run_training(cfg: TrainConfig) -> None:
     model_cfg = cfg.model_config or HybridNGIMLConfig()
     model = HybridNGIML(model_cfg).to(device)
     optimizer = model.build_optimizer()
-    scaler = GradScaler(enabled=cfg.amp)
+    scaler = GradScaler(device.type, enabled=(cfg.amp and device.type == "cuda"))
     loss_cfg = cfg.loss_config or MultiStageLossConfig()
     loss_fn = MultiStageManipulationLoss(loss_cfg)
 
@@ -289,6 +294,8 @@ def run_training(cfg: TrainConfig) -> None:
 
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = out_dir / "checkpoints"
+    checkpoint_log_path = checkpoint_dir / "checkpoint_metrics.jsonl"
     with open(out_dir / "train_config.json", "w", encoding="utf-8") as handle:
         json.dump(asdict(cfg), handle, indent=2)
 
@@ -309,14 +316,30 @@ def run_training(cfg: TrainConfig) -> None:
         elapsed = time.time() - start_time
         print(f"Epoch {epoch:03d} done | loss {train_loss:.4f} | time {elapsed:.1f}s")
 
+        val_loss = None
+        val_dice = None
         if "val" in loaders and (epoch + 1) % cfg.val_every == 0:
             metrics = evaluate(model, loaders["val"], loss_fn, device)
-            print(f"Val | loss {metrics['loss']:.4f} | dice {metrics['dice']:.4f}")
+            val_loss = float(metrics["loss"])
+            val_dice = float(metrics["dice"])
+            print(f"Val | loss {val_loss:.4f} | dice {val_dice:.4f}")
 
         should_checkpoint = ((epoch + 1) % cfg.checkpoint_every == 0) or (epoch + 1 == cfg.epochs)
         if should_checkpoint:
-            ckpt_path = out_dir / f"checkpoint_epoch_{epoch+1:03d}.pt"
+            ckpt_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1:03d}.pt"
             save_checkpoint(ckpt_path, model, optimizer, scaler, epoch + 1, global_step, cfg)
+            append_checkpoint_log(
+                checkpoint_log_path,
+                {
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "train_loss": float(train_loss),
+                    "val_loss": val_loss,
+                    "val_dice": val_dice,
+                    "epoch_seconds": float(elapsed),
+                    "checkpoint_path": str(ckpt_path),
+                },
+            )
             print(f"Saved checkpoint to {ckpt_path}")
 
     print("Training complete")
