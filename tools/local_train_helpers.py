@@ -97,6 +97,7 @@ def build_local_training_config(
     manifest_path: Path,
     output_dir: Path,
     balance_sampling: bool = False,
+    vram_profile: str = "6gb",
 ) -> dict:
     model_cfg, loss_cfg, default_aug, per_dataset_aug = build_default_components()
     training_config = build_training_config(
@@ -112,6 +113,14 @@ def build_local_training_config(
         training_config,
         balance_sampling=balance_sampling,
     )
+
+    base_batch_size = int(training_config.get("batch_size", 8))
+    profile = vram_profile.lower().strip()
+    if profile in {"6gb", "rtx4050", "low"}:
+        training_config["batch_size"] = 1
+        training_config["grad_accum_steps"] = max(1, base_batch_size)
+    else:
+        training_config["grad_accum_steps"] = 1
 
     output_dir = Path(output_dir)
     local_cache = output_dir / "local_cache"

@@ -57,6 +57,7 @@ class TrainConfig:
     warmup_epochs: int = 2
     min_lr_scale: float = 0.1
     grad_clip: float = 1.0
+    grad_accum_steps: int = 1
     val_every: int = 1
     checkpoint_every: int = 1
     resume: Optional[str] = None
@@ -120,6 +121,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--warmup-epochs", type=int, default=2, help="Number of warmup epochs")
     parser.add_argument("--min-lr-scale", type=float, default=0.1, help="Final LR scale for cosine schedule")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Max gradient norm; <=0 disables")
+    parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--val-every", type=int, default=1, help="Validate every N epochs")
     parser.add_argument(
         "--checkpoint-every",
@@ -198,6 +200,7 @@ def parse_args() -> TrainConfig:
         warmup_epochs=args.warmup_epochs,
         min_lr_scale=args.min_lr_scale,
         grad_clip=args.grad_clip,
+        grad_accum_steps=max(1, int(args.grad_accum_steps)),
         val_every=args.val_every,
         checkpoint_every=args.checkpoint_every,
         resume=args.resume,
@@ -487,33 +490,40 @@ def train_one_epoch(model: HybridNGIML, loader, optimizer, scaler: GradScaler, l
     model.train()
     running_loss = 0.0
     num_batches = 0
+    accum_steps = max(1, int(cfg.grad_accum_steps))
     progress = tqdm(loader, desc=f"Epoch {epoch:03d}", leave=False, dynamic_ncols=True)
+    optimizer.zero_grad(set_to_none=True)
     for step, batch in enumerate(progress):
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
         if cfg.channels_last and device.type == "cuda":
             images = images.contiguous(memory_format=torch.channels_last)
 
-        optimizer.zero_grad(set_to_none=True)
         use_amp = cfg.amp and device.type == "cuda"
         with autocast(device_type=device.type, enabled=use_amp):
             preds = model(images, target_size=masks.shape[-2:])
             loss = loss_fn(preds, masks)
-        scaler.scale(loss).backward()
 
-        if cfg.grad_clip and cfg.grad_clip > 0:
-            scaler.unscale_(optimizer)
-            clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        scaled_loss = loss / accum_steps
+        scaler.scale(scaled_loss).backward()
 
-        scaler.step(optimizer)
-        scaler.update()
+        do_step = ((step + 1) % accum_steps == 0) or ((step + 1) == len(loader))
+
+        if do_step:
+            if cfg.grad_clip and cfg.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                clip_grad_norm_(model.parameters(), cfg.grad_clip)
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         running_loss += loss.item()
         num_batches += 1
         global_step += 1
 
         avg_loss = running_loss / max(1, num_batches)
-        progress.set_postfix(loss=f"{avg_loss:.4f}", step=f"{step:05d}")
+        progress.set_postfix(loss=f"{avg_loss:.4f}", step=f"{step:05d}", accum=f"{accum_steps}")
 
     return running_loss / max(1, num_batches), global_step
 
