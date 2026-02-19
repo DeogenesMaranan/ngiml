@@ -263,7 +263,7 @@ def build_default_components():
     per_dataset_aug = {
         "IMD2020": AugmentationConfig(
             enable=True,
-            views_per_sample=2,
+            views_per_sample=8,
             enable_flips=True,
             enable_rotations=True,
             max_rotation_degrees=8.0,
@@ -359,8 +359,6 @@ def apply_colab_runtime_settings(
             model_cfg.optimizer.fusion.lr = 3e-4
             model_cfg.optimizer.decoder.lr = 3e-4
 
-    if "per_dataset_aug" in training_config and "IMD2020" in training_config["per_dataset_aug"]:
-        training_config["per_dataset_aug"]["IMD2020"].views_per_sample = 1 if balance_sampling else 2
 
     return training_config
 
