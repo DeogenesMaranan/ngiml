@@ -350,7 +350,7 @@ def apply_colab_runtime_settings(
         model_cfg.optimizer.decoder.weight_decay = 1e-4
 
         if tune_for_large_batch:
-            training_config["batch_size"] = 16
+            training_config["batch_size"] = 12
             training_config["grad_accum_steps"] = 1
             model_cfg.optimizer.efficientnet.lr = 4.5e-5
             model_cfg.optimizer.swin.lr = 1.5e-5
