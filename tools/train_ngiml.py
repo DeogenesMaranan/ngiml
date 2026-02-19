@@ -684,10 +684,10 @@ def _get_git_hash() -> str | None:
         return None
 
 
-def _init_ema_model(model: HybridNGIML, enabled: bool) -> Optional[HybridNGIML]:
+def _init_ema_model(model: HybridNGIML, model_cfg: HybridNGIMLConfig, enabled: bool) -> Optional[HybridNGIML]:
     if not enabled:
         return None
-    ema_model = HybridNGIML(model.config)
+    ema_model = HybridNGIML(model_cfg)
     ema_model.load_state_dict(model.state_dict())
     ema_model.eval()
     for p in ema_model.parameters():
@@ -1118,7 +1118,7 @@ def run_training(cfg: TrainConfig) -> None:
     optimizer = model.build_optimizer()
     scheduler = _build_lr_scheduler(optimizer, cfg)
     scaler = GradScaler(device.type, enabled=(cfg.amp and device.type == "cuda"))
-    ema_model = _init_ema_model(model, cfg.ema_enabled)
+    ema_model = _init_ema_model(model, model_cfg, cfg.ema_enabled)
     if ema_model is not None:
         ema_model = ema_model.to(device)
         if cfg.channels_last and device.type == "cuda":
