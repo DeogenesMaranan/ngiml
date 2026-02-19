@@ -72,54 +72,54 @@ def _load_mask(mask_path: str | None, target_hw: Sequence[int]) -> torch.Tensor:
 
 
 def _load_from_npz(path: str | io.BytesIO) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    data = np.load(path)
-    image_np = data["image"]
-    image = torch.from_numpy(image_np)
-    if image.ndim == 3:
-        if image.shape[0] in (1, 3):
-            pass
-        elif image.shape[-1] in (1, 3):
-            image = image.permute(2, 0, 1)
+    with np.load(path, allow_pickle=False) as data:
+        image_np = data["image"]
+        image = torch.from_numpy(image_np)
+        if image.ndim == 3:
+            if image.shape[0] in (1, 3):
+                pass
+            elif image.shape[-1] in (1, 3):
+                image = image.permute(2, 0, 1)
+            else:
+                raise ValueError(f"Unexpected image shape in NPZ: {image.shape}")
         else:
-            raise ValueError(f"Unexpected image shape in NPZ: {image.shape}")
-    else:
-        raise ValueError(f"Image array must be 3D, got shape {image.shape}")
+            raise ValueError(f"Image array must be 3D, got shape {image.shape}")
 
-    if image.shape[0] == 1:
-        image = image.repeat(3, 1, 1)
-    image = image.float() / 255.0
+        if image.shape[0] == 1:
+            image = image.repeat(3, 1, 1)
+        image = image.float() / 255.0
 
-    mask = None
-    if "mask" in data:
-        mask_np = data["mask"]
-        mask = torch.from_numpy(mask_np)
-        if mask.ndim == 2:
-            mask = mask.unsqueeze(0)
-        elif mask.ndim == 3 and mask.shape[-1] == 1:
-            mask = mask.permute(2, 0, 1)
-        elif mask.ndim == 3 and mask.shape[0] == 1:
-            pass
-        else:
-            raise ValueError(f"Unexpected mask shape in NPZ: {mask.shape}")
-        if mask.max() > 1.0:
-            mask = mask / 255.0
-
-    high_pass = None
-    if "high_pass" in data:
-        hp_np = data["high_pass"]
-        if hp_np.size > 0:
-            high_pass = torch.from_numpy(hp_np)
-            if high_pass.ndim == 2:
-                high_pass = high_pass.unsqueeze(0)
-            elif high_pass.ndim == 3 and high_pass.shape[-1] in (1, 3):
-                high_pass = high_pass.permute(2, 0, 1)
-            elif high_pass.ndim == 3 and high_pass.shape[0] in (1, 3):
+        mask = None
+        if "mask" in data:
+            mask_np = data["mask"]
+            mask = torch.from_numpy(mask_np)
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(0)
+            elif mask.ndim == 3 and mask.shape[-1] == 1:
+                mask = mask.permute(2, 0, 1)
+            elif mask.ndim == 3 and mask.shape[0] == 1:
                 pass
             else:
-                raise ValueError(f"Unexpected high_pass shape in NPZ: {high_pass.shape}")
-            if high_pass.shape[0] == 1:
-                high_pass = high_pass.repeat(3, 1, 1)
-            high_pass = high_pass.float() / 255.0
+                raise ValueError(f"Unexpected mask shape in NPZ: {mask.shape}")
+            if mask.max() > 1.0:
+                mask = mask / 255.0
+
+        high_pass = None
+        if "high_pass" in data:
+            hp_np = data["high_pass"]
+            if hp_np.size > 0:
+                high_pass = torch.from_numpy(hp_np)
+                if high_pass.ndim == 2:
+                    high_pass = high_pass.unsqueeze(0)
+                elif high_pass.ndim == 3 and high_pass.shape[-1] in (1, 3):
+                    high_pass = high_pass.permute(2, 0, 1)
+                elif high_pass.ndim == 3 and high_pass.shape[0] in (1, 3):
+                    pass
+                else:
+                    raise ValueError(f"Unexpected high_pass shape in NPZ: {high_pass.shape}")
+                if high_pass.shape[0] == 1:
+                    high_pass = high_pass.repeat(3, 1, 1)
+                high_pass = high_pass.float() / 255.0
 
     return image, mask, high_pass
 
@@ -212,6 +212,7 @@ class RoundRobinSampler(Sampler[int]):
         self.shuffle = shuffle
         self.seed = seed
         self.balance = balance
+        self._iteration = 0
         self.lengths = [len(ds) for ds in self.datasets]
         self.offsets: List[int] = []
         total = 0
@@ -222,7 +223,8 @@ class RoundRobinSampler(Sampler[int]):
     def __iter__(self):  # type: ignore[override]
         generator = torch.Generator()
         if self.seed is not None:
-            generator.manual_seed(self.seed)
+            generator.manual_seed(self.seed + self._iteration)
+        self._iteration += 1
         per_dataset_indices: List[List[int]] = []
         for length in self.lengths:
             indices = list(range(length))
@@ -249,12 +251,21 @@ class RoundRobinSampler(Sampler[int]):
         return sum(self.lengths)
 
 
-def _normalize(image: torch.Tensor, mode: str) -> torch.Tensor:
+def _normalize(
+    image: torch.Tensor,
+    mode: str,
+    imagenet_mean: torch.Tensor | None = None,
+    imagenet_std: torch.Tensor | None = None,
+) -> torch.Tensor:
     if mode == "zero_one":
         return image
     if mode == "imagenet":
-        mean = torch.tensor([0.485, 0.456, 0.406], device=image.device).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=image.device).view(3, 1, 1)
+        if imagenet_mean is None or imagenet_std is None:
+            mean = torch.tensor([0.485, 0.456, 0.406], device=image.device).view(3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=image.device).view(3, 1, 1)
+        else:
+            mean = imagenet_mean
+            std = imagenet_std
         return (image - mean) / std
     return image
 
@@ -283,10 +294,11 @@ def _apply_gpu_augmentations(
 
     if cfg.enable_rotations and cfg.max_rotation_degrees > 0:
         angle = float((_rand_scalar() * 2 - 1) * cfg.max_rotation_degrees)
-        image = F.rotate(image, angle=angle, interpolation=InterpolationMode.BILINEAR)
-        mask = F.rotate(mask, angle=angle, interpolation=InterpolationMode.NEAREST)
-        if high_pass is not None:
-            high_pass = F.rotate(high_pass, angle=angle, interpolation=InterpolationMode.BILINEAR)
+        if abs(angle) > 1e-3:
+            image = F.rotate(image, angle=angle, interpolation=InterpolationMode.BILINEAR)
+            mask = F.rotate(mask, angle=angle, interpolation=InterpolationMode.NEAREST)
+            if high_pass is not None:
+                high_pass = F.rotate(high_pass, angle=angle, interpolation=InterpolationMode.BILINEAR)
 
     if cfg.enable_random_crop:
         scale = float(
@@ -296,12 +308,13 @@ def _apply_gpu_augmentations(
         _, h, w = image.shape
         crop_h = max(1, int(h * scale))
         crop_w = max(1, int(w * scale))
-        top = int(_rand_scalar() * (h - crop_h + 1))
-        left = int(_rand_scalar() * (w - crop_w + 1))
-        image = F.resized_crop(image, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.BILINEAR)
-        mask = F.resized_crop(mask, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.NEAREST)
-        if high_pass is not None:
-            high_pass = F.resized_crop(high_pass, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.BILINEAR)
+        if crop_h < h or crop_w < w:
+            top = int(_rand_scalar() * (h - crop_h + 1))
+            left = int(_rand_scalar() * (w - crop_w + 1))
+            image = F.resized_crop(image, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.BILINEAR)
+            mask = F.resized_crop(mask, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.NEAREST)
+            if high_pass is not None:
+                high_pass = F.resized_crop(high_pass, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.BILINEAR)
 
     if cfg.enable_color_jitter:
         factor = float(
@@ -320,17 +333,22 @@ def _apply_gpu_augmentations(
 
 
 def _collate_builder(
-    device: torch.device,
     per_dataset_aug: Dict[str, AugmentationConfig],
     normalization_mode: str,
     training: bool,
     aug_seed: int | None = None,
 ):
+    imagenet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+    imagenet_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+    aug_generator: torch.Generator | None = None
+
     def _collate(batch: List[dict[str, object]]) -> dict[str, object]:
-        aug_generator: torch.Generator | None = None
-        if aug_seed is not None:
-            aug_generator = torch.Generator(device=device)
-            aug_generator.manual_seed(aug_seed)
+        nonlocal aug_generator
+        if aug_seed is not None and aug_generator is None:
+            aug_generator = torch.Generator()
+            worker_info = torch.utils.data.get_worker_info()
+            worker_offset = worker_info.id if worker_info is not None else 0
+            aug_generator.manual_seed(int(aug_seed) + int(worker_offset))
 
         images: List[torch.Tensor] = []
         masks: List[torch.Tensor] = []
@@ -340,14 +358,12 @@ def _collate_builder(
         collect_high_pass = True
 
         for sample in batch:
-            image = sample["image"].to(device, non_blocking=True)
-            mask = sample["mask"].to(device, non_blocking=True)
-            label = sample["label"].to(device, non_blocking=True)
+            image = sample["image"]
+            mask = sample["mask"]
+            label = sample["label"]
             dataset_name = str(sample["dataset"])
             high_pass = sample.get("high_pass")
-            if high_pass is not None:
-                high_pass = high_pass.to(device, non_blocking=True)
-            else:
+            if high_pass is None:
                 collect_high_pass = False
             aug_cfg = per_dataset_aug.get(dataset_name, AugmentationConfig(enable=False))
             views = aug_cfg.views_per_sample if aug_cfg.enable else 1
@@ -371,7 +387,12 @@ def _collate_builder(
                         generator=aug_generator,
                     )
 
-                view_image = _normalize(view_image, normalization_mode)
+                view_image = _normalize(
+                    view_image,
+                    normalization_mode,
+                    imagenet_mean=imagenet_mean,
+                    imagenet_std=imagenet_std,
+                )
 
                 images.append(view_image)
                 masks.append(view_mask)
@@ -422,6 +443,7 @@ def create_dataloaders(
     num_workers: int = 0,
     pin_memory: bool = True,
     round_robin_seed: int | None = 0,
+    balance_sampling: bool = False,
     drop_last: bool = True,
     aug_seed: int | None = None,
     prefetch_factor: int | None = None,
@@ -450,12 +472,16 @@ def create_dataloaders(
         combined = CombinedDataset(datasets)
 
         if training:
-            sampler = RoundRobinSampler(datasets, shuffle=True, seed=round_robin_seed, balance=True)
+            sampler = RoundRobinSampler(
+                datasets,
+                shuffle=True,
+                seed=round_robin_seed,
+                balance=balance_sampling,
+            )
         else:
             sampler = None
 
         collate_fn = _collate_builder(
-            device,
             per_dataset_augmentations,
             normalization_mode,
             training=training,

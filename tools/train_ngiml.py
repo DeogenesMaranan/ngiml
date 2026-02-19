@@ -12,10 +12,12 @@ import argparse
 import json
 import random
 import time
+import os
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 import re
+import math
 
 import numpy as np
 import torch
@@ -40,16 +42,26 @@ class TrainConfig:
     output_dir: str = "runs/ngiml"
     batch_size: int = 8
     epochs: int = 50
-    num_workers: int = 2
+    num_workers: int = max(2, (os.cpu_count() or 4) // 2)
     amp: bool = True
+    pin_memory: bool = True
+    channels_last: bool = True
+    compile_model: bool = False
+    compile_mode: str = "reduce-overhead"
+    deterministic: bool = False
+    use_tf32: bool = True
+    lr_schedule: bool = True
+    warmup_epochs: int = 2
+    min_lr_scale: float = 0.1
     grad_clip: float = 1.0
     val_every: int = 1
     checkpoint_every: int = 1
     resume: Optional[str] = None
     auto_resume: bool = False
     round_robin_seed: Optional[int] = 42
-    prefetch_factor: Optional[int] = None
-    persistent_workers: bool = False
+    balance_sampling: bool = False
+    prefetch_factor: Optional[int] = 2
+    persistent_workers: bool = True
     drop_last: bool = True
     views_per_sample: int = 1
     max_rotation_degrees: float = 5.0
@@ -72,18 +84,29 @@ class Checkpoint:
     global_step: int
     model_state: dict
     optimizer_state: dict
+    scheduler_state: Optional[dict]
     scaler_state: Optional[dict]
     train_config: dict
 
 
 def parse_args() -> TrainConfig:
+    default_workers = max(2, (os.cpu_count() or 4) // 2)
     parser = argparse.ArgumentParser(description="Train NGIML manipulation localization")
     parser.add_argument("--manifest", required=True, help="Path to prepared manifest JSON")
     parser.add_argument("--output-dir", default="runs/ngiml", help="Directory to write checkpoints/logs")
     parser.add_argument("--batch-size", type=int, default=8, help="Mini-batch size")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
-    parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers")
+    parser.add_argument("--num-workers", type=int, default=default_workers, help="DataLoader workers")
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision training")
+    parser.add_argument("--no-pin-memory", action="store_true", help="Disable DataLoader pinned memory")
+    parser.add_argument("--no-channels-last", action="store_true", help="Disable channels-last memory format on CUDA")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile on model")
+    parser.add_argument("--compile-mode", type=str, default="reduce-overhead", help="torch.compile mode")
+    parser.add_argument("--deterministic", action="store_true", help="Enable deterministic kernels (slower)")
+    parser.add_argument("--no-tf32", action="store_true", help="Disable TF32 matrix math on CUDA")
+    parser.add_argument("--no-lr-schedule", action="store_true", help="Disable warmup+cosine LR schedule")
+    parser.add_argument("--warmup-epochs", type=int, default=2, help="Number of warmup epochs")
+    parser.add_argument("--min-lr-scale", type=float, default=0.1, help="Final LR scale for cosine schedule")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Max gradient norm; <=0 disables")
     parser.add_argument("--val-every", type=int, default=1, help="Validate every N epochs")
     parser.add_argument(
@@ -99,9 +122,25 @@ def parse_args() -> TrainConfig:
         help="Automatically resume from latest checkpoint in output_dir/checkpoints when available",
     )
     parser.add_argument("--round-robin-seed", type=int, default=42, help="Seed for round-robin sampler")
-    parser.add_argument("--prefetch-factor", type=int, default=None, help="DataLoader prefetch factor")
-    parser.add_argument("--persistent-workers", action="store_true", help="Enable persistent workers")
-    parser.add_argument("--drop-last", action="store_true", help="Drop last incomplete batch in training")
+    parser.add_argument(
+        "--balance-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Balance per-dataset sampling by oversampling smaller datasets",
+    )
+    parser.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor")
+    parser.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable persistent DataLoader workers",
+    )
+    parser.add_argument(
+        "--drop-last",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Drop last incomplete batch in training",
+    )
     parser.add_argument("--views-per-sample", type=int, default=1, help="Number of augmented views per sample (on-the-fly)")
     parser.add_argument("--max-rotation-degrees", type=float, default=5.0, help="Random rotation range (+/-)")
     parser.add_argument("--noise-std-max", type=float, default=0.02, help="Max Gaussian noise std")
@@ -118,12 +157,22 @@ def parse_args() -> TrainConfig:
         epochs=args.epochs,
         num_workers=args.num_workers,
         amp=not args.no_amp,
+        pin_memory=not args.no_pin_memory,
+        channels_last=not args.no_channels_last,
+        compile_model=args.compile,
+        compile_mode=args.compile_mode,
+        deterministic=args.deterministic,
+        use_tf32=not args.no_tf32,
+        lr_schedule=not args.no_lr_schedule,
+        warmup_epochs=args.warmup_epochs,
+        min_lr_scale=args.min_lr_scale,
         grad_clip=args.grad_clip,
         val_every=args.val_every,
         checkpoint_every=args.checkpoint_every,
         resume=args.resume,
         auto_resume=args.auto_resume,
         round_robin_seed=args.round_robin_seed,
+        balance_sampling=args.balance_sampling,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
         drop_last=args.drop_last,
@@ -138,14 +187,14 @@ def parse_args() -> TrainConfig:
     )
 
 
-def set_global_seed(seed: int) -> None:
+def set_global_seed(seed: int, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
 
 
 def _collect_dataset_names(manifest_path: Path) -> Sequence[str]:
@@ -195,14 +244,34 @@ def _prepare_dataloaders(cfg: TrainConfig, device: torch.device):
         per_dataset_aug,
         batch_size=cfg.batch_size,
         device=device,
-        pin_memory=False,
+        pin_memory=cfg.pin_memory,
         num_workers=cfg.num_workers,
         round_robin_seed=cfg.round_robin_seed,
+        balance_sampling=cfg.balance_sampling,
         drop_last=cfg.drop_last,
         aug_seed=cfg.aug_seed if cfg.aug_seed is not None else cfg.seed,
         prefetch_factor=cfg.prefetch_factor,
         persistent_workers=cfg.persistent_workers,
     )
+
+
+def _build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig):
+    if not cfg.lr_schedule or cfg.epochs <= 1:
+        return None
+
+    warmup_epochs = max(0, min(cfg.warmup_epochs, max(cfg.epochs - 1, 0)))
+    min_lr_scale = float(max(0.0, min(cfg.min_lr_scale, 1.0)))
+
+    def _lr_lambda(epoch: int) -> float:
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            return max(1e-6, float(epoch + 1) / float(warmup_epochs))
+
+        cosine_total = max(cfg.epochs - warmup_epochs, 1)
+        cosine_epoch = min(max(epoch - warmup_epochs, 0), cosine_total)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * cosine_epoch / cosine_total))
+        return min_lr_scale + (1.0 - min_lr_scale) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
 
 def _dice_coefficient(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -238,12 +307,22 @@ def _segmentation_metrics(logits: torch.Tensor, target: torch.Tensor, eps: float
     }
 
 
-def save_checkpoint(path: Path, model: HybridNGIML, optimizer: torch.optim.Optimizer, scaler: GradScaler, epoch: int, global_step: int, cfg: TrainConfig) -> None:
+def save_checkpoint(
+    path: Path,
+    model: HybridNGIML,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    epoch: int,
+    global_step: int,
+    cfg: TrainConfig,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+) -> None:
     ckpt = Checkpoint(
         epoch=epoch,
         global_step=global_step,
         model_state=model.state_dict(),
         optimizer_state=optimizer.state_dict(),
+        scheduler_state=scheduler.state_dict() if scheduler is not None else None,
         scaler_state=scaler.state_dict() if scaler.is_enabled() else None,
         train_config=asdict(cfg),
     )
@@ -257,10 +336,19 @@ def append_checkpoint_log(path: Path, record: dict) -> None:
         handle.write(json.dumps(record) + "\n")
 
 
-def load_checkpoint(path: Path, model: HybridNGIML, optimizer: torch.optim.Optimizer, scaler: GradScaler, device: torch.device) -> Tuple[int, int]:
+def load_checkpoint(
+    path: Path,
+    model: HybridNGIML,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    device: torch.device,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+) -> Tuple[int, int]:
     data = torch.load(path, map_location=device)
     model.load_state_dict(data["model_state"])
     optimizer.load_state_dict(data["optimizer_state"])
+    if scheduler is not None and data.get("scheduler_state") is not None:
+        scheduler.load_state_dict(data["scheduler_state"])
     if data.get("scaler_state") and scaler.is_enabled():
         scaler.load_state_dict(data["scaler_state"])
     start_epoch = int(data.get("epoch", 0))
@@ -289,6 +377,8 @@ def train_one_epoch(model: HybridNGIML, loader, optimizer, scaler: GradScaler, l
     for step, batch in enumerate(progress):
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
+        if cfg.channels_last and device.type == "cuda":
+            images = images.contiguous(memory_format=torch.channels_last)
 
         optimizer.zero_grad(set_to_none=True)
         use_amp = cfg.amp and device.type == "cuda"
@@ -314,8 +404,8 @@ def train_one_epoch(model: HybridNGIML, loader, optimizer, scaler: GradScaler, l
     return running_loss / max(1, num_batches), global_step
 
 
-@torch.no_grad()
-def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device) -> dict:
+@torch.inference_mode()
+def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: TrainConfig) -> dict:
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
@@ -327,8 +417,12 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device) -> dict:
     for batch in loader:
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
-        preds = model(images, target_size=masks.shape[-2:])
-        loss = loss_fn(preds, masks)
+        if cfg.channels_last and device.type == "cuda":
+            images = images.contiguous(memory_format=torch.channels_last)
+        use_amp = cfg.amp and device.type == "cuda"
+        with autocast(device_type=device.type, enabled=use_amp):
+            preds = model(images, target_size=masks.shape[-2:])
+            loss = loss_fn(preds, masks)
         logits = preds[-1]
         dice = _dice_coefficient(logits, masks)
         extra_metrics = _segmentation_metrics(logits, masks)
@@ -352,9 +446,14 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device) -> dict:
 
 
 def run_training(cfg: TrainConfig) -> None:
-    set_global_seed(cfg.seed)
+    set_global_seed(cfg.seed, deterministic=cfg.deterministic)
     device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
+
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = cfg.use_tf32
+        torch.backends.cudnn.allow_tf32 = cfg.use_tf32
+        torch.set_float32_matmul_precision("high" if cfg.use_tf32 else "highest")
 
     loaders = _prepare_dataloaders(cfg, device)
     if "train" not in loaders:
@@ -362,7 +461,10 @@ def run_training(cfg: TrainConfig) -> None:
 
     model_cfg = cfg.model_config or HybridNGIMLConfig()
     model = HybridNGIML(model_cfg).to(device)
+    if cfg.channels_last and device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
     optimizer = model.build_optimizer()
+    scheduler = _build_lr_scheduler(optimizer, cfg)
     scaler = GradScaler(device.type, enabled=(cfg.amp and device.type == "cuda"))
     loss_cfg = cfg.loss_config or MultiStageLossConfig()
     loss_fn = MultiStageManipulationLoss(loss_cfg)
@@ -384,12 +486,19 @@ def run_training(cfg: TrainConfig) -> None:
 
     if resume_path:
         if resume_path.is_file():
-            start_epoch, global_step = load_checkpoint(resume_path, model, optimizer, scaler, device)
+            start_epoch, global_step = load_checkpoint(resume_path, model, optimizer, scaler, device, scheduler=scheduler)
             print(f"Resumed from {resume_path} at epoch {start_epoch} step {global_step}")
         else:
             print(f"Resume path {resume_path} not found; starting fresh")
     elif cfg.auto_resume:
         print("Auto-resume enabled but no checkpoint found; starting fresh")
+
+    if cfg.compile_model:
+        if hasattr(torch, "compile"):
+            model = torch.compile(model, mode=cfg.compile_mode)
+            print(f"torch.compile enabled with mode={cfg.compile_mode}")
+        else:
+            print("torch.compile requested but not available in this torch build")
 
     with open(out_dir / "train_config.json", "w", encoding="utf-8") as handle:
         json.dump(asdict(cfg), handle, indent=2)
@@ -413,7 +522,12 @@ def run_training(cfg: TrainConfig) -> None:
         )
 
         elapsed = time.time() - start_time
-        print(f"Epoch {epoch:03d} done | loss {train_loss:.4f} | time {elapsed:.1f}s")
+        if scheduler is not None:
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"Epoch {epoch:03d} done | loss {train_loss:.4f} | lr {current_lr:.6e} | time {elapsed:.1f}s")
+        else:
+            print(f"Epoch {epoch:03d} done | loss {train_loss:.4f} | time {elapsed:.1f}s")
 
         val_loss = None
         val_dice = None
@@ -422,7 +536,7 @@ def run_training(cfg: TrainConfig) -> None:
         val_recall = None
         val_accuracy = None
         if "val" in loaders and (epoch + 1) % cfg.val_every == 0:
-            metrics = evaluate(model, loaders["val"], loss_fn, device)
+            metrics = evaluate(model, loaders["val"], loss_fn, device, cfg)
             val_loss = float(metrics["loss"])
             val_dice = float(metrics["dice"])
             val_iou = float(metrics["iou"])
@@ -439,7 +553,7 @@ def run_training(cfg: TrainConfig) -> None:
                 best_val_dice = val_dice
                 no_improve_epochs = 0
                 best_path = checkpoint_dir / "best_checkpoint.pt"
-                save_checkpoint(best_path, model, optimizer, scaler, epoch + 1, global_step, cfg)
+                save_checkpoint(best_path, model, optimizer, scaler, epoch + 1, global_step, cfg, scheduler=scheduler)
                 print(f"New best val dice {best_val_dice:.4f}; saved to {best_path}")
             elif early_stopping_enabled:
                 no_improve_epochs += 1
@@ -451,7 +565,7 @@ def run_training(cfg: TrainConfig) -> None:
         should_checkpoint = ((epoch + 1) % cfg.checkpoint_every == 0) or (epoch + 1 == cfg.epochs)
         if should_checkpoint:
             ckpt_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1:03d}.pt"
-            save_checkpoint(ckpt_path, model, optimizer, scaler, epoch + 1, global_step, cfg)
+            save_checkpoint(ckpt_path, model, optimizer, scaler, epoch + 1, global_step, cfg, scheduler=scheduler)
             append_checkpoint_log(
                 checkpoint_log_path,
                 {

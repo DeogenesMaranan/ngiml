@@ -46,10 +46,14 @@ class SwinBackbone(nn.Module):
         ]
         if not self.stages:
             raise ValueError("Swin backbone structure unexpected; layers_* modules not found")
+        self._last_spatial_size: Tuple[int, int] | None = None
 
     def _propagate_spatial_metadata(self, height: int, width: int) -> None:
         if height % self.patch_size[0] != 0 or width % self.patch_size[1] != 0:
             raise ValueError("Input spatial dims must be multiples of patch size")
+
+        if self._last_spatial_size == (height, width):
+            return
 
         grid_h = height // self.patch_size[0]
         grid_w = width // self.patch_size[1]
@@ -73,6 +77,8 @@ class SwinBackbone(nn.Module):
                         device = block.attn_mask.device
                         dtype = block.attn_mask.dtype
                     block.attn_mask = block.get_attn_mask(device=device, dtype=dtype)
+
+        self._last_spatial_size = (height, width)
 
     def _ensure_channels_first(self, features: List[Tensor]) -> List[Tensor]:
         if len(features) != len(self.out_channels):

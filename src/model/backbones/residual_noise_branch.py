@@ -67,6 +67,8 @@ class ResidualNoiseModule(nn.Module):
         srm_kernels /= torch.abs(srm_kernels).sum(dim=(1, 2), keepdim=True)
         self.register_buffer("srm_kernels", srm_kernels.view(cfg.num_kernels, 1, 5, 5), persistent=False)
         self.srm_out_channels = in_channels * cfg.num_kernels  # e.g., RGB * 3
+        self._cached_srm_kernels: Tensor | None = None
+        self._cached_srm_key: tuple[torch.dtype, torch.device, int] | None = None
 
         # --- Multi-scale residual backbone ---
         stage_channels = [cfg.base_channels * (2**i) for i in range(cfg.num_stages)]
@@ -90,6 +92,17 @@ class ResidualNoiseModule(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         self.downsamplers = nn.ModuleList(downsamplers)
 
+    def _get_srm_kernels(self, x: Tensor) -> Tensor:
+        c = x.shape[1]
+        key = (x.dtype, x.device, c)
+        if self._cached_srm_kernels is not None and self._cached_srm_key == key:
+            return self._cached_srm_kernels
+
+        kernels = self.srm_kernels.to(device=x.device, dtype=x.dtype).repeat(c, 1, 1, 1).contiguous()
+        self._cached_srm_kernels = kernels
+        self._cached_srm_key = key
+        return kernels
+
     # ------------------------------------------------------------------
     def forward(self, x: Tensor) -> List[Tensor]:
         """
@@ -99,8 +112,8 @@ class ResidualNoiseModule(nn.Module):
             List of multi-scale feature tensors from CNN backbone
         """
         # --- SRM residuals ---
-        b, c, h, w = x.shape
-        kernels = self.srm_kernels.to(x.dtype).repeat(c, 1, 1, 1).contiguous()
+        c = x.shape[1]
+        kernels = self._get_srm_kernels(x)
         residual_map = F.conv2d(
             x,
             kernels,
