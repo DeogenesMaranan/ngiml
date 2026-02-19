@@ -22,11 +22,11 @@ class OptimizerGroupConfig:
 
 
 def _default_efficientnet_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=5e-5, weight_decay=1e-5)
+    return OptimizerGroupConfig(lr=5e-5, weight_decay=1e-3)
 
 
 def _default_swin_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=2e-5, weight_decay=1e-5)
+    return OptimizerGroupConfig(lr=2e-5, weight_decay=1e-2)
 
 
 def _default_residual_optim() -> OptimizerGroupConfig:

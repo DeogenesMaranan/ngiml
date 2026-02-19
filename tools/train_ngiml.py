@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 import re
 
+import numpy as np
 import torch
 from torch.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
@@ -36,8 +38,8 @@ from src.model.losses import MultiStageLossConfig, MultiStageManipulationLoss
 class TrainConfig:
     manifest: str
     output_dir: str = "runs/ngiml"
-    batch_size: int = 4
-    epochs: int = 10
+    batch_size: int = 8
+    epochs: int = 50
     num_workers: int = 2
     amp: bool = True
     grad_clip: float = 1.0
@@ -45,7 +47,7 @@ class TrainConfig:
     checkpoint_every: int = 1
     resume: Optional[str] = None
     auto_resume: bool = False
-    round_robin_seed: Optional[int] = 0
+    round_robin_seed: Optional[int] = 42
     prefetch_factor: Optional[int] = None
     persistent_workers: bool = False
     drop_last: bool = True
@@ -55,6 +57,9 @@ class TrainConfig:
     disable_aug: bool = False
     device: Optional[str] = None
     aug_seed: Optional[int] = None
+    seed: int = 42
+    early_stopping_patience: int = 8
+    early_stopping_min_delta: float = 1e-4
     default_aug: Optional[AugmentationConfig] = None
     per_dataset_aug: Optional[Dict[str, AugmentationConfig]] = None
     model_config: Optional[HybridNGIMLConfig] = None
@@ -75,8 +80,8 @@ def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Train NGIML manipulation localization")
     parser.add_argument("--manifest", required=True, help="Path to prepared manifest JSON")
     parser.add_argument("--output-dir", default="runs/ngiml", help="Directory to write checkpoints/logs")
-    parser.add_argument("--batch-size", type=int, default=4, help="Mini-batch size")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--batch-size", type=int, default=8, help="Mini-batch size")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers")
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision training")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Max gradient norm; <=0 disables")
@@ -93,7 +98,7 @@ def parse_args() -> TrainConfig:
         action="store_true",
         help="Automatically resume from latest checkpoint in output_dir/checkpoints when available",
     )
-    parser.add_argument("--round-robin-seed", type=int, default=0, help="Seed for round-robin sampler")
+    parser.add_argument("--round-robin-seed", type=int, default=42, help="Seed for round-robin sampler")
     parser.add_argument("--prefetch-factor", type=int, default=None, help="DataLoader prefetch factor")
     parser.add_argument("--persistent-workers", action="store_true", help="Enable persistent workers")
     parser.add_argument("--drop-last", action="store_true", help="Drop last incomplete batch in training")
@@ -102,6 +107,9 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--noise-std-max", type=float, default=0.02, help="Max Gaussian noise std")
     parser.add_argument("--disable-aug", action="store_true", help="Disable GPU augmentations")
     parser.add_argument("--device", type=str, default=None, help="Override device (e.g., cuda:0 or cpu)")
+    parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducibility")
+    parser.add_argument("--early-stopping-patience", type=int, default=8, help="Stop after N validations without improvement; <=0 disables")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4, help="Minimum Dice improvement to reset early stopping")
     args = parser.parse_args()
     return TrainConfig(
         manifest=args.manifest,
@@ -124,7 +132,20 @@ def parse_args() -> TrainConfig:
         noise_std_max=args.noise_std_max,
         disable_aug=args.disable_aug,
         device=args.device,
+        seed=args.seed,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
     )
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def _collect_dataset_names(manifest_path: Path) -> Sequence[str]:
@@ -178,7 +199,7 @@ def _prepare_dataloaders(cfg: TrainConfig, device: torch.device):
         num_workers=cfg.num_workers,
         round_robin_seed=cfg.round_robin_seed,
         drop_last=cfg.drop_last,
-        aug_seed=cfg.aug_seed,
+        aug_seed=cfg.aug_seed if cfg.aug_seed is not None else cfg.seed,
         prefetch_factor=cfg.prefetch_factor,
         persistent_workers=cfg.persistent_workers,
     )
@@ -191,6 +212,30 @@ def _dice_coefficient(logits: torch.Tensor, target: torch.Tensor, eps: float = 1
     intersection = torch.sum(probs * target, dim=dims)
     denom = torch.sum(probs, dim=dims) + torch.sum(target, dim=dims)
     return ((2 * intersection + eps) / (denom + eps)).mean()
+
+
+def _segmentation_metrics(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> Dict[str, float]:
+    probs = torch.sigmoid(logits)
+    pred = (probs >= 0.5).float()
+    target = target.float()
+
+    dims = (1, 2, 3)
+    tp = torch.sum(pred * target, dim=dims)
+    tn = torch.sum((1.0 - pred) * (1.0 - target), dim=dims)
+    fp = torch.sum(pred * (1.0 - target), dim=dims)
+    fn = torch.sum((1.0 - pred) * target, dim=dims)
+
+    iou = (tp + eps) / (tp + fp + fn + eps)
+    precision = (tp + eps) / (tp + fp + eps)
+    recall = (tp + eps) / (tp + fn + eps)
+    accuracy = (tp + tn + eps) / (tp + tn + fp + fn + eps)
+
+    return {
+        "iou": float(iou.mean().item()),
+        "precision": float(precision.mean().item()),
+        "recall": float(recall.mean().item()),
+        "accuracy": float(accuracy.mean().item()),
+    }
 
 
 def save_checkpoint(path: Path, model: HybridNGIML, optimizer: torch.optim.Optimizer, scaler: GradScaler, epoch: int, global_step: int, cfg: TrainConfig) -> None:
@@ -274,22 +319,40 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device) -> dict:
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
+    total_iou = 0.0
+    total_precision = 0.0
+    total_recall = 0.0
+    total_accuracy = 0.0
     batches = 0
     for batch in loader:
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
         preds = model(images, target_size=masks.shape[-2:])
         loss = loss_fn(preds, masks)
-        dice = _dice_coefficient(preds[-1], masks)
+        logits = preds[-1]
+        dice = _dice_coefficient(logits, masks)
+        extra_metrics = _segmentation_metrics(logits, masks)
         total_loss += loss.item()
         total_dice += dice.item()
+        total_iou += extra_metrics["iou"]
+        total_precision += extra_metrics["precision"]
+        total_recall += extra_metrics["recall"]
+        total_accuracy += extra_metrics["accuracy"]
         batches += 1
 
     normalizer = max(1, batches)
-    return {"loss": total_loss / normalizer, "dice": total_dice / normalizer}
+    return {
+        "loss": total_loss / normalizer,
+        "dice": total_dice / normalizer,
+        "iou": total_iou / normalizer,
+        "precision": total_precision / normalizer,
+        "recall": total_recall / normalizer,
+        "accuracy": total_accuracy / normalizer,
+    }
 
 
 def run_training(cfg: TrainConfig) -> None:
+    set_global_seed(cfg.seed)
     device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
 
@@ -331,6 +394,10 @@ def run_training(cfg: TrainConfig) -> None:
     with open(out_dir / "train_config.json", "w", encoding="utf-8") as handle:
         json.dump(asdict(cfg), handle, indent=2)
 
+    best_val_dice = float("-inf")
+    no_improve_epochs = 0
+    early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
+
     for epoch in range(start_epoch, cfg.epochs):
         start_time = time.time()
         train_loss, global_step = train_one_epoch(
@@ -350,11 +417,36 @@ def run_training(cfg: TrainConfig) -> None:
 
         val_loss = None
         val_dice = None
+        val_iou = None
+        val_precision = None
+        val_recall = None
+        val_accuracy = None
         if "val" in loaders and (epoch + 1) % cfg.val_every == 0:
             metrics = evaluate(model, loaders["val"], loss_fn, device)
             val_loss = float(metrics["loss"])
             val_dice = float(metrics["dice"])
-            print(f"Val | loss {val_loss:.4f} | dice {val_dice:.4f}")
+            val_iou = float(metrics["iou"])
+            val_precision = float(metrics["precision"])
+            val_recall = float(metrics["recall"])
+            val_accuracy = float(metrics["accuracy"])
+            print(
+                f"Val | loss {val_loss:.4f} | dice {val_dice:.4f} | iou {val_iou:.4f} "
+                f"| precision {val_precision:.4f} | recall {val_recall:.4f} | accuracy {val_accuracy:.4f}"
+            )
+
+            improved = val_dice > (best_val_dice + cfg.early_stopping_min_delta)
+            if improved:
+                best_val_dice = val_dice
+                no_improve_epochs = 0
+                best_path = checkpoint_dir / "best_checkpoint.pt"
+                save_checkpoint(best_path, model, optimizer, scaler, epoch + 1, global_step, cfg)
+                print(f"New best val dice {best_val_dice:.4f}; saved to {best_path}")
+            elif early_stopping_enabled:
+                no_improve_epochs += 1
+                print(
+                    f"Early stopping patience: {no_improve_epochs}/{cfg.early_stopping_patience} "
+                    f"without val dice improvement"
+                )
 
         should_checkpoint = ((epoch + 1) % cfg.checkpoint_every == 0) or (epoch + 1 == cfg.epochs)
         if should_checkpoint:
@@ -368,11 +460,20 @@ def run_training(cfg: TrainConfig) -> None:
                     "train_loss": float(train_loss),
                     "val_loss": val_loss,
                     "val_dice": val_dice,
+                    "val_iou": val_iou,
+                    "val_precision": val_precision,
+                    "val_recall": val_recall,
+                    "val_accuracy": val_accuracy,
                     "epoch_seconds": float(elapsed),
                     "checkpoint_path": str(ckpt_path),
                 },
             )
             print(f"Saved checkpoint to {ckpt_path}")
+
+        if early_stopping_enabled and "val" in loaders and (epoch + 1) % cfg.val_every == 0:
+            if no_improve_epochs >= cfg.early_stopping_patience:
+                print(f"Early stopping triggered at epoch {epoch + 1}")
+                break
 
     print("Training complete")
 
