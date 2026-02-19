@@ -98,8 +98,31 @@ def _split_records(records: Sequence[SampleRecord], split_cfg: SplitConfig) -> D
         items = items.copy()
         rng.shuffle(items)
         n = len(items)
-        n_train = int(n * split_cfg.train)
-        n_val = int(n * split_cfg.val)
+        ratios = [split_cfg.train, split_cfg.val, split_cfg.test]
+        raw_counts = [n * r for r in ratios]
+        counts = [int(c) for c in raw_counts]
+        remainder = n - sum(counts)
+
+        if remainder > 0:
+            # Distribute leftover samples by largest fractional remainder,
+            # but never allocate to a split whose target ratio is zero.
+            order = sorted(
+                range(3),
+                key=lambda idx: (raw_counts[idx] - counts[idx], ratios[idx]),
+                reverse=True,
+            )
+            for idx in order:
+                if remainder == 0:
+                    break
+                if ratios[idx] <= 0:
+                    continue
+                counts[idx] += 1
+                remainder -= 1
+
+        if remainder > 0:
+            counts[0] += remainder
+
+        n_train, n_val, _ = counts
         train_items = items[:n_train]
         val_items = items[n_train : n_train + n_val]
         test_items = items[n_train + n_val :]
@@ -122,13 +145,10 @@ def _build_npz_bytes(
         if mask_img is not None:
             mask_img = mask_img.resize((target_size, target_size), Image.NEAREST)
 
-    if mask_img is None:
-        mask_img = Image.new("L", image.size, color=0)
-
     image_np = np.array(image, dtype=np.uint8)
-    mask_np = np.array(mask_img, dtype=np.uint8)
-
-    payload = {"image": image_np, "mask": mask_np}
+    payload = {"image": image_np}
+    if mask_img is not None:
+        payload["mask"] = np.array(mask_img, dtype=np.uint8)
 
     buf = io.BytesIO()
     # np.savez (not compressed) to avoid CPU overhead from compression.
@@ -248,6 +268,7 @@ def prepare_all(
 
 
 def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, SplitConfig], PreparationConfig]:
+    shared_seed = 42
     datasets = [
         DatasetStructureConfig(
             dataset_root="./datasets",
@@ -279,9 +300,9 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
     ]
 
     per_dataset_splits = {
-        "CASIA2": SplitConfig(train=0.8, val=0.2, test=0.0, seed=6),
-        "IMD2020": SplitConfig(train=0.8, val=0.2, test=0.0, seed=20),
-        "COVERAGE": SplitConfig(train=0.0, val=0.0, test=1.0, seed=4),
+        "CASIA2": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
+        "IMD2020": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
+        "COVERAGE": SplitConfig(train=0.0, val=0.0, test=1.0, seed=shared_seed),
     }
 
     prep_cfg = PreparationConfig(target_sizes=(320,), normalization_mode="imagenet", tar_shard_size=500)

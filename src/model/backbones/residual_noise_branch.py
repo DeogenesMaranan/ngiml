@@ -106,7 +106,6 @@ class ResidualNoiseModule(nn.Module):
             kernels,
             padding=2,
             groups=c,
-            padding_mode="reflect",
         )  # shape: (B, C*3, H, W)
 
         # --- Multi-scale CNN ---
@@ -120,7 +119,7 @@ class ResidualNoiseModule(nn.Module):
         return features
 
 
-    # Backward compatibility for existing imports
-    ResidualNoiseBranch = ResidualNoiseModule
+# Backward compatibility for existing imports
+ResidualNoiseBranch = ResidualNoiseModule
 
-    __all__ = ["ResidualNoiseModule", "ResidualNoiseBranch", "ResidualNoiseConfig"]
+__all__ = ["ResidualNoiseModule", "ResidualNoiseBranch", "ResidualNoiseConfig"]

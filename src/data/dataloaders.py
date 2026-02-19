@@ -162,12 +162,13 @@ class PerDatasetDataset(Dataset):
             image, mask, high_pass = _load_from_tar_npz(record.image_path)
         elif record.image_path.endswith(".npz"):
             image, mask, high_pass = _load_from_npz(record.image_path)
-            if mask is None:
-                mask = torch.zeros((1, image.shape[-2], image.shape[-1]), dtype=torch.float32)
         else:
             image = _load_image(record.image_path)
             mask = _load_mask(record.mask_path, image.shape[-2:])
             high_pass = None
+
+        if mask is None:
+            mask = torch.zeros((1, image.shape[-2], image.shape[-1]), dtype=torch.float32)
 
         label = torch.tensor(record.label, dtype=torch.long)
 
