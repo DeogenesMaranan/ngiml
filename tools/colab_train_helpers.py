@@ -304,7 +304,8 @@ def build_training_config(
     return {
         "manifest": str(manifest_path),
         "output_dir": output_dir,
-        "batch_size": 8,
+        "batch_size": 4,
+        "grad_accum_steps": 3,
         "epochs": 50,
         "num_workers": 0,
         "amp": True,
