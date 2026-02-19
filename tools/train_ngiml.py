@@ -13,6 +13,8 @@ import json
 import random
 import time
 import os
+import hashlib
+import tarfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
@@ -63,6 +65,8 @@ class TrainConfig:
     prefetch_factor: Optional[int] = 2
     persistent_workers: bool = True
     drop_last: bool = True
+    auto_local_cache: bool = True
+    local_cache_dir: Optional[str] = None
     views_per_sample: int = 1
     max_rotation_degrees: float = 5.0
     noise_std_max: float = 0.02
@@ -141,6 +145,18 @@ def parse_args() -> TrainConfig:
         default=True,
         help="Drop last incomplete batch in training",
     )
+    parser.add_argument(
+        "--auto-local-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically materialize tar::npz samples to local cache before training",
+    )
+    parser.add_argument(
+        "--local-cache-dir",
+        type=str,
+        default=None,
+        help="Directory for local materialized samples (defaults to output_dir/local_cache)",
+    )
     parser.add_argument("--views-per-sample", type=int, default=1, help="Number of augmented views per sample (on-the-fly)")
     parser.add_argument("--max-rotation-degrees", type=float, default=5.0, help="Random rotation range (+/-)")
     parser.add_argument("--noise-std-max", type=float, default=0.02, help="Max Gaussian noise std")
@@ -176,6 +192,8 @@ def parse_args() -> TrainConfig:
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
         drop_last=args.drop_last,
+        auto_local_cache=args.auto_local_cache,
+        local_cache_dir=args.local_cache_dir,
         views_per_sample=args.views_per_sample,
         max_rotation_degrees=args.max_rotation_degrees,
         noise_std_max=args.noise_std_max,
@@ -253,6 +271,81 @@ def _prepare_dataloaders(cfg: TrainConfig, device: torch.device):
         prefetch_factor=cfg.prefetch_factor,
         persistent_workers=cfg.persistent_workers,
     )
+
+
+def _safe_cache_name(spec: str) -> str:
+    digest = hashlib.sha1(spec.encode("utf-8")).hexdigest()
+    return f"{digest}.npz"
+
+
+def _materialize_tar_npz_manifest(manifest_path: Path, cache_root: Path) -> Path:
+    manifest = load_manifest(manifest_path)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    samples_dir = cache_root / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+
+    tar_handles: Dict[str, tarfile.TarFile] = {}
+
+    def _extract_if_needed(spec: str) -> str:
+        if "::" not in spec or not spec.endswith(".npz"):
+            return spec
+        archive_path, member_name = spec.split("::", 1)
+        out_path = samples_dir / _safe_cache_name(spec)
+        if out_path.exists() and out_path.stat().st_size > 0:
+            return str(out_path)
+
+        tar = tar_handles.get(archive_path)
+        if tar is None or tar.closed:
+            tar = tarfile.open(archive_path, mode="r:*")
+            tar_handles[archive_path] = tar
+
+        member = tar.extractfile(member_name)
+        if member is None:
+            raise FileNotFoundError(f"Missing tar member {member_name} in {archive_path}")
+
+        out_path.write_bytes(member.read())
+        return str(out_path)
+
+    try:
+        changed = False
+        for sample in manifest.samples:
+            new_image_path = _extract_if_needed(sample.image_path)
+            if new_image_path != sample.image_path:
+                sample.image_path = new_image_path
+                changed = True
+
+            if sample.mask_path is not None:
+                new_mask_path = _extract_if_needed(sample.mask_path)
+                if new_mask_path != sample.mask_path:
+                    sample.mask_path = new_mask_path
+                    changed = True
+
+        resolved_manifest = cache_root / "manifest_local_cache.parquet"
+        if changed or not resolved_manifest.exists():
+            manifest.to_dataframe().to_parquet(resolved_manifest, index=False)
+        return resolved_manifest
+    finally:
+        for tar in tar_handles.values():
+            try:
+                tar.close()
+            except Exception:
+                pass
+
+
+def _resolve_manifest_for_training(cfg: TrainConfig, out_dir: Path) -> Path:
+    manifest_path = Path(cfg.manifest)
+    if not cfg.auto_local_cache:
+        return manifest_path
+
+    manifest = load_manifest(manifest_path)
+    has_tar_npz = any("::" in s.image_path and s.image_path.endswith(".npz") for s in manifest.samples)
+    if not has_tar_npz:
+        return manifest_path
+
+    cache_root = Path(cfg.local_cache_dir) if cfg.local_cache_dir else (out_dir / "local_cache")
+    cache_root = cache_root / manifest_path.stem
+    print(f"Materializing tar::npz samples to local cache: {cache_root}")
+    return _materialize_tar_npz_manifest(manifest_path, cache_root)
 
 
 def _build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig):
@@ -455,6 +548,13 @@ def run_training(cfg: TrainConfig) -> None:
         torch.backends.cudnn.allow_tf32 = cfg.use_tf32
         torch.set_float32_matmul_precision("high" if cfg.use_tf32 else "highest")
 
+    out_dir = Path(cfg.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved_manifest = _resolve_manifest_for_training(cfg, out_dir)
+    if resolved_manifest != Path(cfg.manifest):
+        cfg = replace(cfg, manifest=str(resolved_manifest))
+
     loaders = _prepare_dataloaders(cfg, device)
     if "train" not in loaders:
         raise ValueError("Train split missing in manifest; cannot start training")
@@ -469,8 +569,6 @@ def run_training(cfg: TrainConfig) -> None:
     loss_cfg = cfg.loss_config or MultiStageLossConfig()
     loss_fn = MultiStageManipulationLoss(loss_cfg)
 
-    out_dir = Path(cfg.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = out_dir / "checkpoints"
     checkpoint_log_path = checkpoint_dir / "checkpoint_metrics.jsonl"
 
