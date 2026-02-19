@@ -48,7 +48,7 @@ class TrainConfig:
     amp: bool = True
     pin_memory: bool = True
     channels_last: bool = True
-    compile_model: bool = False
+    compile_model: bool = True
     compile_mode: str = "default"
     deterministic: bool = False
     use_tf32: bool = True
@@ -538,7 +538,8 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
     total_recall = 0.0
     total_accuracy = 0.0
     batches = 0
-    for batch in loader:
+    progress = tqdm(loader, desc="Validation", leave=False, dynamic_ncols=True)
+    for batch in progress:
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
         if cfg.channels_last and device.type == "cuda":
@@ -557,6 +558,7 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         total_recall += extra_metrics["recall"]
         total_accuracy += extra_metrics["accuracy"]
         batches += 1
+        progress.set_postfix(loss=f"{(total_loss / max(1, batches)):.4f}", step=f"{batches:05d}")
 
     normalizer = max(1, batches)
     return {

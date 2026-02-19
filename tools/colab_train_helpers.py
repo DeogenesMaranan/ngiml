@@ -330,12 +330,12 @@ def apply_colab_runtime_settings(
     training_config.update(
         {
             "num_workers": recommended_workers,
-            "persistent_workers": True,
+            "persistent_workers": False,
             "pin_memory": True,
             "auto_local_cache": True,
             "local_cache_dir": cache_dir,
             "reuse_local_cache_manifest": True,
-            "compile_model": False,
+            "compile_model": True,
             "compile_mode": "default",
             "channels_last": True,
             "use_tf32": True,
