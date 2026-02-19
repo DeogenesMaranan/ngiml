@@ -166,6 +166,7 @@ def _prepare_dataloaders(cfg: TrainConfig, device: torch.device):
         per_dataset_aug,
         batch_size=cfg.batch_size,
         device=device,
+        pin_memory=False,
         num_workers=cfg.num_workers,
         round_robin_seed=cfg.round_robin_seed,
         drop_last=cfg.drop_last,
