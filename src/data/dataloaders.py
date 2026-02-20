@@ -687,7 +687,7 @@ def create_dataloaders(
     aug_seed: int | None = None,
     prefetch_factor: int | None = None,
     persistent_workers: bool = False,
-    balance_real_fake: bool = False,
+    balance_real_fake: bool = True,
     balanced_positive_ratio: float = 0.5,
     balanced_sampler_seed: int | None = 42,
     balanced_sampler_num_samples: int | None = None,

@@ -29,6 +29,29 @@ from src.data.config import DatasetStructureConfig, Manifest, PreparationConfig,
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
+def _compute_high_pass(image_np: np.ndarray) -> np.ndarray:
+    """Compute a deterministic per-channel high-pass map (uint8 HWC)."""
+    if image_np.ndim != 3 or image_np.shape[2] != 3:
+        raise ValueError(f"Expected RGB image HxWx3, got shape {image_np.shape}")
+
+    image_f = image_np.astype(np.float32) / 255.0
+    padded = np.pad(image_f, ((1, 1), (1, 1), (0, 0)), mode="reflect")
+
+    center = padded[1:-1, 1:-1, :]
+    top = padded[:-2, 1:-1, :]
+    bottom = padded[2:, 1:-1, :]
+    left = padded[1:-1, :-2, :]
+    right = padded[1:-1, 2:, :]
+
+    hp = np.abs(4.0 * center - top - bottom - left - right)
+    scale = np.percentile(hp, 99.5)
+    if scale <= 1e-6:
+        return np.zeros_like(image_np, dtype=np.uint8)
+
+    hp_uint8 = np.clip((hp / scale) * 255.0, 0.0, 255.0).astype(np.uint8)
+    return hp_uint8
+
+
 class TarShardWriter:
     """Utility to write NPZ payloads into sequential tar shards."""
 
@@ -146,9 +169,11 @@ def _build_npz_bytes(
             mask_img = mask_img.resize((target_size, target_size), Image.NEAREST)
 
     image_np = np.array(image, dtype=np.uint8)
+    high_pass_np = _compute_high_pass(image_np)
     payload = {"image": image_np}
     if mask_img is not None:
         payload["mask"] = np.array(mask_img, dtype=np.uint8)
+    payload["high_pass"] = high_pass_np
 
     buf = io.BytesIO()
     # np.savez (not compressed) to avoid CPU overhead from compression.
@@ -297,12 +322,22 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
             mask_suffix="forged",
             prepared_root="./prepared",
         ),
+        DatasetStructureConfig(
+            dataset_root="./datasets",
+            dataset_name="Columbia",
+            real_subdir="real",
+            fake_subdir="fake",
+            mask_subdir="mask",
+            mask_suffix="_edgemask",
+            prepared_root="./prepared",
+        ),
     ]
 
     per_dataset_splits = {
         "CASIA2": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
         "IMD2020": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
         "COVERAGE": SplitConfig(train=0.0, val=0.0, test=1.0, seed=shared_seed),
+        "Columbia": SplitConfig(train=0.0, val=0.0, test=1.0, seed=shared_seed),
     }
 
     prep_cfg = PreparationConfig(target_sizes=(320,), normalization_mode="imagenet", tar_shard_size=500)
