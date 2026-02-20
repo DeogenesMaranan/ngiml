@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
 import tarfile
 from pathlib import Path
@@ -20,13 +19,16 @@ def ensure_repo_on_syspath(repo_root: Path) -> None:
         sys.path.insert(0, str(repo_root))
 
 
-def _infer_label_from_name(name: str) -> int:
-    lower = name.lower()
-    if re.search(r"(^|[_/\\-])fake([_/\\-]|$)", lower):
+def _infer_label_from_path(path_value: str) -> int:
+    tokens = [token.strip().lower() for token in path_value.replace("\\", "/").split("/") if token.strip()]
+    has_fake = "fake" in tokens
+    has_real = "real" in tokens
+
+    if has_fake and not has_real:
         return 1
-    if re.search(r"(^|[_/\\-])real([_/\\-]|$)", lower):
+    if has_real and not has_fake:
         return 0
-    return 0
+    raise ValueError(f"Unable to infer label from path (expected folder 'fake' or 'real'): {path_value}")
 
 
 def build_manifest_from_prepared(prepared_root: Path, manifest_out: Path | None = None) -> Path:
@@ -47,7 +49,7 @@ def build_manifest_from_prepared(prepared_root: Path, manifest_out: Path | None 
 
             npz_files = sorted(split_dir.rglob("*.npz"))
             for npz_path in npz_files:
-                label = _infer_label_from_name(npz_path.name)
+                label = _infer_label_from_path(npz_path.as_posix())
                 records.append(
                     SampleRecord(
                         dataset=dataset_name,
@@ -68,7 +70,7 @@ def build_manifest_from_prepared(prepared_root: Path, manifest_out: Path | None 
                     for member in tf.getmembers():
                         if not member.isfile() or not member.name.endswith(".npz"):
                             continue
-                        label = _infer_label_from_name(member.name)
+                        label = _infer_label_from_path(member.name)
                         records.append(
                             SampleRecord(
                                 dataset=dataset_name,

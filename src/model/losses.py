@@ -109,7 +109,7 @@ class MultiStageManipulationLoss(nn.Module):
 
     def _stage_weights(self, num_stages: int) -> List[float]:
         if self.cfg.stage_weights is None:
-            return [1.0 for _ in range(num_stages)]
+            return [float(i + 1) / float(num_stages) for i in range(num_stages)]
         if len(self.cfg.stage_weights) < num_stages:
             raise ValueError("Provided stage_weights shorter than number of stages")
         return list(self.cfg.stage_weights[:num_stages])

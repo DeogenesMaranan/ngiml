@@ -9,6 +9,7 @@ save checkpoints plus a copy of the training arguments inside the output dir.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import random
 import time
@@ -178,7 +179,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument(
         "--balance-real-fake",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Enable weighted sampling to match a target fake-positive ratio in train batches",
     )
     parser.add_argument(
@@ -665,6 +666,126 @@ def _metric_for_monitor(metrics: dict, monitor: str) -> float:
     return float(metrics[key])
 
 
+def _sample_has_mask_high_pass(record) -> tuple[bool, bool]:
+    has_mask = bool(record.mask_path)
+    has_high_pass = bool(record.high_pass_path)
+    image_path = str(record.image_path)
+    if not image_path.endswith(".npz"):
+        return has_mask, has_high_pass
+
+    try:
+        if "::" in image_path:
+            archive_path, member_name = image_path.split("::", 1)
+            with tarfile.open(archive_path, "r:*") as tf:
+                member = tf.extractfile(member_name)
+                if member is None:
+                    raise FileNotFoundError(f"Missing member {member_name} in {archive_path}")
+                with np.load(io.BytesIO(member.read()), allow_pickle=False) as npz_data:
+                    has_mask = has_mask or ("mask" in npz_data and npz_data["mask"].size > 0)
+                    has_high_pass = has_high_pass or ("high_pass" in npz_data and npz_data["high_pass"].size > 0)
+        else:
+            with np.load(image_path, allow_pickle=False) as npz_data:
+                has_mask = has_mask or ("mask" in npz_data and npz_data["mask"].size > 0)
+                has_high_pass = has_high_pass or ("high_pass" in npz_data and npz_data["high_pass"].size > 0)
+    except Exception as exc:
+        raise ValueError(f"Failed to inspect NPZ sample for mask/high_pass fields: {image_path}") from exc
+
+    return has_mask, has_high_pass
+
+
+def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
+    manifest = load_manifest(manifest_path)
+    train_samples = [sample for sample in manifest.samples if sample.split == "train"]
+    if not train_samples:
+        raise ValueError("Train split has no samples; cannot start training")
+
+    per_dataset_counts: Dict[str, int] = {}
+    real_count = 0
+    fake_count = 0
+    mask_count = 0
+    high_pass_count = 0
+
+    for sample in train_samples:
+        per_dataset_counts[sample.dataset] = per_dataset_counts.get(sample.dataset, 0) + 1
+        label = int(sample.label)
+        if label == 0:
+            real_count += 1
+        elif label == 1:
+            fake_count += 1
+        else:
+            raise ValueError(f"Unexpected train label {label} for sample: {sample.image_path}")
+
+        has_mask, has_high_pass = _sample_has_mask_high_pass(sample)
+        if has_mask:
+            mask_count += 1
+        if has_high_pass:
+            high_pass_count += 1
+
+    total = len(train_samples)
+    print("Train dataset integrity summary")
+    print("  Per-dataset sample counts:")
+    for dataset_name in sorted(per_dataset_counts):
+        print(f"    {dataset_name}: {per_dataset_counts[dataset_name]}")
+
+    fake_ratio = fake_count / max(total, 1)
+    real_ratio = real_count / max(total, 1)
+    print(
+        "  Class ratio (real/fake): "
+        f"{real_count}/{fake_count} "
+        f"(real={real_ratio:.3f}, fake={fake_ratio:.3f})"
+    )
+    print(
+        "  Coverage: "
+        f"masks={100.0 * (mask_count / max(total, 1)):.1f}% "
+        f"high_pass={100.0 * (high_pass_count / max(total, 1)):.1f}%"
+    )
+
+    if fake_count <= 0:
+        raise ValueError(
+            "Train split has no positive (fake) samples. "
+            "Expected at least one sample with label=1."
+        )
+
+    minority_ratio = min(real_count, fake_count) / max(total, 1)
+    if minority_ratio < 0.01:
+        raise ValueError(
+            "Train split class ratio is extreme "
+            f"(real={real_count}, fake={fake_count}, total={total}). "
+            "Please rebalance data before training."
+        )
+
+
+def _write_best_threshold_metadata(
+    path: Path,
+    *,
+    epoch: int,
+    threshold: float | None,
+    threshold_metric: str,
+    monitor: str,
+    monitor_value: float,
+    metrics: dict,
+    checkpoint_path: Path,
+) -> dict:
+    payload = {
+        "epoch": int(epoch),
+        "checkpoint_path": str(checkpoint_path),
+        "threshold": float(threshold) if threshold is not None else None,
+        "threshold_metric": str(threshold_metric),
+        "monitor": str(monitor),
+        "monitor_value": float(monitor_value),
+        "val_iou": float(metrics.get("iou")) if metrics.get("iou") is not None else None,
+        "val_dice": float(metrics.get("dice")) if metrics.get("dice") is not None else None,
+        "val_precision": float(metrics.get("precision")) if metrics.get("precision") is not None else None,
+        "val_recall": float(metrics.get("recall")) if metrics.get("recall") is not None else None,
+        "val_accuracy": float(metrics.get("accuracy")) if metrics.get("accuracy") is not None else None,
+        "val_size_bins": metrics.get("size_bins"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return payload
+
+
 def _get_git_hash() -> str | None:
     git_dir = ROOT
     head_path = git_dir / ".git" / "HEAD"
@@ -1116,6 +1237,8 @@ def run_training(cfg: TrainConfig) -> None:
     if resolved_manifest != Path(cfg.manifest):
         cfg = replace(cfg, manifest=str(resolved_manifest))
 
+    _print_and_validate_train_dataset_integrity(Path(cfg.manifest))
+
     loaders = _prepare_dataloaders(cfg, device)
     t_after_dataloaders = time.time()
     if "train" not in loaders:
@@ -1333,32 +1456,25 @@ def run_training(cfg: TrainConfig) -> None:
                     ema_model=ema_model,
                     use_ema_for_model_state=(ema_model is not None),
                 )
-                checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                with open(best_threshold_path, "w", encoding="utf-8") as handle:
-                    json.dump(
-                        {
-                            "epoch": int(epoch + 1),
-                            "threshold": float(val_threshold) if val_threshold is not None else None,
-                            "threshold_metric": str(metrics.get("threshold_metric", cfg.threshold_metric)),
-                            "monitor": cfg.early_stopping_monitor,
-                            "monitor_value": float(monitor_value),
-                            "val_iou": float(val_iou) if val_iou is not None else None,
-                            "val_dice": float(val_dice) if val_dice is not None else None,
-                            "val_precision": float(val_precision) if val_precision is not None else None,
-                            "val_recall": float(val_recall) if val_recall is not None else None,
-                            "val_accuracy": float(val_accuracy) if val_accuracy is not None else None,
-                            "val_size_bins": val_size_bins,
-                        },
-                        handle,
-                        indent=2,
-                    )
+                best_threshold_payload = _write_best_threshold_metadata(
+                    best_threshold_path,
+                    epoch=epoch + 1,
+                    threshold=val_threshold,
+                    threshold_metric=str(metrics.get("threshold_metric", cfg.threshold_metric)),
+                    monitor=cfg.early_stopping_monitor,
+                    monitor_value=monitor_value,
+                    metrics=metrics,
+                    checkpoint_path=best_alias_path,
+                )
                 _update_experiment_fingerprint(
                     fingerprint_path,
                     {
-                        "chosen_threshold": float(val_threshold) if val_threshold is not None else None,
-                        "best_monitor": cfg.early_stopping_monitor,
-                        "best_monitor_value": float(monitor_value),
-                        "best_val_iou": float(val_iou) if val_iou is not None else None,
+                        "chosen_threshold": best_threshold_payload["threshold"],
+                        "best_threshold_metric": best_threshold_payload["threshold_metric"],
+                        "best_checkpoint_path": best_threshold_payload["checkpoint_path"],
+                        "best_monitor": best_threshold_payload["monitor"],
+                        "best_monitor_value": best_threshold_payload["monitor_value"],
+                        "best_val_iou": best_threshold_payload["val_iou"],
                     },
                 )
                 print(

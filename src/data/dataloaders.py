@@ -4,6 +4,7 @@ import io
 import json
 import tarfile
 import atexit
+import warnings
 from collections import OrderedDict
 import pandas as pd
 from bisect import bisect_right
@@ -24,6 +25,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".npz"}
 # Per-process LRU cache of open tar archives to avoid reopening on every sample.
 _TAR_CACHE_LIMIT = 8
 _TAR_CACHE: "OrderedDict[str, tarfile.TarFile]" = OrderedDict()
+_MISSING_HIGH_PASS_WARNED = False
 
 
 def _close_all_tars() -> None:
@@ -72,7 +74,29 @@ def _load_mask(mask_path: str | None, target_hw: Sequence[int]) -> torch.Tensor:
     return mask
 
 
+def _safe_scale_to_unit_float32(tensor: torch.Tensor) -> torch.Tensor:
+    source_dtype = tensor.dtype
+    tensor = tensor.float()
+    if tensor.numel() == 0:
+        return tensor.to(dtype=torch.float32)
+    if source_dtype == torch.uint8:
+        return (tensor / 255.0).to(dtype=torch.float32)
+    max_value = float(tensor.max().item())
+    if max_value > 1.0:
+        tensor = tensor / 255.0
+    return tensor.to(dtype=torch.float32)
+
+
+def _compute_high_pass_fallback(image: torch.Tensor) -> torch.Tensor:
+    gray = image.mean(dim=0, keepdim=True)
+    blurred = NN_F.avg_pool2d(gray.unsqueeze(0), kernel_size=5, stride=1, padding=2).squeeze(0)
+    high_pass = torch.abs(gray - blurred)
+    high_pass = torch.clamp(high_pass * 4.0, 0.0, 1.0)
+    return high_pass.repeat(3, 1, 1).to(dtype=torch.float32)
+
+
 def _load_from_npz(path: str | io.BytesIO) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    global _MISSING_HIGH_PASS_WARNED
     with np.load(path, allow_pickle=False) as data:
         image_np = data["image"]
         image = torch.from_numpy(image_np)
@@ -88,7 +112,7 @@ def _load_from_npz(path: str | io.BytesIO) -> tuple[torch.Tensor, torch.Tensor |
 
         if image.shape[0] == 1:
             image = image.repeat(3, 1, 1)
-        image = image.float() / 255.0
+        image = _safe_scale_to_unit_float32(image)
 
         mask = None
         if "mask" in data:
@@ -104,6 +128,7 @@ def _load_from_npz(path: str | io.BytesIO) -> tuple[torch.Tensor, torch.Tensor |
                 raise ValueError(f"Unexpected mask shape in NPZ: {mask.shape}")
             if mask.max() > 1.0:
                 mask = mask / 255.0
+            mask = mask.float()
 
         high_pass = None
         if "high_pass" in data:
@@ -120,7 +145,17 @@ def _load_from_npz(path: str | io.BytesIO) -> tuple[torch.Tensor, torch.Tensor |
                     raise ValueError(f"Unexpected high_pass shape in NPZ: {high_pass.shape}")
                 if high_pass.shape[0] == 1:
                     high_pass = high_pass.repeat(3, 1, 1)
-                high_pass = high_pass.float() / 255.0
+                high_pass = _safe_scale_to_unit_float32(high_pass)
+
+        if high_pass is None:
+            if not _MISSING_HIGH_PASS_WARNED:
+                warnings.warn(
+                    "NPZ sample missing high_pass; computing lightweight fallback from image.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                _MISSING_HIGH_PASS_WARNED = True
+            high_pass = _compute_high_pass_fallback(image)
 
     return image, mask, high_pass
 
