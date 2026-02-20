@@ -260,6 +260,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--tversky-weight", type=float, default=0.2, help="Optional Tversky loss weight to improve recall")
     parser.add_argument("--tversky-alpha", type=float, default=0.3, help="Tversky alpha (FP penalty)")
     parser.add_argument("--tversky-beta", type=float, default=0.7, help="Tversky beta (FN penalty)")
+    parser.add_argument("--lovasz-weight", type=float, default=0.5, help="Lovasz Hinge Loss weight for IoU optimization")
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=True, help="Use EMA weights for validation and best checkpoints")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay factor")
     parser.add_argument("--hard-mining-enabled", action=argparse.BooleanOptionalAction, default=True, help="Enable low-IoU hard-example weighting")
@@ -331,6 +332,7 @@ def parse_args() -> TrainConfig:
         tversky_weight=args.tversky_weight,
         tversky_alpha=args.tversky_alpha,
         tversky_beta=args.tversky_beta,
+        lovasz_weight=args.lovasz_weight,
         ema_enabled=args.ema_enabled,
         ema_decay=args.ema_decay,
         hard_mining_enabled=args.hard_mining_enabled,
@@ -1276,6 +1278,7 @@ def run_training(cfg: TrainConfig) -> None:
         tversky_weight=cfg.tversky_weight,
         tversky_alpha=cfg.tversky_alpha,
         tversky_beta=cfg.tversky_beta,
+        lovasz_weight=cfg.lovasz_weight,
     )
     if cfg.auto_pos_weight and foreground_ratio is not None:
         ratio = max(1e-6, min(1.0 - 1e-6, foreground_ratio))

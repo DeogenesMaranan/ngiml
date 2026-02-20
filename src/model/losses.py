@@ -71,6 +71,31 @@ class TverskyLoss(nn.Module):
         return 1.0 - tversky.mean()
 
 
+class LovaszHingeLoss(nn.Module):
+    """Lovasz Hinge Loss for optimizing IoU directly."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        signs = targets * 2 - 1  # Convert targets to {-1, 1}
+        errors = 1 - logits * signs
+        errors_sorted, perm = torch.sort(errors.view(errors.size(0), -1), dim=1, descending=True)
+        perm = perm.detach()
+        targets_sorted = targets.view(targets.size(0), -1).gather(1, perm)
+        grad = self._lovasz_grad(targets_sorted)
+        return (F.relu(errors_sorted) * grad).mean()
+
+    @staticmethod
+    def _lovasz_grad(gt_sorted: torch.Tensor) -> torch.Tensor:
+        """Compute gradient of the Lovasz extension w.r.t sorted errors."""
+        gts = gt_sorted.sum(dim=1, keepdim=True)
+        intersection = gts - gt_sorted.cumsum(dim=1)
+        union = gts + (1 - gt_sorted).cumsum(dim=1)
+        jacc = 1 - intersection / union.clamp_min(1.0)
+        return torch.cat([jacc[:, :1], jacc[:, 1:] - jacc[:, :-1]], dim=1)
+
+
 @dataclass
 class MultiStageLossConfig:
     """Configuration flags for the combined Dice + weighted BCE loss."""
@@ -86,6 +111,7 @@ class MultiStageLossConfig:
     tversky_weight: float = 0.0
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.7
+    lovasz_weight: float = 0.0  # Weight for Lovasz Hinge Loss
 
 
 class MultiStageManipulationLoss(nn.Module):
@@ -101,6 +127,7 @@ class MultiStageManipulationLoss(nn.Module):
             beta=self.cfg.tversky_beta,
             smooth=self.cfg.smooth,
         )
+        self.lovasz = LovaszHingeLoss()
 
         mode = self.cfg.hybrid_mode.strip().lower()
         if mode not in {"dice_bce", "dice_focal"}:
@@ -147,6 +174,8 @@ class MultiStageManipulationLoss(nn.Module):
             stage_loss = self.cfg.dice_weight * dice + hybrid_term
             if self.cfg.tversky_weight > 0:
                 stage_loss = stage_loss + self.cfg.tversky_weight * self.tversky(logits, target)
+            if getattr(self.cfg, "lovasz_weight", 0) > 0:
+                stage_loss = stage_loss + self.cfg.lovasz_weight * self.lovasz(logits, target)
 
             total_loss += stage_weight * stage_loss
             normalizer += stage_weight
@@ -160,4 +189,5 @@ __all__ = [
     "TverskyLoss",
     "MultiStageLossConfig",
     "MultiStageManipulationLoss",
+    "LovaszHingeLoss",
 ]
