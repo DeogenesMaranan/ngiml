@@ -159,6 +159,7 @@ def _build_npz_bytes(
     image_path: Path,
     mask_path: Path | None,
     target_size: int,
+    include_high_pass: bool = True,
 ) -> bytes:
     image = Image.open(image_path).convert("RGB")
     mask_img = Image.open(mask_path).convert("L") if mask_path is not None else None
@@ -169,11 +170,11 @@ def _build_npz_bytes(
             mask_img = mask_img.resize((target_size, target_size), Image.NEAREST)
 
     image_np = np.array(image, dtype=np.uint8)
-    high_pass_np = _compute_high_pass(image_np)
     payload = {"image": image_np}
     if mask_img is not None:
         payload["mask"] = np.array(mask_img, dtype=np.uint8)
-    payload["high_pass"] = high_pass_np
+    if include_high_pass:
+        payload["high_pass"] = _compute_high_pass(image_np)
 
     buf = io.BytesIO()
     # np.savez (not compressed) to avoid CPU overhead from compression.
@@ -242,6 +243,7 @@ def prepare_single_dataset(
                 image_path=image_path,
                 mask_path=mask_path,
                 target_size=target_size,
+                include_high_pass=prep_cfg.enable_high_pass,
             )
 
             stem = f"{cfg.dataset_name}_{split_name}_{'fake' if rec.label else 'real'}_{idx:06d}"
