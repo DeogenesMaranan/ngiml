@@ -104,7 +104,7 @@ class ResidualNoiseModule(nn.Module):
         return kernels
 
     # ------------------------------------------------------------------
-    def forward(self, x: Tensor) -> List[Tensor]:
+    def forward(self, x: Tensor, high_pass: Tensor | None = None) -> List[Tensor]:
         """
         Args:
             x : (B, C, H, W), e.g., RGB image
@@ -120,6 +120,25 @@ class ResidualNoiseModule(nn.Module):
             padding=2,
             groups=c,
         )  # shape: (B, C*3, H, W)
+
+        if high_pass is not None:
+            hp = high_pass
+            if hp.shape[-2:] != x.shape[-2:]:
+                hp = F.interpolate(hp, size=x.shape[-2:], mode="bilinear", align_corners=False)
+            if hp.shape[1] == 1 and c > 1:
+                hp = hp.repeat(1, c, 1, 1)
+            elif hp.shape[1] != c:
+                hp = hp[:, :c, ...]
+                if hp.shape[1] < c:
+                    hp = F.pad(hp, (0, 0, 0, 0, 0, c - hp.shape[1]))
+
+            hp_residual_map = F.conv2d(
+                hp,
+                kernels,
+                padding=2,
+                groups=c,
+            )
+            residual_map = 0.5 * (residual_map + hp_residual_map)
 
         # --- Multi-scale CNN ---
         features = []

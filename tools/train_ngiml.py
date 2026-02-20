@@ -845,16 +845,23 @@ def train_one_epoch(
     for step, batch in enumerate(progress):
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
+        high_pass = batch.get("high_pass")
+        if isinstance(high_pass, torch.Tensor):
+            high_pass = high_pass.to(device, non_blocking=True)
+        else:
+            high_pass = None
         labels = batch["labels"]
         pos_count, total_count = _to_float_label_ratio(labels)
         sampled_pos += pos_count
         sampled_total += total_count
         if cfg.channels_last and device.type == "cuda":
             images = images.contiguous(memory_format=torch.channels_last)
+            if high_pass is not None:
+                high_pass = high_pass.contiguous(memory_format=torch.channels_last)
 
         use_amp = cfg.amp and device.type == "cuda"
         with autocast(device_type=device.type, enabled=use_amp):
-            preds = model(images, target_size=masks.shape[-2:])
+            preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
             loss = loss_fn(preds, masks)
 
             if cfg.hard_mining_enabled and epoch >= int(max(0, cfg.hard_mining_start_epoch)):
@@ -924,11 +931,18 @@ def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: T
     for batch in loader:
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
+        high_pass = batch.get("high_pass")
+        if isinstance(high_pass, torch.Tensor):
+            high_pass = high_pass.to(device, non_blocking=True)
+        else:
+            high_pass = None
         if cfg.channels_last and device.type == "cuda":
             images = images.contiguous(memory_format=torch.channels_last)
+            if high_pass is not None:
+                high_pass = high_pass.contiguous(memory_format=torch.channels_last)
         use_amp = cfg.amp and device.type == "cuda"
         with autocast(device_type=device.type, enabled=use_amp):
-            preds = model(images, target_size=masks.shape[-2:])
+            preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
         logits = preds[-1]
 
         for threshold in thresholds:
@@ -979,11 +993,18 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
     for batch in progress:
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
+        high_pass = batch.get("high_pass")
+        if isinstance(high_pass, torch.Tensor):
+            high_pass = high_pass.to(device, non_blocking=True)
+        else:
+            high_pass = None
         if cfg.channels_last and device.type == "cuda":
             images = images.contiguous(memory_format=torch.channels_last)
+            if high_pass is not None:
+                high_pass = high_pass.contiguous(memory_format=torch.channels_last)
         use_amp = cfg.amp and device.type == "cuda"
         with autocast(device_type=device.type, enabled=use_amp):
-            preds = model(images, target_size=masks.shape[-2:])
+            preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
             loss = loss_fn(preds, masks)
         logits = preds[-1]
 

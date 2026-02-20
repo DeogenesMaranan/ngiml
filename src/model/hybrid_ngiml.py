@@ -106,10 +106,10 @@ class HybridNGIML(nn.Module):
         self.fusion = MultiStageFeatureFusion(branch_channels, self.cfg.fusion)
         self.decoder = UNetDecoder(self.cfg.fusion.fusion_channels, self.cfg.decoder)
 
-    def _extract_features(self, x: Tensor) -> Dict[str, List[Tensor] | Tensor]:
+    def _extract_features(self, x: Tensor, high_pass: Tensor | None = None) -> Dict[str, List[Tensor] | Tensor]:
         low_level = self.efficientnet(x)
         context = self.swin(x)
-        residual = self.noise(x)
+        residual = self.noise(x, high_pass=high_pass)
         return {
             "low_level": low_level,
             "context": context,
@@ -120,8 +120,9 @@ class HybridNGIML(nn.Module):
         self,
         x: Tensor,
         target_size: Optional[Tuple[int, int]] = None,
+        high_pass: Tensor | None = None,
     ) -> List[Tensor]:
-        backbone_feats = self._extract_features(x)
+        backbone_feats = self._extract_features(x, high_pass=high_pass)
         fusion_inputs = {}
         if self.cfg.use_low_level:
             fusion_inputs["low_level"] = backbone_feats["low_level"]
@@ -135,8 +136,9 @@ class HybridNGIML(nn.Module):
         self,
         x: Tensor,
         target_size: Optional[Tuple[int, int]] = None,
+        high_pass: Tensor | None = None,
     ) -> List[Tensor]:
-        fused = self.forward_features(x, target_size=None)
+        fused = self.forward_features(x, target_size=None, high_pass=high_pass)
         preds = self.decoder(fused)
         if target_size is None:
             return preds
