@@ -231,7 +231,7 @@ def parse_args() -> TrainConfig:
         default=True,
         help="Reuse existing local cached manifest when available to shorten startup",
     )
-    parser.add_argument("--views-per-sample", type=int, default=1, help="Number of augmented views per sample (on-the-fly)")
+    parser.add_argument("--views-per-sample", type=int, default=None, help="Number of augmented views per sample (on-the-fly)")
     parser.add_argument("--max-rotation-degrees", type=float, default=5.0, help="Random rotation range (+/-)")
     parser.add_argument("--noise-std-max", type=float, default=0.02, help="Max Gaussian noise std")
     parser.add_argument("--disable-aug", action="store_true", help="Disable GPU augmentations")
@@ -369,7 +369,7 @@ def _coerce_aug(value) -> AugmentationConfig:
 def _build_aug_map(names: Sequence[str], cfg: TrainConfig) -> Dict[str, AugmentationConfig]:
     base_aug = cfg.default_aug or AugmentationConfig(
         enable=not cfg.disable_aug,
-        views_per_sample=cfg.views_per_sample,
+        views_per_sample=cfg.views_per_sample if cfg.views_per_sample is not None else 1,
         enable_flips=True,
         enable_rotations=cfg.max_rotation_degrees > 0,
         max_rotation_degrees=cfg.max_rotation_degrees,
