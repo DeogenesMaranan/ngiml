@@ -116,7 +116,10 @@ class MultiStageLossConfig:
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.7
     lovasz_weight: float = 0.0  # Weight for Lovasz Hinge Loss
+    boundary_weight: float = 0.3  # Weight for Sobel boundary loss
+    boundary_kernel_size: int = 3  # Sobel kernel size (3 or 5)
     hard_pixel_mining: bool = True  # Enable hard pixel mining by default
+    focal_tversky_gamma: float = 1.33  # Focal exponent for Tversky (like LIFD)
 
 
 
@@ -125,7 +128,7 @@ class MultiStageManipulationLoss(nn.Module):
 
     Forensic motivation: Adds Sobel-based boundary loss to encourage sharper manipulation boundaries.
     """
-    def __init__(self, config: MultiStageLossConfig | None = None, boundary_weight: float = 0.3) -> None:
+    def __init__(self, config: MultiStageLossConfig | None = None, boundary_weight: float | None = None) -> None:
         super().__init__()
         self.cfg = config or MultiStageLossConfig()
         self.dice = SoftDiceLoss(smooth=self.cfg.smooth)
@@ -136,8 +139,13 @@ class MultiStageManipulationLoss(nn.Module):
             smooth=self.cfg.smooth,
         )
         self.lovasz = LovaszHingeLoss()
-        self.boundary_loss = SobelBoundaryLoss()
-        self.boundary_weight = boundary_weight
+        self.boundary_loss = SobelBoundaryLoss(kernel_size=self.cfg.boundary_kernel_size)
+        # Prefer config value; fall back to explicit kwarg; default 0.3
+        self.boundary_weight = (
+            self.cfg.boundary_weight
+            if boundary_weight is None
+            else boundary_weight
+        )
 
         mode = self.cfg.hybrid_mode.strip().lower()
         if mode not in {"dice_bce", "dice_focal"}:
@@ -212,26 +220,51 @@ class MultiStageManipulationLoss(nn.Module):
 class SobelBoundaryLoss(nn.Module):
     """Sobel-based boundary loss for sharper manipulation boundaries.
 
-    Forensic motivation: Penalizes boundary errors by comparing Sobel gradient magnitudes of prediction and target.
+    Forensic motivation: Penalizes boundary errors by comparing Sobel gradient
+    magnitudes of prediction and target.  Supports both 3×3 and 5×5 Sobel
+    kernels; 5×5 captures wider boundary context.
     """
-    def __init__(self):
+    def __init__(self, kernel_size: int = 3) -> None:
         super().__init__()
-        # Sobel kernels
-        sobel_x = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3)
-        sobel_y = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+        if kernel_size not in {3, 5}:
+            kernel_size = 3
+        sobel_x, sobel_y = self._make_sobel(kernel_size)
         self.register_buffer('sobel_x', sobel_x)
         self.register_buffer('sobel_y', sobel_y)
+        self.pad = kernel_size // 2
+
+    @staticmethod
+    def _make_sobel(ksize: int):
+        if ksize == 3:
+            kx = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32)
+            ky = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32)
+        else:  # 5×5
+            kx = torch.tensor(
+                [[2, 1, 0, -1, -2],
+                 [3, 2, 0, -2, -3],
+                 [4, 3, 0, -3, -4],
+                 [3, 2, 0, -2, -3],
+                 [2, 1, 0, -1, -2]], dtype=torch.float32)
+            ky = torch.tensor(
+                [[2, 3, 4, 3, 2],
+                 [1, 2, 3, 2, 1],
+                 [0, 0, 0, 0, 0],
+                 [-1, -2, -3, -2, -1],
+                 [-2, -3, -4, -3, -2]], dtype=torch.float32)
+        return kx.view(1, 1, ksize, ksize), ky.view(1, 1, ksize, ksize)
+
+    def _gradient_mag(self, x: Tensor) -> Tensor:
+        gx = F.conv2d(x, self.sobel_x, padding=self.pad)
+        gy = F.conv2d(x, self.sobel_y, padding=self.pad)
+        return torch.sqrt(gx ** 2 + gy ** 2 + 1e-6)
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
         pred = torch.sigmoid(pred)
         target = target.float()
-        # Compute gradients
-        grad_pred_x = F.conv2d(pred, self.sobel_x, padding=1)
-        grad_pred_y = F.conv2d(pred, self.sobel_y, padding=1)
-        grad_target_x = F.conv2d(target, self.sobel_x, padding=1)
-        grad_target_y = F.conv2d(target, self.sobel_y, padding=1)
-        grad_pred = torch.sqrt(grad_pred_x ** 2 + grad_pred_y ** 2 + 1e-6)
-        grad_target = torch.sqrt(grad_target_x ** 2 + grad_target_y ** 2 + 1e-6)
+        if pred.shape[-2:] != target.shape[-2:]:
+            pred = F.interpolate(pred, size=target.shape[-2:], mode='bilinear', align_corners=False)
+        grad_pred = self._gradient_mag(pred)
+        grad_target = self._gradient_mag(target)
         return F.l1_loss(grad_pred, grad_target)
 
 __all__ = [
