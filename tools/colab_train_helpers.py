@@ -224,15 +224,7 @@ def build_default_components():
         residual=ResidualNoiseConfig(num_kernels=3, base_channels=32, num_stages=4),
         fusion=FeatureFusionConfig(fusion_channels=(64, 128, 192, 256)),
         decoder=UNetDecoderConfig(decoder_channels=None, out_channels=1, per_stage_heads=True),
-        optimizer=HybridNGIMLOptimizerConfig(
-            efficientnet=OptimizerGroupConfig(lr=3e-5, weight_decay=1e-4),
-            swin=OptimizerGroupConfig(lr=1e-5, weight_decay=5e-5),
-            residual=OptimizerGroupConfig(lr=2e-4, weight_decay=1e-4),
-            fusion=OptimizerGroupConfig(lr=2e-4, weight_decay=1e-4),
-            decoder=OptimizerGroupConfig(lr=2e-4, weight_decay=1e-4),
-            betas=(0.9, 0.999),
-            eps=1e-8,
-        ),
+        optimizer=HybridNGIMLOptimizerConfig(),
         use_low_level=True,
         use_context=True,
         use_residual=True,
@@ -339,10 +331,10 @@ def build_training_config(
         "hard_mining_start_epoch": 3,
         "hard_mining_weight": 0.1,
         "hard_mining_gamma": 1.0,
-        "default_aug": default_aug,
+        "default_aug": AugmentationConfig,
         "per_dataset_aug": per_dataset_aug,
-        "model_config": model_cfg,
-        "loss_config": loss_cfg,
+        "model_config": HybridNGIMLConfig,
+        "loss_config": MultiStageLossConfig,
     }
 
 
@@ -369,23 +361,6 @@ def apply_colab_runtime_settings(
             "balance_sampling": bool(balance_sampling),
         }
     )
-
-    model_cfg = training_config.get("model_config")
-    if model_cfg is not None and getattr(model_cfg, "optimizer", None) is not None:
-        model_cfg.optimizer.efficientnet.weight_decay = 1e-4
-        model_cfg.optimizer.swin.weight_decay = 5e-5
-        model_cfg.optimizer.fusion.weight_decay = 1e-4
-        model_cfg.optimizer.decoder.weight_decay = 1e-4
-
-        if tune_for_large_batch:
-            training_config["batch_size"] = 12
-            training_config["grad_accum_steps"] = 1
-            model_cfg.optimizer.efficientnet.lr = 4.5e-5
-            model_cfg.optimizer.swin.lr = 1.5e-5
-            model_cfg.optimizer.residual.lr = 3e-4
-            model_cfg.optimizer.fusion.lr = 3e-4
-            model_cfg.optimizer.decoder.lr = 3e-4
-
 
     return training_config
 
