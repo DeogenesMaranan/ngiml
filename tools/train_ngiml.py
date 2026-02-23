@@ -55,8 +55,8 @@ class TrainConfig:
     use_tf32: bool = True
     cuda_expandable_segments: bool = True
     lr_schedule: bool = True
-    warmup_epochs: int = 3
-    min_lr_scale: float = 0.1
+    warmup_epochs: int = 5  # Linear warmup for first 5 epochs
+    min_lr_scale: float = 0.1  # Start at 10% base LR
     grad_clip: float = 1.0
     grad_accum_steps: int = 1
     val_every: int = 1
@@ -152,8 +152,8 @@ def parse_args() -> TrainConfig:
         help="Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True when CUDA is used",
     )
     parser.add_argument("--no-lr-schedule", action="store_true", help="Disable warmup+cosine LR schedule")
-    parser.add_argument("--warmup-epochs", type=int, default=2, help="Number of warmup epochs")
-    parser.add_argument("--min-lr-scale", type=float, default=0.1, help="Final LR scale for cosine schedule")
+    parser.add_argument("--warmup-epochs", type=int, default=5, help="Number of warmup epochs (linear, default=5)")
+    parser.add_argument("--min-lr-scale", type=float, default=0.1, help="Initial LR scale for warmup (default=0.1)")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Max gradient norm; <=0 disables")
     parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--val-every", type=int, default=1, help="Validate every N epochs")
@@ -510,8 +510,9 @@ def _build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig):
     min_lr_scale = float(max(0.0, min(cfg.min_lr_scale, 1.0)))
 
     def _lr_lambda(epoch: int) -> float:
+        # Linear warmup for first warmup_epochs, starting at min_lr_scale (default 0.1)
         if warmup_epochs > 0 and epoch < warmup_epochs:
-            return max(1e-6, float(epoch + 1) / float(warmup_epochs))
+            return min_lr_scale + (1.0 - min_lr_scale) * (float(epoch + 1) / float(warmup_epochs))
 
         cosine_total = max(cfg.epochs - warmup_epochs, 1)
         cosine_epoch = min(max(epoch - warmup_epochs, 0), cosine_total)

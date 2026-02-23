@@ -23,15 +23,16 @@ class OptimizerGroupConfig:
 
 
 def _default_efficientnet_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=3e-5, weight_decay=1e-4)
+    # Forensic motivation: Lower LR for backbone to stabilize early training
+    return OptimizerGroupConfig(lr=1e-5, weight_decay=1e-4)
 
 
 def _default_swin_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=1e-5, weight_decay=5e-5)
+    return OptimizerGroupConfig(lr=5e-6, weight_decay=5e-5)
 
 
 def _default_residual_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=2e-4, weight_decay=1e-4)
+    return OptimizerGroupConfig(lr=3e-4, weight_decay=1e-4)
 
 
 def _default_fusion_optim() -> OptimizerGroupConfig:
@@ -39,13 +40,15 @@ def _default_fusion_optim() -> OptimizerGroupConfig:
 
 
 def _default_decoder_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=2e-4, weight_decay=1e-4)
+    return OptimizerGroupConfig(lr=3e-4, weight_decay=1e-4)
 
 
 @dataclass
 class HybridNGIMLOptimizerConfig:
-    """Optimizer hyper-parameters separated per backbone/fusion branch."""
+    """Optimizer hyper-parameters separated per backbone/fusion branch.
 
+    Forensic motivation: Lower backbone LR, higher forensic/fusion/decoder LRs, and support freezing backbone for early epochs.
+    """
     efficientnet: OptimizerGroupConfig = field(default_factory=_default_efficientnet_optim)
     swin: OptimizerGroupConfig = field(default_factory=_default_swin_optim)
     residual: OptimizerGroupConfig = field(default_factory=_default_residual_optim)
@@ -53,6 +56,7 @@ class HybridNGIMLOptimizerConfig:
     decoder: OptimizerGroupConfig = field(default_factory=_default_decoder_optim)
     betas: Tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
+    freeze_backbone_epochs: int = 5  # Number of epochs to freeze backbone
 
 
 @dataclass

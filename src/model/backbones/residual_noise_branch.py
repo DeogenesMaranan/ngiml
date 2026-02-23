@@ -16,15 +16,20 @@ class ResidualNoiseConfig:
 
 
 class ConvBlock(nn.Module):
-    """Basic 2-layer conv + BN + ReLU block."""
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+    """Basic 2-layer conv + norm + ReLU block.
+
+    Forensic motivation: Normalization is disabled for residual/noise branch to preserve forensic frequency statistics.
+    """
+    def __init__(self, in_channels: int, out_channels: int, norm_layer: nn.Module = None) -> None:
         super().__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d(out_channels)
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False, padding_mode="reflect"),
-            nn.BatchNorm2d(out_channels),
+            norm_layer,
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False, padding_mode="reflect"),
-            nn.BatchNorm2d(out_channels),
+            norm_layer.__class__(out_channels) if not isinstance(norm_layer, nn.Identity) else nn.Identity(),
             nn.ReLU(inplace=True),
         )
 
@@ -36,6 +41,8 @@ class ResidualNoiseModule(nn.Module):
     """
     Combined SRM residual extractor + learnable multi-scale CNN backbone.
 
+    Forensic motivation: Disables normalization for residual branch to preserve forensic signal integrity. Adds learnable scale to strengthen residual branch contribution.
+
     For splicing / copy-move detection:
         Image → SRMResidualBranch → ResidualNoiseBackbone → multi-scale features
     """
@@ -45,6 +52,8 @@ class ResidualNoiseModule(nn.Module):
         cfg = config or ResidualNoiseConfig()
         self.cfg = cfg
         self.in_channels = in_channels
+        # Learnable scale for residual branch
+        self.residual_scale = nn.Parameter(torch.tensor(1.5))
 
         # --- SRM Residual Branch ---
         srm_kernels = torch.tensor([
@@ -79,13 +88,15 @@ class ResidualNoiseModule(nn.Module):
         downsamplers = []
         current_in = self.srm_out_channels
         for idx, out_channels in enumerate(stage_channels):
-            blocks.append(ConvBlock(current_in, out_channels))
+            # Disable normalization for residual branch
+            norm_layer = nn.Identity()
+            blocks.append(ConvBlock(current_in, out_channels, norm_layer=norm_layer))
             current_in = out_channels
             if idx < cfg.num_stages - 1:
                 downsamplers.append(
                     nn.Sequential(
                         nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1, bias=False, padding_mode="reflect"),
-                        nn.BatchNorm2d(out_channels),
+                        nn.Identity(),
                         nn.ReLU(inplace=True),
                     )
                 )
@@ -142,7 +153,8 @@ class ResidualNoiseModule(nn.Module):
 
         # --- Multi-scale CNN ---
         features = []
-        out = residual_map
+        # Apply learnable scale to residuals before fusion
+        out = residual_map * self.residual_scale
         for idx, block in enumerate(self.blocks):
             out = block(out)
             features.append(out)

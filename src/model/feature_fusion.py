@@ -42,8 +42,10 @@ class FeatureFusionConfig:
 
 
 class _AdaptiveFusionStage(nn.Module):
-    """Stage-wise fusion with learned gating and post refinement."""
+    """Stage-wise fusion with learned gating and post refinement.
 
+    Forensic motivation: Prevent gate collapse by initializing fusion gates equally and bounding their range, ensuring all branches contribute to the fused features.
+    """
     def __init__(
         self,
         branch_channels: Dict[str, int],
@@ -52,21 +54,19 @@ class _AdaptiveFusionStage(nn.Module):
         activation: str,
     ) -> None:
         super().__init__()
+        # Conv only for projected features before fusion (no norm/activation)
         self.projections = nn.ModuleDict(
             {
                 branch: nn.Conv2d(in_ch, out_channels, kernel_size=1, bias=False)
                 for branch, in_ch in branch_channels.items()
             }
         )
-        self.gates = nn.ModuleDict(
-            {
-                branch: nn.Sequential(
-                    nn.AdaptiveAvgPool2d(1),
-                    nn.Conv2d(out_channels, 1, kernel_size=1, bias=True),
-                )
-                for branch in branch_channels
-            }
-        )
+        num_branches = len(branch_channels)
+        # Initialize fusion gates equally across branches
+        self.gate_params = nn.ParameterDict({
+            branch: nn.Parameter(torch.full((1, 1, 1, 1), 1.0 / num_branches))
+            for branch in branch_channels
+        })
         self.refine = nn.Sequential(
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
             _build_norm(norm, out_channels),
@@ -99,8 +99,11 @@ class _AdaptiveFusionStage(nn.Module):
             if proj.shape[-2:] != (align_h, align_w):
                 proj = F.interpolate(proj, size=(align_h, align_w), mode="bilinear", align_corners=False)
 
-            # Learned scalar gate per branch keeps gradients informative.
-            gate = torch.sigmoid(self.gates[branch](proj))
+            # Bounded sigmoid gating: gate = sigmoid(param) * 0.8 + 0.1
+            raw_gate = self.gate_params[branch]
+            gate = torch.sigmoid(raw_gate) * 0.8 + 0.1
+            # Broadcast gate to proj shape
+            gate = gate.expand_as(proj)
             if noise_branch is not None and branch == noise_branch:
                 gate = gate * noise_weight
 

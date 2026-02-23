@@ -1,4 +1,7 @@
-"""EfficientNet-B0 backbone for NGIML low-level feature extraction (torchvision-based)."""
+"""EfficientNet backbone for NGIML low-level feature extraction (timm-based).
+
+Forensic motivation: timm EfficientNet provides more stable pretrained weights and better intermediate feature extraction for manipulation localization tasks.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,7 +10,7 @@ from typing import Sequence, List, Tuple, Union
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+import timm
 
 
 @dataclass
@@ -20,9 +23,12 @@ class EfficientNetBackboneConfig:
     input_size: Union[int, Tuple[int, int], None] = None
 
 
-class EfficientNetBackbone(nn.Module):
-    """Wrapper that exposes multi-scale EfficientNet-B0 feature maps."""
 
+class EfficientNetBackbone(nn.Module):
+    """Wrapper that exposes multi-scale EfficientNet feature maps using timm.
+
+    Forensic motivation: Use timm EfficientNet for more stable pretrained weights and better feature extraction for manipulation localization.
+    """
     def __init__(self, config: EfficientNetBackboneConfig | None = None) -> None:
         super().__init__()
         cfg = config or EfficientNetBackboneConfig()
@@ -36,38 +42,29 @@ class EfficientNetBackbone(nn.Module):
             else:
                 self.expected_hw = tuple(cfg.input_size)
         else:
-            self.expected_hw = (224, 224)  # default EfficientNet-B0 input
+            self.expected_hw = (224, 224)  # default EfficientNet input
 
-        weights = EfficientNet_B0_Weights.DEFAULT if cfg.pretrained else None
-        backbone = efficientnet_b0(weights=weights)
-        self.features = backbone.features
-
+        # Use timm to create EfficientNet backbone
+        # Default to 'efficientnet_b0' for backward compatibility
+        model_name = getattr(cfg, 'model_name', 'efficientnet_b0')
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=cfg.pretrained,
+            features_only=True,
+            out_indices=self.out_indices
+        )
         # Cache channel dimensions for downstream heads
-        self.out_channels: List[int] = self._infer_out_channels()
-
-    def _infer_out_channels(self) -> List[int]:
-        """Infer the channel dimensions of the selected feature maps dynamically."""
-        with torch.no_grad():
-            dummy = torch.zeros(1, 3, *self.expected_hw)
-            channels: List[int] = []
-            x = dummy
-            for idx, block in enumerate(self.features):
-                x = block(x)
-                if idx in self.out_indices:
-                    channels.append(x.shape[1])
-        return channels
+        self.out_channels: List[int] = [f['num_chs'] for f in self.backbone.feature_info if f['index'] in self.out_indices]
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """Return multi-scale feature maps."""
         if self.enforce_input_size and x.shape[-2:] != self.expected_hw:
             x = F.interpolate(x, size=self.expected_hw, mode="bilinear", align_corners=False)
-
-        outputs: List[torch.Tensor] = []
-        for idx, block in enumerate(self.features):
-            x = block(x)
-            if idx in self.out_indices:
-                outputs.append(x)
-        return outputs
+        features = self.backbone(x)
+        # Ensure returned feature list order matches out_indices
+        if isinstance(features, (list, tuple)):
+            return list(features)
+        return [features]
 
 
 __all__ = ["EfficientNetBackbone", "EfficientNetBackboneConfig"]

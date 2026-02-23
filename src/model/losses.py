@@ -1,3 +1,27 @@
+class SobelBoundaryLoss(nn.Module):
+    """Sobel-based boundary loss for sharper manipulation boundaries.
+
+    Forensic motivation: Penalizes boundary errors by comparing Sobel gradient magnitudes of prediction and target.
+    """
+    def __init__(self):
+        super().__init__()
+        # Sobel kernels
+        sobel_x = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        pred = torch.sigmoid(pred)
+        target = target.float()
+        # Compute gradients
+        grad_pred_x = F.conv2d(pred, self.sobel_x, padding=1)
+        grad_pred_y = F.conv2d(pred, self.sobel_y, padding=1)
+        grad_target_x = F.conv2d(target, self.sobel_x, padding=1)
+        grad_target_y = F.conv2d(target, self.sobel_y, padding=1)
+        grad_pred = torch.sqrt(grad_pred_x ** 2 + grad_pred_y ** 2 + 1e-6)
+        grad_target = torch.sqrt(grad_target_x ** 2 + grad_target_y ** 2 + 1e-6)
+        return F.l1_loss(grad_pred, grad_target)
 """Training losses for NGIML multi-stage localization."""
 from __future__ import annotations
 
@@ -98,12 +122,16 @@ class LovaszHingeLoss(nn.Module):
 
 @dataclass
 class MultiStageLossConfig:
-    """Configuration flags for the combined Dice + weighted BCE loss."""
+    """Configuration flags for the combined Dice + weighted BCE loss.
+
+    Forensic motivation: Reduce deep supervision strength so final prediction dominates total loss, improving stability for forensic segmentation.
+    """
 
     dice_weight: float = 1.0
     bce_weight: float = 1.0
     pos_weight: float = 2.0
-    stage_weights: Optional[Sequence[float]] = None
+    # Default stage weights: [0.05, 0.1, 0.2, 1.0] (final prediction dominates)
+    stage_weights: Optional[Sequence[float]] = field(default_factory=lambda: [0.05, 0.1, 0.2, 1.0])
     smooth: float = 1e-6
     hybrid_mode: str = "dice_bce"  # one of: dice_bce, dice_focal
     focal_gamma: float = 2.0
@@ -114,10 +142,13 @@ class MultiStageLossConfig:
     lovasz_weight: float = 0.0  # Weight for Lovasz Hinge Loss
 
 
-class MultiStageManipulationLoss(nn.Module):
-    """Applies configurable hybrid segmentation supervision at every prediction stage."""
 
-    def __init__(self, config: MultiStageLossConfig | None = None) -> None:
+class MultiStageManipulationLoss(nn.Module):
+    """Applies configurable hybrid segmentation supervision at every prediction stage, with optional boundary loss.
+
+    Forensic motivation: Adds Sobel-based boundary loss to encourage sharper manipulation boundaries.
+    """
+    def __init__(self, config: MultiStageLossConfig | None = None, boundary_weight: float = 0.3) -> None:
         super().__init__()
         self.cfg = config or MultiStageLossConfig()
         self.dice = SoftDiceLoss(smooth=self.cfg.smooth)
@@ -128,6 +159,8 @@ class MultiStageManipulationLoss(nn.Module):
             smooth=self.cfg.smooth,
         )
         self.lovasz = LovaszHingeLoss()
+        self.boundary_loss = SobelBoundaryLoss()
+        self.boundary_weight = boundary_weight
 
         mode = self.cfg.hybrid_mode.strip().lower()
         if mode not in {"dice_bce", "dice_focal"}:
@@ -180,6 +213,11 @@ class MultiStageManipulationLoss(nn.Module):
             total_loss += stage_weight * stage_loss
             normalizer += stage_weight
 
+        # Add boundary loss on final prediction
+        if preds:
+            boundary = self.boundary_loss(preds[-1], target)
+            total_loss += self.boundary_weight * boundary
+
         return total_loss / max(normalizer, 1e-6)
 
 
@@ -189,5 +227,6 @@ __all__ = [
     "TverskyLoss",
     "MultiStageLossConfig",
     "MultiStageManipulationLoss",
+    "SobelBoundaryLoss",
     "LovaszHingeLoss",
 ]

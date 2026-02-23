@@ -45,11 +45,14 @@ class _ConvBlock(nn.Module):
 
 @dataclass
 class UNetDecoderConfig:
-    """Configuration for the U-Net style decoder."""
+    """Configuration for the U-Net style decoder.
+
+    Forensic motivation: Use InstanceNorm by default to improve stability for forensic segmentation.
+    """
 
     decoder_channels: Sequence[int] | None = None
     out_channels: int = 1
-    norm: str = "bn"
+    norm: str = "in"  # Default to InstanceNorm
     activation: str = "relu"
     per_stage_heads: bool = True
 
