@@ -44,26 +44,30 @@ class EfficientNetBackbone(nn.Module):
         else:
             self.expected_hw = (224, 224)  # default EfficientNet input
 
-        # Use timm to create EfficientNet backbone
-        # Default to 'efficientnet_b0' for backward compatibility
+        # Use timm to create EfficientNet backbone without forcing out_indices.
+        # We'll select the requested feature maps from the returned list to avoid timm internal index mismatches.
         model_name = getattr(cfg, 'model_name', 'efficientnet_b0')
-        self.backbone = timm.create_model(
-            model_name,
-            pretrained=cfg.pretrained,
-            features_only=True,
-            out_indices=self.out_indices
-        )
-        # Cache channel dimensions for downstream heads
-        self.out_channels: List[int] = [f['num_chs'] for f in self.backbone.feature_info if f['index'] in self.out_indices]
+        self.backbone = timm.create_model(model_name, pretrained=cfg.pretrained, features_only=True)
+        avail_n = len(self.backbone.feature_info)
+        requested = tuple(sorted(set(self.out_indices)))
+        valid_indices = tuple(i for i in requested if 0 <= i < avail_n)
+        if not valid_indices:
+            valid_indices = tuple(range(avail_n))
+        if valid_indices != tuple(requested):
+            print(f"Warning: requested efficientnet out_indices {requested} adjusted to available indices {valid_indices} for model {model_name}")
+        self.selected_indices = valid_indices
+        # Cache channel dimensions for downstream heads corresponding to selected indices
+        self.out_channels: List[int] = [self.backbone.feature_info[i]['num_chs'] for i in self.selected_indices]
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """Return multi-scale feature maps."""
         if self.enforce_input_size and x.shape[-2:] != self.expected_hw:
             x = F.interpolate(x, size=self.expected_hw, mode="bilinear", align_corners=False)
         features = self.backbone(x)
-        # Ensure returned feature list order matches out_indices
+        # Select only the requested feature maps and return as list
         if isinstance(features, (list, tuple)):
-            return list(features)
+            selected = [features[i] for i in self.selected_indices]
+            return selected
         return [features]
 
 
