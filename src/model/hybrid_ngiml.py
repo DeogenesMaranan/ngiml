@@ -153,19 +153,12 @@ class HybridNGIML(nn.Module):
             # Modulate semantic features: semantic_feat = semantic_feat * (1 + attention)
             low_level[0] = low_level[0] * (1.0 + attn_map)
 
-        # Gradient checkpointing for memory savings
-        if getattr(self.cfg, 'gradient_checkpointing', False):
-            def checkpointed_forward(module, *inputs):
-                def custom_forward(*inputs):
-                    return module(*inputs)
-                return torch.utils.checkpoint.checkpoint(custom_forward, *inputs)
-            # Only checkpoint backbone blocks if possible
-            if hasattr(self.efficientnet, 'backbone'):
-                low_level = [checkpointed_forward(m, x) for m in self.efficientnet.backbone.children()]
-            if hasattr(self.swin, 'model'):
-                context = [checkpointed_forward(m, x) for m in self.swin.model.children()]
-            if hasattr(self.noise, 'blocks'):
-                residual = [checkpointed_forward(m, x) for m in self.noise.blocks]
+        # Note: previous implementation attempted to checkpoint each child module
+        # by calling them directly with the original input `x`. That is incorrect
+        # because many backbone children expect the output of prior blocks, not
+        # the raw image, which can cause BatchNorm channel mismatches.
+        # For now, we avoid per-child checkpointing and rely on the backbone's
+        # own forward implementation (which may internally support memory saving).
 
         return {
             "low_level": low_level,
