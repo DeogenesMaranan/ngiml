@@ -209,6 +209,9 @@ class SwinBackbone(nn.Module):
                     self._propagate_spatial_metadata(x_padded.shape[-2], x_padded.shape[-1])
                     # Resize to exact expected model input size
                     x_resized = NN_F.interpolate(x_padded, size=(exp_h, exp_w), mode="bilinear", align_corners=False)
+                    # Re-propagate metadata for the final resized spatial dims so
+                    # attention masks and window masks are built for the exact size.
+                    self._propagate_spatial_metadata(exp_h, exp_w)
                     features = self.model(x_resized)
                 else:
                     # No default input size available; fall back to patch-multiple padding
