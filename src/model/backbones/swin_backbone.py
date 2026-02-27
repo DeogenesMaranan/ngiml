@@ -83,8 +83,20 @@ class SwinBackbone(nn.Module):
                 _LOG.info("xformers not installed; xformers attention will not be used.")
 
     def _propagate_spatial_metadata(self, height: int, width: int) -> None:
-        if height % self.patch_size[0] != 0 or width % self.patch_size[1] != 0:
-            raise ValueError("Input spatial dims must be multiples of patch size")
+        # Accept non-multiple spatial dims by adjusting to the next multiple of patch size.
+        ph, pw = self.patch_size
+        if height % ph != 0 or width % pw != 0:
+            new_h = ((height + ph - 1) // ph) * ph
+            new_w = ((width + pw - 1) // pw) * pw
+            _LOG.warning(
+                "Swin input spatial dims (%d,%d) are not multiples of patch size %s; adjusting to (%d,%d)",
+                height,
+                width,
+                self.patch_size,
+                new_h,
+                new_w,
+            )
+            height, width = new_h, new_w
 
         if self._last_spatial_size == (height, width):
             return
