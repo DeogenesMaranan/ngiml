@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-
+import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.optim import AdamW
@@ -151,7 +151,6 @@ class HybridNGIML(nn.Module):
 
         # Gradient checkpointing for memory savings
         if getattr(self.cfg, 'gradient_checkpointing', False):
-            import torch.utils.checkpoint
             def checkpointed_forward(module, *inputs):
                 def custom_forward(*inputs):
                     return module(*inputs)
