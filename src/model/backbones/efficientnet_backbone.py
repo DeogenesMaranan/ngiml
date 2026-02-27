@@ -84,7 +84,26 @@ class EfficientNetBackbone(nn.Module):
             except Exception:
                 pass
 
-        features = self.backbone(x)
+        try:
+            features = self.backbone(x)
+        except AssertionError as err:
+            msg = str(err)
+            _LOG.warning("EfficientNet model assertion during forward: %s", msg)
+            default_cfg = getattr(self.backbone, "default_cfg", None) or getattr(self.backbone, "default_cfg", {})
+            input_size = default_cfg.get("input_size") if isinstance(default_cfg, dict) else None
+            if input_size:
+                try:
+                    exp_h, exp_w = input_size[1], input_size[2]
+                    _LOG.warning(
+                        "Resizing input from (%d,%d) to model default (%d,%d) to recover from assertion",
+                        x.shape[-2], x.shape[-1], exp_h, exp_w,
+                    )
+                    x_resized = F.interpolate(x, size=(exp_h, exp_w), mode="bilinear", align_corners=False)
+                    features = self.backbone(x_resized)
+                except Exception:
+                    raise
+            else:
+                raise
         # Select only the requested feature maps and return as list
         if isinstance(features, (list, tuple)):
             selected = [features[i] for i in self.selected_indices]
