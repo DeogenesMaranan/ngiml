@@ -24,13 +24,23 @@ class SwinBackbone(nn.Module):
     def __init__(self, config: SwinBackboneConfig | None = None, flash_attention: bool = False, xformers: bool = False) -> None:
         super().__init__()
         cfg = config or SwinBackboneConfig()
+        # Create model without forcing out_indices first, then clamp requested indices
+        # to the model's available feature levels and recreate with valid indices.
+        self.model = timm.create_model(cfg.model_name, pretrained=cfg.pretrained, features_only=True)
+        avail_n = len(self.model.feature_info)
+        requested = tuple(cfg.out_indices) if cfg.out_indices is not None else tuple(range(avail_n))
+        valid_indices = tuple(i for i in requested if 0 <= i < avail_n)
+        if not valid_indices:
+            valid_indices = tuple(range(avail_n))
+        if valid_indices != tuple(requested):
+            print(
+                f"Warning: requested swin out_indices {requested} adjusted to available indices {valid_indices} for model {cfg.model_name}"
+            )
+        # Recreate model with validated out_indices to ensure forward returns expected maps
         self.model = timm.create_model(
-            cfg.model_name,
-            pretrained=cfg.pretrained,
-            features_only=True,
-            out_indices=cfg.out_indices,
+            cfg.model_name, pretrained=cfg.pretrained, features_only=True, out_indices=valid_indices
         )
-        self.out_channels: List[int] = list(self.model.feature_info.channels())
+        self.out_channels: List[int] = [self.model.feature_info[i]["num_chs"] for i in valid_indices]
         patch = getattr(self.model, "patch_embed", None)
         if patch is None:
             raise ValueError("Swin backbone missing patch_embed; ensure model_name is a Swin variant")
