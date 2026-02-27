@@ -20,6 +20,8 @@ from torchvision.transforms import functional as F
 from torchvision.transforms.functional import InterpolationMode
 import random
 import functools
+from dataclasses import replace as _dc_replace
+from bisect import bisect_left
 
 from .config import AugmentationConfig, Manifest, SampleRecord
 
@@ -186,7 +188,15 @@ def torchvision_load_image(path: str, as_mask: bool = False) -> torch.Tensor:
 
 
 class PerDatasetDataset(Dataset):
-    def __init__(self, samples: Sequence[SampleRecord], aug_cfg: AugmentationConfig, training: bool, max_short_side: int | None = None) -> None:
+    def __init__(
+        self,
+        samples: Sequence[SampleRecord],
+        aug_cfg: AugmentationConfig,
+        training: bool,
+        max_short_side: int | None = None,
+        aug_seed: int | None = None,
+        apply_augmentations: bool = False,
+    ) -> None:
         self.samples = list(samples)
         self.aug_cfg = aug_cfg
         self.training = training
@@ -195,6 +205,9 @@ class PerDatasetDataset(Dataset):
         # (helps prevent oversized backbone inputs that trigger timm assertions
         # or excessive GPU memory usage). If None, no cap is applied.
         self.max_short_side = int(max_short_side) if max_short_side is not None else None
+        # Per-worker augmentation seed and whether to perform augmentations inside workers
+        self.aug_seed = aug_seed
+        self.apply_augmentations = bool(apply_augmentations)
 
     def __len__(self) -> int:  # type: ignore[override]
         return len(self.samples)
@@ -241,6 +254,18 @@ class PerDatasetDataset(Dataset):
             mask = F.resize(mask, [new_h, new_w], interpolation=InterpolationMode.NEAREST)
             if high_pass is not None:
                 high_pass = F.resize(high_pass, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+
+        # If configured, perform per-sample augmentations inside the worker.
+        if self.apply_augmentations and self.training and cfg.enable:
+            worker_info = torch.utils.data.get_worker_info()
+            worker_offset = worker_info.id if worker_info is not None else 0
+            gen = None
+            if self.aug_seed is not None:
+                gen = torch.Generator()
+                gen.manual_seed(int(self.aug_seed) + int(worker_offset) + int(index))
+            image, mask, high_pass = _apply_gpu_augmentations(
+                image, mask, cfg, high_pass=high_pass, generator=gen
+            )
 
         label = torch.tensor(record.label, dtype=torch.long)
 
@@ -719,7 +744,109 @@ def _apply_gpu_augmentations_batch(
         noise = torch.randn_like(images) * stds
         images = torch.clamp(images + noise, 0.0, 1.0)
 
+    # Random resized_crop vectorized (approximate; does not implement
+    # object-centered crop bias). Uses affine_grid + grid_sample for batch.
+    if cfg.enable_random_crop:
+        _, _, H, W = images.shape
+        scales = cfg.crop_scale_range[0] + _rand_scalar((B,)) * (cfg.crop_scale_range[1] - cfg.crop_scale_range[0])
+        crop_h = (scales * float(H)).round().to(dtype=torch.int64)
+        crop_w = (scales * float(W)).round().to(dtype=torch.int64)
+        # Clamp
+        crop_h = torch.clamp(crop_h, min=1, max=H)
+        crop_w = torch.clamp(crop_w, min=1, max=W)
+
+        tops = torch.zeros((B,), dtype=torch.int64, device=images.device)
+        lefts = torch.zeros((B,), dtype=torch.int64, device=images.device)
+        valid_crop = (crop_h < H) | (crop_w < W)
+        if valid_crop.any():
+            # choose random top/left where crop smaller than original
+            max_t = (H - crop_h).clamp(min=0)
+            max_l = (W - crop_w).clamp(min=0)
+            r_t = torch.rand((B,), device=images.device, generator=generator)
+            r_l = torch.rand((B,), device=images.device, generator=generator)
+            tops = (r_t * (max_t.to(dtype=torch.float32) + 1.0)).to(dtype=torch.int64).clamp(max=max_t)
+            lefts = (r_l * (max_l.to(dtype=torch.float32) + 1.0)).to(dtype=torch.int64).clamp(max=max_l)
+
+            thetas = torch.zeros((B, 2, 3), device=images.device, dtype=images.dtype)
+            denom_x = float(W - 1) if W > 1 else 1.0
+            denom_y = float(H - 1) if H > 1 else 1.0
+            for i in range(B):
+                ch = int(crop_h[i].item())
+                cw = int(crop_w[i].item())
+                if ch <= 0 or cw <= 0:
+                    thetas[i, 0, 0] = 1.0
+                    thetas[i, 1, 1] = 1.0
+                    continue
+                a = float(max(cw - 1, 0)) / denom_x
+                b = float(max(ch - 1, 0)) / denom_y
+                left = int(lefts[i].item())
+                top = int(tops[i].item())
+                tx = (2.0 * left + (cw - 1) - (W - 1)) / denom_x
+                ty = (2.0 * top + (ch - 1) - (H - 1)) / denom_y
+                thetas[i, 0, 0] = a
+                thetas[i, 0, 2] = tx
+                thetas[i, 1, 1] = b
+                thetas[i, 1, 2] = ty
+
+            grid = torch.nn.functional.affine_grid(thetas, images.size(), align_corners=True)
+            images = torch.nn.functional.grid_sample(images, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
+            masks = torch.nn.functional.grid_sample(masks, grid, mode="nearest", padding_mode="zeros", align_corners=True)
+            if high_pass is not None:
+                high_pass = torch.nn.functional.grid_sample(high_pass, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
+
     return images, masks, high_pass
+
+
+
+class SizeBucketingBatchSampler:
+    """BatchSampler that groups indices from a base sampler into batches of
+    similarly-sized samples (by short side) to reduce padding waste.
+
+    Args:
+        base_sampler: an iterable yielding indices (e.g., RoundRobinSampler)
+        short_sides: list-like mapping index -> short-side length (int)
+        batch_size: batch size
+        drop_last: whether to drop incomplete batches
+        bin_size: bucket width in pixels (default 32)
+    """
+
+    def __init__(self, base_sampler, short_sides, batch_size: int, drop_last: bool = True, bin_size: int = 32):
+        self.base_sampler = base_sampler
+        self.short_sides = list(int(s) for s in short_sides)
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.bin_size = int(bin_size)
+
+    def __iter__(self):
+        buckets = {}
+        for idx in self.base_sampler:
+            if idx < 0 or idx >= len(self.short_sides):
+                # forward indices unchanged
+                bucket_key = 0
+            else:
+                s = int(self.short_sides[idx])
+                bucket_key = (s // self.bin_size) * self.bin_size
+            lst = buckets.setdefault(bucket_key, [])
+            lst.append(idx)
+            if len(lst) >= self.batch_size:
+                yield lst[: self.batch_size]
+                del lst[: self.batch_size]
+
+        # emit remaining
+        if not self.drop_last:
+            remaining = []
+            for lst in buckets.values():
+                if lst:
+                    remaining.extend(lst)
+                    while len(remaining) >= self.batch_size:
+                        yield remaining[: self.batch_size]
+                        del remaining[: self.batch_size]
+            if remaining:
+                yield remaining
+
+    def __len__(self):
+        # best-effort length is unknown because bucketing depends on runtime
+        return NotImplemented
 
 
 def _collate_impl(
@@ -923,6 +1050,7 @@ def create_dataloaders(
     balanced_sampler_seed: int | None = 42,
     balanced_sampler_num_samples: int | None = None,
     max_short_side: int | None = None,
+    size_bucketing: bool = True,
 ) -> Dict[str, DataLoader]:
     manifest = load_manifest(manifest_path)
     normalization_mode = manifest.normalization_mode
@@ -937,11 +1065,59 @@ def create_dataloaders(
     for split_name, per_dataset_records in splits.items():
         training = split_name == "train"
         datasets: List[PerDatasetDataset] = []
+        combined_short_sides: List[int] = []
+        # Track whether each dataset will perform augmentations inside workers
+        per_dataset_apply_in_worker: Dict[str, bool] = {}
         for dataset_name, records in per_dataset_records.items():
             aug_cfg = per_dataset_augmentations.get(dataset_name, AugmentationConfig(enable=False))
+            apply_in_worker = bool(aug_cfg.enable and num_workers > 0 and device.type != "cuda")
+            per_dataset_apply_in_worker[dataset_name] = apply_in_worker
             datasets.append(
-                PerDatasetDataset(records, aug_cfg=aug_cfg, training=training, max_short_side=max_short_side)
+                PerDatasetDataset(
+                    records,
+                    aug_cfg=aug_cfg,
+                    training=training,
+                    max_short_side=max_short_side,
+                    aug_seed=aug_seed,
+                    apply_augmentations=apply_in_worker,
+                )
             )
+            # Estimate short-side per-sample for bucketing heuristics (cheap, best-effort)
+            for r in records:
+                ss = None
+                try:
+                    p = str(r.image_path)
+                    if "::" in p and p.endswith(".npz"):
+                        # tar::npz entry: extract member bytes from tar and inspect
+                        archive, member = p.split("::", 1)
+                        try:
+                            tar = _get_tarfile(archive)
+                            member_obj = tar.extractfile(member)
+                            if member_obj is not None:
+                                npz_bytes = member_obj.read()
+                                with np.load(io.BytesIO(npz_bytes), allow_pickle=False) as data:
+                                    img = data["image"]
+                                    ss = int(min(img.shape[0] if img.ndim==3 else img.shape[-2], img.shape[1] if img.ndim==3 else img.shape[-1]))
+                        except Exception:
+                            ss = None
+                    elif p.endswith(".npz"):
+                        with np.load(p, allow_pickle=False) as data:
+                            img = data["image"]
+                            ss = int(min(img.shape[0] if img.ndim==3 else img.shape[-2], img.shape[1] if img.ndim==3 else img.shape[-1]))
+                    else:
+                        try:
+                            from PIL import Image
+
+                            with Image.open(p) as im:
+                                w, h = im.size
+                            ss = int(min(w, h))
+                        except Exception:
+                            ss = None
+                except Exception:
+                    ss = None
+                if ss is None:
+                    ss = int(max_short_side) if max_short_side is not None else 320
+                combined_short_sides.append(int(ss))
 
         if not datasets:
             continue
@@ -967,8 +1143,17 @@ def create_dataloaders(
         else:
             sampler = None
 
+        # If a dataset applies augmentations in the worker, disable collate-time
+        # augmentations for that dataset to avoid double-application.
+        collate_aug_map: Dict[str, AugmentationConfig] = {}
+        for name, aug in per_dataset_augmentations.items():
+            if per_dataset_apply_in_worker.get(name, False):
+                collate_aug_map[name] = _dc_replace(aug, enable=False)
+            else:
+                collate_aug_map[name] = aug
+
         collate_fn = _collate_builder(
-            per_dataset_augmentations,
+            collate_aug_map,
             normalization_mode,
             training=training,
             aug_seed=aug_seed,
@@ -977,18 +1162,34 @@ def create_dataloaders(
         pf = prefetch_factor if num_workers > 0 else None
         persistent = persistent_workers if num_workers > 0 else False
 
-        loader = DataLoader(
-            combined,
-            batch_size=batch_size,
-            sampler=sampler,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            collate_fn=collate_fn,
-            drop_last=drop_last if training else False,
-            prefetch_factor=pf,
-            persistent_workers=persistent,
-        )
+        # Optionally use a size-bucketing batch sampler to group similarly
+        # sized samples and reduce padding waste during batching.
+        use_batch_sampler = bool(training and size_bucketing and sampler is not None)
+        if use_batch_sampler:
+            batch_sampler = SizeBucketingBatchSampler(sampler, combined_short_sides, batch_size=batch_size, drop_last=drop_last)
+            loader = DataLoader(
+                combined,
+                batch_sampler=batch_sampler,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                collate_fn=collate_fn,
+                prefetch_factor=pf,
+                persistent_workers=persistent,
+            )
+        else:
+            loader = DataLoader(
+                combined,
+                batch_size=batch_size,
+                sampler=sampler,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                collate_fn=collate_fn,
+                drop_last=drop_last if training else False,
+                prefetch_factor=pf,
+                persistent_workers=persistent,
+            )
         loaders[split_name] = loader
 
     return loaders

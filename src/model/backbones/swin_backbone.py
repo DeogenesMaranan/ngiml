@@ -160,9 +160,12 @@ class SwinBackbone(nn.Module):
         except StopIteration:
             model_dev = None
         if model_dev is not None and model_dev != x.device:
-            _LOG.info("Moving SwinBackbone model from %s to %s", model_dev, x.device)
-            # Move the full module so all parameters/buffers align
-            self.to(x.device)
+            _LOG.warning(
+                "SwinBackbone detected model device %s differs from input device %s. "
+                "Avoid per-forward module moves; ensure model is moved to the input device once during setup.",
+                model_dev,
+                x.device,
+            )
 
         # Pad input so spatial dimensions are multiples of the Swin patch size
         _, _, h, w = x.shape

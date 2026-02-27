@@ -367,6 +367,30 @@ def apply_colab_runtime_settings(
     return training_config
 
 
+def apply_high_throughput_settings(training_config: dict, target_batch_size: int = 32) -> dict:
+    """Adjust a training_config dict for high-throughput GPU runs.
+
+    This function updates worker counts, prefetching, memory format and
+    precision defaults to better saturate modern accelerators.
+    """
+    recommended_workers = max(4, min(16, (os.cpu_count() or 4)))
+    training_config.update(
+        {
+            "batch_size": int(target_batch_size),
+            "num_workers": recommended_workers,
+            "pin_memory": True,
+            "prefetch_factor": 4,
+            "persistent_workers": True,
+            "compile_model": True,
+            "compile_mode": "default",
+            "channels_last": True,
+            "use_tf32": True,
+            "precision": "bf16",
+        }
+    )
+    return training_config
+
+
 def stage_persistent_cache_to_runtime(
     persistent_cache_dir: str | Path,
     runtime_cache_dir: str | Path = "/content/cache",

@@ -1545,6 +1545,14 @@ def run_training(cfg: TrainConfig) -> None:
         print(f"Foreground pixel ratio (train): {foreground_ratio:.6f}")
 
     model_cfg = cfg.model_config or HybridNGIMLConfig()
+    # Honor the training-level gradient checkpointing toggle when instantiating the model
+    try:
+        from dataclasses import replace as _dc_replace
+
+        model_cfg = _dc_replace(model_cfg, gradient_checkpointing=cfg.gradient_checkpointing)
+    except Exception:
+        model_cfg.gradient_checkpointing = cfg.gradient_checkpointing
+
     model = HybridNGIML(model_cfg).to(device)
     if cfg.channels_last and device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
