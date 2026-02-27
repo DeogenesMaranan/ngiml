@@ -99,11 +99,30 @@ class _AdaptiveFusionStage(nn.Module):
         if target_size is not None:
             align_h, align_w = target_size
         else:
-            align_h = max(x.shape[-2] for x in features.values())
-            align_w = max(x.shape[-1] for x in features.values())
+            # Compute per-branch spatial sizes
+            sizes = {branch: (tensor.shape[-2], tensor.shape[-1]) for branch, tensor in features.items()}
+            # Default to the maximum across branches
+            max_h = max(h for h, w in sizes.values())
+            max_w = max(w for h, w in sizes.values())
 
-        fused = 0.0
-        weight_sum = 0.0
+            # If a noise/residual branch is present and is extremely larger than
+            # the other branches, avoid upsampling everything to that huge size
+            # (which can OOM). Instead prefer the maximum among non-noise
+            # branches when the residual spatial size exceeds others by >2x.
+            non_noise_sizes = [s for b, s in sizes.items() if b != (noise_branch or "")] if features else []
+            if non_noise_sizes:
+                non_max_h = max(h for h, w in non_noise_sizes)
+                non_max_w = max(w for h, w in non_noise_sizes)
+                # If the largest size is more than twice the non-noise max, cap it.
+                if max_h >= 2 * non_max_h:
+                    max_h = non_max_h
+                if max_w >= 2 * non_max_w:
+                    max_w = non_max_w
+
+            align_h, align_w = int(max_h), int(max_w)
+
+        fused = None
+        weight_sum = None
         eps = 1e-6
 
         for branch, tensor in features.items():
@@ -117,10 +136,20 @@ class _AdaptiveFusionStage(nn.Module):
             # Broadcast gate to proj shape
             gate = gate.expand_as(proj)
             if noise_branch is not None and branch == noise_branch:
+                # weight noise branch by the configured noise weight
                 gate = gate * noise_weight
 
-            fused = fused + proj * gate
-            weight_sum = weight_sum + gate
+            # Initialize fused/weight_sum tensors on first iteration to avoid
+            # creating large intermediate Python floats and to enable in-place
+            # accumulation which reduces peak memory.
+            if fused is None:
+                fused = torch.zeros_like(proj)
+                weight_sum = torch.zeros_like(proj)
+
+            # Multiply in-place into proj tensor to avoid allocating proj * gate
+            torch.mul(proj, gate, out=proj)
+            fused.add_(proj)
+            weight_sum.add_(gate)
 
         fused = fused / (weight_sum + eps)
         fused = self.refine(fused)
