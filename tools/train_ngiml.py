@@ -74,8 +74,8 @@ def _build_lr_scheduler(optimizer, cfg):
 
 @dataclass
 class TrainConfig:
-    scheduler_type: str = "cosine"  # one of: 'cosine', 'step' (cosine enabled by default)
     manifest: str
+    scheduler_type: str = "cosine"  # one of: 'cosine', 'step' (cosine enabled by default)
     output_dir: str = "runs/ngiml"
     batch_size: int = 8
     epochs: int = 50
