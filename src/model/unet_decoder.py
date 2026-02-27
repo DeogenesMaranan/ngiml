@@ -137,7 +137,7 @@ class UNetDecoder(nn.Module):
             ]
         )
 
-    def forward(self, features: List[Tensor], image: Tensor = None) -> List[Tensor]:
+    def forward(self, features: List[Tensor], image: Tensor = None, postprocess: Optional[str] = None) -> List[Tensor]:
         if len(features) != len(self.stage_channels):
             raise ValueError("Feature list length must match number of decoder stages")
 
@@ -184,11 +184,21 @@ class UNetDecoder(nn.Module):
             out_preds = [pred for pred in predictions if pred is not None]
             if self.use_dropout and out_preds:
                 out_preds[-1] = self.dropout(out_preds[-1])
+            if postprocess is not None:
+                if postprocess.lower() == 'sigmoid':
+                    out_preds = [torch.sigmoid(p) for p in out_preds]
+                else:
+                    raise ValueError(f"Unsupported postprocess: {postprocess}")
             return out_preds
 
         final = self.predictors[0](x)
         if self.use_dropout:
             final = self.dropout(final)
+        if postprocess is not None:
+            if postprocess.lower() == 'sigmoid':
+                final = torch.sigmoid(final)
+            else:
+                raise ValueError(f"Unsupported postprocess: {postprocess}")
         return [final]
 
 
