@@ -44,9 +44,60 @@ import sys
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.data.dataloaders import AugmentationConfig, create_dataloaders, load_manifest
+from src.data.dataloaders import AugmentationConfig, create_dataloaders, load_manifest, _apply_gpu_augmentations, _normalize
 from src.model.hybrid_ngiml import HybridNGIML, HybridNGIMLConfig
 from src.model.losses import MultiStageLossConfig, MultiStageManipulationLoss
+
+
+class _PrefetchLoader:
+    """Simple async prefetcher that moves next batch to CUDA in a background stream.
+
+    Usage: wrap a DataLoader with `_PrefetchLoader(loader, device)` before iterating.
+    No-op on CPU devices.
+    """
+
+    def __init__(self, loader, device: torch.device):
+        self._loader = loader
+        self._device = device
+        self._stream = None
+
+    def __iter__(self):
+        if self._device.type != "cuda":
+            return iter(self._loader)
+        self._iter = iter(self._loader)
+        self._stream = torch.cuda.Stream()
+        self._next_batch = None
+        self._preload()
+        return self
+
+    def __next__(self):
+        if self._device.type != "cuda":
+            return next(self._iter)
+        if self._next_batch is None:
+            raise StopIteration
+        batch = self._next_batch
+        self._preload()
+        return batch
+
+    def _preload(self):
+        try:
+            nxt = next(self._iter)
+        except StopIteration:
+            self._next_batch = None
+            return
+
+        # Move tensors to GPU in the prefetch stream
+        with torch.cuda.stream(self._stream):
+            for k, v in list(nxt.items()):
+                if isinstance(v, torch.Tensor):
+                    try:
+                        nxt[k] = v.to(self._device, non_blocking=True)
+                    except Exception:
+                        nxt[k] = v.to(self._device)
+        # Ensure the current stream waits for the prefetch stream before using batch
+        torch.cuda.current_stream().wait_stream(self._stream)
+        self._next_batch = nxt
+
 
 
 def _build_lr_scheduler(optimizer, cfg):
@@ -174,7 +225,9 @@ class Checkpoint:
 
 def parse_args() -> TrainConfig:
     parser.add_argument("--scheduler-type", type=str, default="cosine", choices=["cosine", "step"], help="LR scheduler type (cosine or step)")
-    default_workers = max(2, (os.cpu_count() or 4) // 2)
+    # Use a higher default worker count to better saturate fast GPUs (e.g. A100).
+    # Keep a sensible floor to avoid tiny values on CI/low-core systems.
+    default_workers = max(4, (os.cpu_count() or 4))
     parser = argparse.ArgumentParser(description="Train NGIML manipulation localization")
     parser.add_argument("--manifest", required=True, help="Path to prepared manifest JSON")
     parser.add_argument("--output-dir", default="runs/ngiml", help="Directory to write checkpoints/logs")
@@ -188,7 +241,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--compile-mode", type=str, default="default", help="torch.compile mode")
     parser.add_argument("--deterministic", action="store_true", help="Enable deterministic kernels (slower)")
     parser.add_argument("--no-tf32", action="store_true", help="Disable TF32 matrix math on CUDA")
-    parser.add_argument("--precision", type=str, default="fp32", choices=["fp32", "fp16", "bf16"], help="Numerical precision for training")
+    parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Numerical precision for training")
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False, help="Enable gradient checkpointing for memory savings")
     parser.add_argument("--flash-attention", action=argparse.BooleanOptionalAction, default=False, help="Enable flash attention if supported")
     parser.add_argument("--xformers", action=argparse.BooleanOptionalAction, default=False, help="Enable xformers memory-efficient attention if supported")
@@ -454,9 +507,26 @@ def _prepare_dataloaders(cfg: TrainConfig, device: torch.device):
     manifest_path = Path(cfg.manifest)
     dataset_names = _collect_dataset_names(manifest_path)
     per_dataset_aug = _build_aug_map(dataset_names, cfg)
-    return create_dataloaders(
+    # Also return the per-dataset augmentation map and normalization mode so
+    # augmentations can be applied on-device in the training loop.
+    manifest = load_manifest(manifest_path)
+    normalization_mode = manifest.normalization_mode
+    # When running on CUDA we prefer to perform augmentations and normalization
+    # on-device. To enable that we disable cpu-side augmentation/normalization
+    # inside the collate function by passing a disabled aug map and using
+    # a no-op normalization there. The original per_dataset_aug and
+    # normalization_mode are returned for on-device application in the loop.
+    collate_aug_map = per_dataset_aug
+    collate_norm_mode = normalization_mode
+    if device.type == "cuda":
+        from dataclasses import replace as _dc_replace
+
+        collate_aug_map = {name: _dc_replace(aug, enable=False) for name, aug in per_dataset_aug.items()}
+        collate_norm_mode = "zero_one"
+
+    loaders = create_dataloaders(
         manifest_path,
-        per_dataset_aug,
+        collate_aug_map,
         batch_size=cfg.batch_size,
         device=device,
         pin_memory=cfg.pin_memory,
@@ -473,6 +543,7 @@ def _prepare_dataloaders(cfg: TrainConfig, device: torch.device):
         persistent_workers=cfg.persistent_workers,
         max_short_side=cfg.max_short_side,
     )
+    return loaders, per_dataset_aug, normalization_mode
 
 
 def _safe_cache_name(spec: str) -> str:
@@ -1001,6 +1072,8 @@ def train_one_epoch(
     epoch: int,
     global_step: int,
     ema_model: Optional[HybridNGIML] = None,
+    per_dataset_aug: Optional[Dict[str, AugmentationConfig]] = None,
+    normalization_mode: Optional[str] = None,
 ):
     model.train()
     running_loss = 0.0
@@ -1008,6 +1081,9 @@ def train_one_epoch(
     sampled_pos = 0.0
     sampled_total = 0.0
     accum_steps = max(1, int(cfg.grad_accum_steps))
+    # Wrap loader with prefetcher to overlap host->device copy with GPU compute.
+    if device.type == "cuda":
+        loader = _PrefetchLoader(loader, device)
     progress = tqdm(loader, desc=f"Epoch {epoch:03d}", leave=False, dynamic_ncols=True)
     optimizer.zero_grad(set_to_none=True)
     for step, batch in enumerate(progress):
@@ -1018,6 +1094,42 @@ def train_one_epoch(
             high_pass = high_pass.to(device, non_blocking=True)
         else:
             high_pass = None
+        # Apply GPU-side augmentations and normalization when requested.
+        if device.type == "cuda" and per_dataset_aug is not None and normalization_mode is not None:
+            try:
+                gen = torch.Generator(device=device)
+            except TypeError:
+                gen = torch.Generator()
+            seed_base = int(cfg.aug_seed) if cfg.aug_seed is not None else int(cfg.seed)
+            try:
+                gen.manual_seed(seed_base + int(global_step))
+            except Exception:
+                gen.manual_seed(seed_base)
+
+            imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
+            imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
+
+            datasets_list = batch.get("datasets", None)
+            if datasets_list is not None:
+                bsz = images.shape[0]
+                for i in range(bsz):
+                    ds_name = str(datasets_list[i])
+                    aug_cfg = per_dataset_aug.get(ds_name, None)
+                    if aug_cfg is None or not getattr(aug_cfg, "enable", False):
+                        # still ensure normalization is applied on-device
+                        images[i] = _normalize(images[i], normalization_mode, imagenet_mean=imagenet_mean, imagenet_std=imagenet_std)
+                        continue
+
+                    hp_i = None
+                    if high_pass is not None:
+                        hp_i = high_pass[i]
+
+                    img_i, mask_i, hp_out = _apply_gpu_augmentations(images[i], masks[i], aug_cfg, high_pass=hp_i, generator=gen)
+                    img_i = _normalize(img_i, normalization_mode, imagenet_mean=imagenet_mean, imagenet_std=imagenet_std)
+                    images[i] = img_i
+                    masks[i] = mask_i
+                    if hp_out is not None and high_pass is not None:
+                        high_pass[i] = hp_out
         labels = batch["labels"]
         pos_count, total_count = _to_float_label_ratio(labels)
         sampled_pos += pos_count
@@ -1027,8 +1139,43 @@ def train_one_epoch(
             if high_pass is not None:
                 high_pass = high_pass.contiguous(memory_format=torch.channels_last)
 
-        use_amp = cfg.amp and device.type == "cuda"
-        with autocast(device_type=device.type, enabled=use_amp):
+        precision_name = (getattr(cfg, "precision", "fp32") or "fp32").lower()
+        amp_dtype = torch.bfloat16 if precision_name == "bf16" else (torch.float16 if precision_name == "fp16" else None)
+        use_amp = cfg.amp and device.type == "cuda" and (amp_dtype is not None)
+        if amp_dtype is not None:
+            with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+                loss = loss_fn(preds, masks)
+
+                if cfg.hard_mining_enabled and epoch >= int(max(0, cfg.hard_mining_start_epoch)):
+                    final_logits = preds[-1]
+                    if final_logits.shape[-2:] != masks.shape[-2:]:
+                        final_logits = torch.nn.functional.interpolate(
+                            final_logits,
+                            size=masks.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+
+                    bce_per_sample = torch.nn.functional.binary_cross_entropy_with_logits(
+                        final_logits,
+                        masks,
+                        reduction="none",
+                    ).mean(dim=(1, 2, 3))
+
+                    with torch.no_grad():
+                        pred_bin = (torch.sigmoid(final_logits) >= 0.5).float()
+                        tp = (pred_bin * masks).sum(dim=(1, 2, 3))
+                        fp = (pred_bin * (1.0 - masks)).sum(dim=(1, 2, 3))
+                        fn = ((1.0 - pred_bin) * masks).sum(dim=(1, 2, 3))
+                        iou = (tp + 1e-6) / (tp + fp + fn + 1e-6)
+                        difficulty = (1.0 - iou).clamp(0.0, 1.0)
+                        hard_weights = 1.0 + float(max(0.0, cfg.hard_mining_gamma)) * difficulty
+                        hard_weights = hard_weights / hard_weights.mean().clamp_min(1e-6)
+
+                    hard_loss = (hard_weights * bce_per_sample).mean()
+                    loss = loss + float(max(0.0, cfg.hard_mining_weight)) * hard_loss
+        else:
             preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
             loss = loss_fn(preds, masks)
 
@@ -1108,8 +1255,13 @@ def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: T
             images = images.contiguous(memory_format=torch.channels_last)
             if high_pass is not None:
                 high_pass = high_pass.contiguous(memory_format=torch.channels_last)
-        use_amp = cfg.amp and device.type == "cuda"
-        with autocast(device_type=device.type, enabled=use_amp):
+        precision_name = (getattr(cfg, "precision", "fp32") or "fp32").lower()
+        amp_dtype = torch.bfloat16 if precision_name == "bf16" else (torch.float16 if precision_name == "fp16" else None)
+        use_amp = cfg.amp and device.type == "cuda" and (amp_dtype is not None)
+        if amp_dtype is not None:
+            with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+        else:
             preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
         logits = preds[-1]
 
@@ -1143,7 +1295,7 @@ def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: T
 
 
 @torch.inference_mode()
-def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: TrainConfig) -> dict:
+def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: TrainConfig, normalization_mode: Optional[str] = None) -> dict:
     model.eval()
     total_loss = 0.0
     batches = 0
@@ -1166,12 +1318,26 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
             high_pass = high_pass.to(device, non_blocking=True)
         else:
             high_pass = None
+        # If collate left normalization to be done on-device (collate used zero_one),
+        # perform normalization here on the GPU for evaluation.
+        if device.type == "cuda" and normalization_mode is not None:
+            imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
+            imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
+            bsz = images.shape[0]
+            for i in range(bsz):
+                images[i] = _normalize(images[i], normalization_mode, imagenet_mean=imagenet_mean, imagenet_std=imagenet_std)
         if cfg.channels_last and device.type == "cuda":
             images = images.contiguous(memory_format=torch.channels_last)
             if high_pass is not None:
                 high_pass = high_pass.contiguous(memory_format=torch.channels_last)
-        use_amp = cfg.amp and device.type == "cuda"
-        with autocast(device_type=device.type, enabled=use_amp):
+        precision_name = (getattr(cfg, "precision", "fp32") or "fp32").lower()
+        amp_dtype = torch.bfloat16 if precision_name == "bf16" else (torch.float16 if precision_name == "fp16" else None)
+        use_amp = cfg.amp and device.type == "cuda" and (amp_dtype is not None)
+        if amp_dtype is not None:
+            with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+                loss = loss_fn(preds, masks)
+        else:
             preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
             loss = loss_fn(preds, masks)
         logits = preds[-1]
@@ -1286,7 +1452,7 @@ def run_training(cfg: TrainConfig) -> None:
 
     _print_and_validate_train_dataset_integrity(Path(cfg.manifest))
 
-    loaders = _prepare_dataloaders(cfg, device)
+    loaders, per_dataset_aug, normalization_mode = _prepare_dataloaders(cfg, device)
     t_after_dataloaders = time.time()
     if "train" not in loaders:
         raise ValueError("Train split missing in manifest; cannot start training")
@@ -1309,7 +1475,8 @@ def run_training(cfg: TrainConfig) -> None:
         model = model.to(memory_format=torch.channels_last)
     optimizer = model.build_optimizer()
     scheduler = _build_lr_scheduler(optimizer, cfg)
-    scaler = GradScaler(device.type, enabled=(cfg.amp and device.type == "cuda"))
+    # GradScaler is only required for fp16; bf16 on A100 benefits from native autocast without scaling.
+    scaler = GradScaler(enabled=(str(cfg.precision).lower() == "fp16" and cfg.amp and device.type == "cuda"))
     ema_model = _init_ema_model(model, model_cfg, cfg.ema_enabled)
     if ema_model is not None:
         ema_model = ema_model.to(device)
@@ -1420,6 +1587,8 @@ def run_training(cfg: TrainConfig) -> None:
             epoch,
             global_step,
             ema_model=ema_model,
+            per_dataset_aug=per_dataset_aug,
+            normalization_mode=normalization_mode,
         )
 
         elapsed = time.time() - start_time
@@ -1446,7 +1615,7 @@ def run_training(cfg: TrainConfig) -> None:
         val_size_bins = None
         if "val" in loaders and (epoch + 1) % cfg.val_every == 0:
             eval_model = ema_model if ema_model is not None else model
-            metrics = evaluate(eval_model, loaders["val"], loss_fn, device, cfg)
+            metrics = evaluate(eval_model, loaders["val"], loss_fn, device, cfg, normalization_mode=normalization_mode)
             val_loss = float(metrics["loss"])
             val_dice = float(metrics["dice"])
             val_iou = float(metrics["iou"])

@@ -20,6 +20,7 @@ from torchvision.transforms.functional import InterpolationMode
 from PIL import Image
 import random
 import io as pyio
+import functools
 
 from .config import AugmentationConfig, Manifest, SampleRecord
 
@@ -653,136 +654,145 @@ def _apply_gpu_augmentations(
     return image, mask, high_pass
 
 
+def _collate_impl(
+    per_dataset_aug: Dict[str, AugmentationConfig],
+    normalization_mode: str,
+    training: bool,
+    aug_seed: int | None,
+    batch: List[dict[str, object]],
+) -> dict[str, object]:
+    imagenet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+    imagenet_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+
+    # Create a per-call generator seeded from aug_seed and worker id (if provided).
+    aug_generator = None
+    if aug_seed is not None:
+        worker_info = torch.utils.data.get_worker_info()
+        worker_offset = worker_info.id if worker_info is not None else 0
+        aug_generator = torch.Generator()
+        aug_generator.manual_seed(int(aug_seed) + int(worker_offset))
+
+    images: List[torch.Tensor] = []
+    masks: List[torch.Tensor] = []
+    labels: List[torch.Tensor] = []
+    datasets: List[str] = []
+    high_passes: List[torch.Tensor] = []
+    collect_high_pass = True
+
+    for sample in batch:
+        image = sample["image"]
+        mask = sample["mask"]
+        label = sample["label"]
+        dataset_name = str(sample["dataset"])
+        high_pass = sample.get("high_pass")
+        if high_pass is None:
+            collect_high_pass = False
+        aug_cfg = per_dataset_aug.get(dataset_name, AugmentationConfig(enable=False))
+        views = aug_cfg.views_per_sample if aug_cfg.enable else 1
+        views = max(1, views)
+
+        base_image = image
+        base_mask = mask
+        base_high_pass = high_pass
+
+        for _ in range(views):
+            view_image = base_image
+            view_mask = base_mask
+            view_high_pass = base_high_pass
+
+            if training and aug_cfg.enable:
+                view_image, view_mask, view_high_pass = _apply_gpu_augmentations(
+                    view_image,
+                    view_mask,
+                    aug_cfg,
+                    high_pass=view_high_pass,
+                    generator=aug_generator,
+                )
+
+            view_image = _normalize(
+                view_image,
+                normalization_mode,
+                imagenet_mean=imagenet_mean,
+                imagenet_std=imagenet_std,
+            )
+
+            images.append(view_image)
+            masks.append(view_mask)
+            labels.append(label)
+            datasets.append(dataset_name)
+            if collect_high_pass and view_high_pass is not None:
+                high_passes.append(view_high_pass)
+
+    # Ensure all images/masks/high_pass tensors have the same H,W before stacking.
+    # Pad to the maximum H,W in the batch (pad on right and bottom).
+    shapes = [img.shape for img in images]
+    need_pad = any(s != shapes[0] for s in shapes)
+
+    if need_pad:
+        max_c = max(s[0] for s in shapes)
+        max_h = max(s[1] for s in shapes)
+        max_w = max(s[2] for s in shapes)
+
+        padded_images: List[torch.Tensor] = []
+        padded_masks: List[torch.Tensor] = []
+        for img, m in zip(images, masks):
+            c, h, w = img.shape
+            # pad channels if necessary (unlikely)
+            if c < max_c:
+                pad_ch = max_c - c
+                img = torch.cat([img, torch.zeros((pad_ch, h, w), dtype=img.dtype, device=img.device)], dim=0)
+
+            pad_w = max_w - w
+            pad_h = max_h - h
+            if pad_w or pad_h:
+                img = NN_F.pad(img, (0, pad_w, 0, pad_h), value=0)
+            # handle missing masks (create zero mask)
+            if m is None:
+                m = torch.zeros((1, h, w), dtype=torch.float32, device=img.device)
+            else:
+                mc, mh, mw = m.shape
+                if (mh != max_h) or (mw != max_w):
+                    m = NN_F.pad(m, (0, pad_w, 0, pad_h), value=0)
+
+            padded_images.append(img)
+            padded_masks.append(m)
+
+        images = padded_images
+        masks = padded_masks
+
+        if collect_high_pass and high_passes:
+            padded_high: List[torch.Tensor] = []
+            for hp in high_passes:
+                hc, hh, hw = hp.shape
+                ph = max_h - hh
+                pw = max_w - hw
+                if ph or pw:
+                    hp = NN_F.pad(hp, (0, pw, 0, ph), value=0)
+                padded_high.append(hp)
+            high_passes = padded_high
+
+    batch_dict = {
+        "images": torch.stack(images, dim=0),
+        "masks": torch.stack(masks, dim=0),
+        "labels": torch.stack(labels, dim=0),
+        "datasets": datasets,
+    }
+
+    if collect_high_pass and high_passes:
+        batch_dict["high_pass"] = torch.stack(high_passes, dim=0)
+
+    return batch_dict
+
+
 def _collate_builder(
     per_dataset_aug: Dict[str, AugmentationConfig],
     normalization_mode: str,
     training: bool,
     aug_seed: int | None = None,
 ):
-    imagenet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
-    imagenet_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
-    aug_generator: torch.Generator | None = None
-
-    def _collate(batch: List[dict[str, object]]) -> dict[str, object]:
-        nonlocal aug_generator
-        if aug_seed is not None and aug_generator is None:
-            aug_generator = torch.Generator()
-            worker_info = torch.utils.data.get_worker_info()
-            worker_offset = worker_info.id if worker_info is not None else 0
-            aug_generator.manual_seed(int(aug_seed) + int(worker_offset))
-
-        images: List[torch.Tensor] = []
-        masks: List[torch.Tensor] = []
-        labels: List[torch.Tensor] = []
-        datasets: List[str] = []
-        high_passes: List[torch.Tensor] = []
-        collect_high_pass = True
-
-        for sample in batch:
-            image = sample["image"]
-            mask = sample["mask"]
-            label = sample["label"]
-            dataset_name = str(sample["dataset"])
-            high_pass = sample.get("high_pass")
-            if high_pass is None:
-                collect_high_pass = False
-            aug_cfg = per_dataset_aug.get(dataset_name, AugmentationConfig(enable=False))
-            views = aug_cfg.views_per_sample if aug_cfg.enable else 1
-            views = max(1, views)
-
-            base_image = image
-            base_mask = mask
-            base_high_pass = high_pass
-
-            for _ in range(views):
-                view_image = base_image
-                view_mask = base_mask
-                view_high_pass = base_high_pass
-
-                if training and aug_cfg.enable:
-                    view_image, view_mask, view_high_pass = _apply_gpu_augmentations(
-                        view_image,
-                        view_mask,
-                        aug_cfg,
-                        high_pass=view_high_pass,
-                        generator=aug_generator,
-                    )
-
-                view_image = _normalize(
-                    view_image,
-                    normalization_mode,
-                    imagenet_mean=imagenet_mean,
-                    imagenet_std=imagenet_std,
-                )
-
-                images.append(view_image)
-                masks.append(view_mask)
-                labels.append(label)
-                datasets.append(dataset_name)
-                if collect_high_pass and view_high_pass is not None:
-                    high_passes.append(view_high_pass)
-
-        # Ensure all images/masks/high_pass tensors have the same H,W before stacking.
-        # Pad to the maximum H,W in the batch (pad on right and bottom).
-        shapes = [img.shape for img in images]
-        need_pad = any(s != shapes[0] for s in shapes)
-
-        if need_pad:
-            max_c = max(s[0] for s in shapes)
-            max_h = max(s[1] for s in shapes)
-            max_w = max(s[2] for s in shapes)
-
-            padded_images: List[torch.Tensor] = []
-            padded_masks: List[torch.Tensor] = []
-            for img, m in zip(images, masks):
-                c, h, w = img.shape
-                # pad channels if necessary (unlikely)
-                if c < max_c:
-                    pad_ch = max_c - c
-                    img = torch.cat([img, torch.zeros((pad_ch, h, w), dtype=img.dtype, device=img.device)], dim=0)
-
-                pad_w = max_w - w
-                pad_h = max_h - h
-                if pad_w or pad_h:
-                    img = NN_F.pad(img, (0, pad_w, 0, pad_h), value=0)
-                # handle missing masks (create zero mask)
-                if m is None:
-                    m = torch.zeros((1, h, w), dtype=torch.float32, device=img.device)
-                else:
-                    mc, mh, mw = m.shape
-                    if (mh != max_h) or (mw != max_w):
-                        m = NN_F.pad(m, (0, pad_w, 0, pad_h), value=0)
-
-                padded_images.append(img)
-                padded_masks.append(m)
-
-            images = padded_images
-            masks = padded_masks
-
-            if collect_high_pass and high_passes:
-                padded_high: List[torch.Tensor] = []
-                for hp in high_passes:
-                    hc, hh, hw = hp.shape
-                    ph = max_h - hh
-                    pw = max_w - hw
-                    if ph or pw:
-                        hp = NN_F.pad(hp, (0, pw, 0, ph), value=0)
-                    padded_high.append(hp)
-                high_passes = padded_high
-
-        batch_dict = {
-            "images": torch.stack(images, dim=0),
-            "masks": torch.stack(masks, dim=0),
-            "labels": torch.stack(labels, dim=0),
-            "datasets": datasets,
-        }
-
-        if collect_high_pass and high_passes:
-            batch_dict["high_pass"] = torch.stack(high_passes, dim=0)
-
-        return batch_dict
-
-    return _collate
+    # Return a picklable partial of the top-level collate implementation so
+    # spawn-based multiprocessing (Windows) can serialize it.
+    return functools.partial(_collate_impl, per_dataset_aug, normalization_mode, training, aug_seed)
 
 
 def _group_by(split: str, samples: Iterable[SampleRecord]) -> Dict[str, list[SampleRecord]]:
