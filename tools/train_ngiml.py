@@ -16,6 +16,7 @@ import time
 import os
 import hashlib
 import tarfile
+import shutil
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
@@ -500,7 +501,9 @@ def _materialize_tar_npz_manifest(manifest_path: Path, cache_root: Path) -> Path
         if member is None:
             raise FileNotFoundError(f"Missing tar member {member_name} in {archive_path}")
 
-        out_path.write_bytes(member.read())
+        # Stream-write the member to avoid loading the entire file into memory
+        with open(out_path, "wb") as out_f:
+            shutil.copyfileobj(member, out_f)
         return str(out_path)
 
     try:
