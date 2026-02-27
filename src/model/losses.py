@@ -105,7 +105,7 @@ class MultiStageLossConfig:
 
     dice_weight: float = 1.0
     bce_weight: float = 1.0
-    pos_weight: float = 2.0
+    pos_weight: float = 1.0
     # Default stage weights: [0.05, 0.1, 0.2, 1.0] (final prediction dominates)
     stage_weights: Optional[Sequence[float]] = field(default_factory=lambda: [0.05, 0.1, 0.2, 1.0])
     smooth: float = 1e-6
@@ -116,7 +116,8 @@ class MultiStageLossConfig:
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.7
     lovasz_weight: float = 0.0  # Weight for Lovasz Hinge Loss
-    hard_pixel_mining: bool = True  # Enable hard pixel mining by default
+    hard_pixel_mining: bool = False  # Disable hard pixel mining by default to stabilize training
+    
 
 
 

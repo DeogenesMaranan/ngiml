@@ -325,7 +325,7 @@ def build_training_config(
         "threshold_metric": "dice",
         "compute_foreground_ratio": True,
         "auto_pos_weight": True,
-        "pos_weight_min": 1.0,
+        "pos_weight_min": 0.5,
         "pos_weight_max": 8.0,
         "ema_enabled": True,
         "ema_decay": 0.999,

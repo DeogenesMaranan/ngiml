@@ -791,10 +791,33 @@ def _collate_impl(
             if collect_high_pass and view_high_pass is not None:
                 high_passes.append(view_high_pass)
 
-    # Ensure all images/masks/high_pass tensors have the same H,W before stacking.
-    # Pad to the maximum H,W in the batch (pad on right and bottom).
+    # Reduce per-batch size variance: resize all images in the batch to the
+    # median short-side to avoid excessive padding across widely varying sizes.
+    # This is a cheap bucketing heuristic that improves memory usage and
+    # throughput while keeping aspect ratios.
     shapes = [img.shape for img in images]
-    need_pad = any(s != shapes[0] for s in shapes)
+    shorts = [min(s[1], s[2]) for s in shapes]
+    if len(shorts) > 1:
+        try:
+            target_short = int(round(float(np.median(shorts))))
+        except Exception:
+            target_short = shorts[0]
+        # Only resize when it actually changes the short side
+        for i, img in enumerate(images):
+            c, h, w = img.shape
+            short_side = min(h, w)
+            if short_side != target_short and short_side > 0:
+                scale = float(target_short) / float(short_side)
+                new_h, new_w = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+                images[i] = F.resize(images[i], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+                if masks[i] is None:
+                    masks[i] = torch.zeros((1, new_h, new_w), dtype=torch.float32, device=images[i].device)
+                else:
+                    masks[i] = F.resize(masks[i], [new_h, new_w], interpolation=InterpolationMode.NEAREST)
+                if collect_high_pass and i < len(high_passes):
+                    high_passes[i] = F.resize(high_passes[i], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+
+    need_pad = any(s != images[0].shape for s in [img.shape for img in images])
 
     if need_pad:
         max_c = max(s[0] for s in shapes)

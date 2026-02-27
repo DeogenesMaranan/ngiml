@@ -205,7 +205,7 @@ class TrainConfig:
     medium_mask_ratio_max: float = 0.05
     compute_foreground_ratio: bool = True
     auto_pos_weight: bool = True
-    pos_weight_min: float = 1.0
+    pos_weight_min: float = 0.5
     pos_weight_max: float = 20.0
     loss_hybrid_mode: str = "dice_bce"
     dice_weight: float = 1.0
