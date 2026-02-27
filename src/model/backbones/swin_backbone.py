@@ -104,10 +104,9 @@ class SwinBackbone(nn.Module):
         grid_h = height // self.patch_size[0]
         grid_w = width // self.patch_size[1]
 
-        if (height, width) != self.patch_embed.img_size:
-            self.patch_embed.img_size = (height, width)
-            self.patch_embed.grid_size = (grid_h, grid_w)
-            self.patch_embed.num_patches = grid_h * grid_w
+        # Do not forcibly override patch_embed.img_size/grid_size/num_patches here; leave
+        # timm internals to manage those attributes to avoid creating inconsistent
+        # attention masks. We only propagate stage-level input resolutions below.
 
         for stage_idx, stage in enumerate(self.stages):
             scale = 2 ** stage_idx
@@ -174,17 +173,7 @@ class SwinBackbone(nn.Module):
             x = NN_F.pad(x, (0, pad_w, 0, pad_h), value=0)
 
         self._propagate_spatial_metadata(x.shape[-2], x.shape[-1])
-        # Guard timm model internal `out_indices` against invalid values (some timm versions)
-        if hasattr(self.model, "feature_info") and hasattr(self.model, "out_indices"):
-            avail = len(self.model.feature_info)
-            safe_out = tuple(i for i in self.selected_indices if 0 <= i < avail)
-            if not safe_out:
-                safe_out = tuple(range(avail))
-            try:
-                self.model.out_indices = safe_out
-            except Exception:
-                pass
-
+        # Call timm model and select requested feature maps from returned list.
         features = self.model(x)
         # Select only the requested feature maps
         selected = [features[i] for i in self.selected_indices]
