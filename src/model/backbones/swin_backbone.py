@@ -183,17 +183,33 @@ class SwinBackbone(nn.Module):
             _LOG.warning("Swin model assertion during forward: %s", msg)
             default_cfg = getattr(self.model, "default_cfg", None) or getattr(self.model, "default_cfg", {})
             input_size = default_cfg.get("input_size") if isinstance(default_cfg, dict) else None
-            if input_size:
-                try:
-                    exp_h, exp_w = input_size[1], input_size[2]
+            # Prefer padding (preserve localization) over downscaling to the model's
+            # default input size. Pad to the next multiple of the patch size so
+            # attention masks and grid sizes are consistent, then retry.
+            try:
+                h_cur, w_cur = x.shape[-2], x.shape[-1]
+                ph, pw = self.patch_size
+                pad_h = ((h_cur + ph - 1) // ph) * ph - h_cur
+                pad_w = ((w_cur + pw - 1) // pw) * pw - w_cur
+                if pad_h or pad_w:
                     _LOG.warning(
-                        "Resizing input from (%d,%d) to model default (%d,%d) to recover from assertion",
-                        x.shape[-2], x.shape[-1], exp_h, exp_w,
+                        "Padding input from (%d,%d) by (h=%d,w=%d) to match patch multiple and preserve resolution",
+                        h_cur,
+                        w_cur,
+                        pad_h,
+                        pad_w,
                     )
-                    x_resized = NN_F.interpolate(x, size=(exp_h, exp_w), mode="bilinear", align_corners=False)
-                    features = self.model(x_resized)
-                except Exception:
+                    x_padded = NN_F.pad(x, (0, pad_w, 0, pad_h), value=0)
+                else:
+                    # Already a multiple and still failing; re-raise to allow caller to decide.
                     raise
+                # Ensure spatial metadata and attention masks match the padded input
+                self._propagate_spatial_metadata(x_padded.shape[-2], x_padded.shape[-1])
+                features = self.model(x_padded)
+            except AssertionError:
+                # If padding didn't help (e.g., model insists on a specific size),
+                # re-raise the original assertion to surface a clear error.
+                raise
             else:
                 raise
         # Select only the requested feature maps
