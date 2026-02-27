@@ -7,13 +7,6 @@ from pathlib import Path
 from typing import Tuple
 
 from src.data.dataloaders import AugmentationConfig, load_manifest
-from src.model.backbones.efficientnet_backbone import EfficientNetBackboneConfig
-from src.model.backbones.residual_noise_branch import ResidualNoiseConfig
-from src.model.backbones.swin_backbone import SwinBackboneConfig
-from src.model.feature_fusion import FeatureFusionConfig
-from src.model.hybrid_ngiml import HybridNGIMLConfig, HybridNGIMLOptimizerConfig, OptimizerGroupConfig
-from src.model.losses import MultiStageLossConfig
-from src.model.unet_decoder import UNetDecoderConfig
 
 
 def _norm(value: str) -> str:
@@ -218,6 +211,15 @@ def find_or_resolve_manifest(data_root: Path, manifest_names: Tuple[str, ...] = 
 
 
 def build_default_components():
+    # Import model config classes lazily to avoid importing heavy ML libraries at module import time
+    from src.model.backbones.efficientnet_backbone import EfficientNetBackboneConfig
+    from src.model.backbones.residual_noise_branch import ResidualNoiseConfig
+    from src.model.backbones.swin_backbone import SwinBackboneConfig
+    from src.model.feature_fusion import FeatureFusionConfig
+    from src.model.hybrid_ngiml import HybridNGIMLConfig, HybridNGIMLOptimizerConfig, OptimizerGroupConfig
+    from src.model.losses import MultiStageLossConfig
+    from src.model.unet_decoder import UNetDecoderConfig
+
     model_cfg = HybridNGIMLConfig(
         efficientnet=EfficientNetBackboneConfig(pretrained=True),
         swin=SwinBackboneConfig(model_name="swin_tiny_patch4_window7_224", pretrained=True),
