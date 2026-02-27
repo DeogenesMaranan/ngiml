@@ -201,17 +201,15 @@ class SwinBackbone(nn.Module):
                     )
                     x_padded = NN_F.pad(x, (0, pad_w, 0, pad_h), value=0)
                 else:
-                    # Already a multiple and still failing; re-raise to allow caller to decide.
-                    raise
+                    # Already a multiple and still failing; re-raise the original assertion.
+                    raise err
                 # Ensure spatial metadata and attention masks match the padded input
                 self._propagate_spatial_metadata(x_padded.shape[-2], x_padded.shape[-1])
                 features = self.model(x_padded)
             except AssertionError:
                 # If padding didn't help (e.g., model insists on a specific size),
                 # re-raise the original assertion to surface a clear error.
-                raise
-            else:
-                raise
+                raise err
         # Select only the requested feature maps
         selected = [features[i] for i in self.selected_indices]
         return self._ensure_channels_first(selected)
