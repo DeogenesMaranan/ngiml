@@ -55,21 +55,111 @@ def load_default_threshold(checkpoint_path: Path, fallback: float = 0.5) -> floa
     return float(fallback)
 
 
+def _infer_fusion_channels_from_state_dict(model_state: dict) -> tuple[int, ...] | None:
+    stage_channels: dict[int, int] = {}
+    pattern = re.compile(r"^fusion\.stages\.(\d+)\.projections\.[^.]+\.weight$")
+    for key, tensor in model_state.items():
+        match = pattern.match(key)
+        if not match or not isinstance(tensor, torch.Tensor):
+            continue
+        stage_idx = int(match.group(1))
+        out_channels = int(tensor.shape[0])
+        stage_channels[stage_idx] = out_channels
+
+    if not stage_channels:
+        return None
+
+    ordered = [stage_channels[idx] for idx in sorted(stage_channels)]
+    return tuple(int(value) for value in ordered)
+
+
+def _build_model_config_from_checkpoint(checkpoint: dict) -> tuple[object, str]:
+    model_cfg, _, _, _ = build_default_components()
+
+    train_config = checkpoint.get("train_config") if isinstance(checkpoint, dict) else None
+    model_config = train_config.get("model_config") if isinstance(train_config, dict) else None
+
+    if isinstance(model_config, dict):
+        fusion_cfg = model_config.get("fusion")
+        if isinstance(fusion_cfg, dict):
+            fusion_channels = fusion_cfg.get("fusion_channels")
+            if isinstance(fusion_channels, (list, tuple)) and fusion_channels:
+                model_cfg.fusion.fusion_channels = tuple(int(value) for value in fusion_channels)
+            for attr in ("noise_branch", "noise_skip_stage", "noise_decay", "norm", "activation", "fusion_refinement"):
+                if attr in fusion_cfg and hasattr(model_cfg.fusion, attr):
+                    setattr(model_cfg.fusion, attr, fusion_cfg[attr])
+
+        decoder_cfg = model_config.get("decoder")
+        if isinstance(decoder_cfg, dict):
+            for attr in (
+                "decoder_channels",
+                "out_channels",
+                "norm",
+                "activation",
+                "per_stage_heads",
+                "enable_edge_guidance",
+                "use_dropout",
+                "dropout_p",
+            ):
+                if attr in decoder_cfg and hasattr(model_cfg.decoder, attr):
+                    setattr(model_cfg.decoder, attr, decoder_cfg[attr])
+
+        for attr in (
+            "use_low_level",
+            "use_context",
+            "use_residual",
+            "enable_residual_attention",
+            "gradient_checkpointing",
+            "flash_attention",
+            "xformers",
+        ):
+            if attr in model_config and hasattr(model_cfg, attr):
+                setattr(model_cfg, attr, model_config[attr])
+
+        return model_cfg, "train_config.model_config"
+
+    inferred_channels = _infer_fusion_channels_from_state_dict(checkpoint.get("model_state", {}))
+    if inferred_channels:
+        model_cfg.fusion.fusion_channels = inferred_channels
+        return model_cfg, "state_dict.inferred_fusion_channels"
+
+    return model_cfg, "defaults"
+
+
+def _load_state_dict_with_fallback(model: HybridNGIML, model_state: dict) -> tuple[list[str], list[str], int]:
+    try:
+        missing, unexpected = model.load_state_dict(model_state, strict=False)
+        return list(missing), list(unexpected), 0
+    except RuntimeError:
+        current_state = model.state_dict()
+        compatible_state = {
+            key: value
+            for key, value in model_state.items()
+            if key in current_state and hasattr(value, "shape") and current_state[key].shape == value.shape
+        }
+        skipped = int(len(model_state) - len(compatible_state))
+        missing, unexpected = model.load_state_dict(compatible_state, strict=False)
+        return list(missing), list(unexpected), skipped
+
+
 def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | None = None) -> tuple[HybridNGIML, torch.device, dict]:
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model_cfg, _, _, _ = build_default_components()
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model_cfg, config_source = _build_model_config_from_checkpoint(checkpoint)
     model = HybridNGIML(model_cfg).to(device)
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    missing, unexpected = model.load_state_dict(checkpoint["model_state"], strict=False)
+    missing, unexpected, skipped_mismatched = _load_state_dict_with_fallback(model, checkpoint["model_state"])
     model.eval()
 
     info = {
         "epoch": int(checkpoint.get("epoch", -1)),
         "missing_keys": len(missing),
         "unexpected_keys": len(unexpected),
+        "skipped_mismatched_keys": int(skipped_mismatched),
+        "config_source": str(config_source),
+        "fusion_channels": tuple(int(value) for value in model.cfg.fusion.fusion_channels),
         "default_threshold": float(load_default_threshold(Path(checkpoint_path), fallback=0.5)),
     }
     setattr(model, "default_threshold", float(info["default_threshold"]))
