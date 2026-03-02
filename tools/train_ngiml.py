@@ -82,7 +82,13 @@ class _PrefetchLoader:
             return next(self._iter)
         if self._next_batch is None:
             raise StopIteration
+        # Wait only for the currently prefetched batch, then launch prefetch
+        # for the subsequent one to overlap transfer with compute.
+        torch.cuda.current_stream().wait_stream(self._stream)
         batch = self._next_batch
+        for value in batch.values():
+            if isinstance(value, torch.Tensor):
+                value.record_stream(torch.cuda.current_stream())
         self._preload()
         return batch
 
@@ -101,8 +107,6 @@ class _PrefetchLoader:
                         nxt[k] = v.to(self._device, non_blocking=True)
                     except Exception:
                         nxt[k] = v.to(self._device)
-        # Ensure the current stream waits for the prefetch stream before using batch
-        torch.cuda.current_stream().wait_stream(self._stream)
         self._next_batch = nxt
 
     def __len__(self):
@@ -1210,11 +1214,16 @@ def train_one_epoch(
     optimizer.zero_grad(set_to_none=True)
     for step, batch in enumerate(progress):
         batch_start = time.perf_counter()
-        images = batch["images"].to(device, non_blocking=True)
-        masks = batch["masks"].to(device, non_blocking=True)
+        images = batch["images"]
+        masks = batch["masks"]
+        if images.device != device:
+            images = images.to(device, non_blocking=True)
+        if masks.device != device:
+            masks = masks.to(device, non_blocking=True)
         high_pass = batch.get("high_pass")
         if isinstance(high_pass, torch.Tensor):
-            high_pass = high_pass.to(device, non_blocking=True)
+            if high_pass.device != device:
+                high_pass = high_pass.to(device, non_blocking=True)
         else:
             high_pass = None
         # Apply GPU-side augmentations and normalization when requested.
@@ -1250,7 +1259,6 @@ def train_one_epoch(
                 gen = gen if 'gen' in locals() else gen
                 for ds_name, idxs in idxs_by_ds.items():
                     aug_cfg = per_dataset_aug.get(ds_name, None)
-                    idx_tensor = torch.tensor(idxs, dtype=torch.long, device=images.device)
                     if aug_cfg is None or not getattr(aug_cfg, "enable", False):
                         # Apply normalization on-device in batch
                         if normalization_mode == "imagenet":
@@ -1338,38 +1346,6 @@ def train_one_epoch(
 
             hard_loss = (hard_weights * bce_per_sample).mean()
             loss = loss + float(max(0.0, cfg.hard_mining_weight)) * hard_loss
-        else:
-            preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
-            loss = loss_fn(preds, masks)
-
-            if cfg.hard_mining_enabled and epoch >= int(max(0, cfg.hard_mining_start_epoch)):
-                final_logits = preds[-1]
-                if final_logits.shape[-2:] != masks.shape[-2:]:
-                    final_logits = torch.nn.functional.interpolate(
-                        final_logits,
-                        size=masks.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-
-                bce_per_sample = torch.nn.functional.binary_cross_entropy_with_logits(
-                    final_logits,
-                    masks,
-                    reduction="none",
-                ).mean(dim=(1, 2, 3))
-
-                with torch.no_grad():
-                    pred_bin = (torch.sigmoid(final_logits) >= 0.5).float()
-                    tp = (pred_bin * masks).sum(dim=(1, 2, 3))
-                    fp = (pred_bin * (1.0 - masks)).sum(dim=(1, 2, 3))
-                    fn = ((1.0 - pred_bin) * masks).sum(dim=(1, 2, 3))
-                    iou = (tp + 1e-6) / (tp + fp + fn + 1e-6)
-                    difficulty = (1.0 - iou).clamp(0.0, 1.0)
-                    hard_weights = 1.0 + float(max(0.0, cfg.hard_mining_gamma)) * difficulty
-                    hard_weights = hard_weights / hard_weights.mean().clamp_min(1e-6)
-
-                hard_loss = (hard_weights * bce_per_sample).mean()
-                loss = loss + float(max(0.0, cfg.hard_mining_weight)) * hard_loss
 
         scaled_loss = loss / accum_steps
         backward_start = time.perf_counter()
