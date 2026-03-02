@@ -323,7 +323,7 @@ def build_training_config(
     return {
         "manifest": str(manifest_path),
         "output_dir": output_dir,
-        "batch_size": 12,
+        "batch_size": 20,
         "grad_accum_steps": 1,
         "epochs": 50,
         "num_workers": 0,
@@ -341,6 +341,7 @@ def build_training_config(
         "max_rotation_degrees": 5.0,
         "noise_std_max": 0.012,
         "disable_aug": False,
+        "max_short_side": 480,
         "device": "cuda",
         "aug_seed": 42,
         "seed": 42,
@@ -413,10 +414,10 @@ def apply_colab_runtime_settings(
     if tune_for_large_batch:
         training_config.update(
             {
-                "batch_size": int(training_config.get("batch_size", 12)),
+                "batch_size": int(max(20, int(training_config.get("batch_size", 20)))),
                 "num_workers": recommended_workers,
                 "persistent_workers": False,
-                "prefetch_factor": 1,
+                "prefetch_factor": 2,
                 "pin_memory": True,
                 "auto_local_cache": True,
                 "local_cache_dir": cache_dir,
@@ -426,7 +427,7 @@ def apply_colab_runtime_settings(
                 "channels_last": True,
                 "use_tf32": True,
                 "precision": "bf16",
-                "max_short_side": int(min(448, int(training_config.get("max_short_side", 448)))),
+                "max_short_side": int(max(480, int(training_config.get("max_short_side", 480)))),
                 "foreground_ratio_max_batches": int(training_config.get("foreground_ratio_max_batches", 20)),
                 "short_side_probe_samples": int(training_config.get("short_side_probe_samples", 0)),
                 "balance_sampling": bool(balance_sampling),
@@ -449,6 +450,7 @@ def apply_colab_runtime_settings(
                 "balance_sampling": bool(balance_sampling),
             }
         )
+        _apply_effective_batch_optimizer_scaling(training_config, base_effective_batch=12)
 
     return training_config
 
@@ -474,6 +476,23 @@ def apply_high_throughput_settings(training_config: dict, target_batch_size: int
             "precision": "bf16",
         }
     )
+
+    model_cfg = training_config.get("model_config")
+    if model_cfg is not None and hasattr(model_cfg, "optimizer"):
+        optimizer_cfg = model_cfg.optimizer
+        batch_size = int(training_config.get("batch_size", 12))
+        grad_accum_steps = int(training_config.get("grad_accum_steps", 1))
+        effective_batch = max(1, batch_size * grad_accum_steps)
+        ratio = float(effective_batch) / float(12)
+        lr_scale = float(min(max(math.sqrt(ratio), 0.75), 1.8))
+        wd_scale = float(min(max(pow(ratio, 0.25), 0.9), 1.35))
+        for group_name in ("efficientnet", "swin", "residual", "fusion", "decoder"):
+            group = getattr(optimizer_cfg, group_name, None)
+            if group is None:
+                continue
+            group.lr = float(group.lr) * lr_scale
+            group.weight_decay = float(group.weight_decay) * wd_scale
+
     return training_config
 
 
