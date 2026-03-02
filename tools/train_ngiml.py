@@ -1638,8 +1638,8 @@ def run_training(cfg: TrainConfig) -> None:
         loss_cfg = replace(loss_cfg, pos_weight=pos_weight)
         print(f"Auto pos_weight from foreground ratio: {pos_weight:.4f}")
     else:
-        # Auto pos weight disabled -> use fixed pos_weight=1.0
-        loss_cfg = replace(loss_cfg, pos_weight=1.0)
+        fixed_pos_weight = float(getattr(loss_cfg, "pos_weight", 1.0))
+        print(f"Using fixed pos_weight from loss config: {fixed_pos_weight:.4f}")
     loss_fn = MultiStageManipulationLoss(loss_cfg)
     t_after_model = time.time()
 

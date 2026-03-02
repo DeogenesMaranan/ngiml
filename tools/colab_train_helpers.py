@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 from pathlib import Path
@@ -235,7 +236,7 @@ def build_default_components():
     loss_cfg = MultiStageLossConfig(
         dice_weight=1.0,
         bce_weight=1.0,
-        pos_weight=2.0,
+        pos_weight=1.0,
         stage_weights=None,
         smooth=1e-6,
     )
@@ -295,6 +296,16 @@ def build_training_config(
     default_aug: AugmentationConfig,
     per_dataset_aug: dict[str, AugmentationConfig],
 ) -> dict:
+    effective_hybrid_mode = str(getattr(loss_cfg, "hybrid_mode", "dice_bce"))
+    effective_dice_weight = float(getattr(loss_cfg, "dice_weight", 1.0))
+    effective_bce_weight = float(getattr(loss_cfg, "bce_weight", 1.0))
+    effective_focal_gamma = float(getattr(loss_cfg, "focal_gamma", 2.0))
+    effective_focal_alpha = float(getattr(loss_cfg, "focal_alpha", 0.25))
+    effective_tversky_weight = float(getattr(loss_cfg, "tversky_weight", 0.0))
+    effective_tversky_alpha = float(getattr(loss_cfg, "tversky_alpha", 0.3))
+    effective_tversky_beta = float(getattr(loss_cfg, "tversky_beta", 0.7))
+    effective_lovasz_weight = float(getattr(loss_cfg, "lovasz_weight", 0.0))
+
     return {
         "manifest": str(manifest_path),
         "output_dir": output_dir,
@@ -327,6 +338,15 @@ def build_training_config(
         "auto_pos_weight": False,
         "pos_weight_min": 0.5,
         "pos_weight_max": 8.0,
+        "loss_hybrid_mode": effective_hybrid_mode,
+        "dice_weight": effective_dice_weight,
+        "bce_weight": effective_bce_weight,
+        "focal_gamma": effective_focal_gamma,
+        "focal_alpha": effective_focal_alpha,
+        "tversky_weight": effective_tversky_weight,
+        "tversky_alpha": effective_tversky_alpha,
+        "tversky_beta": effective_tversky_beta,
+        "lovasz_weight": effective_lovasz_weight,
         "ema_enabled": True,
         "ema_decay": 0.999,
         "hard_mining_enabled": True,
@@ -346,23 +366,66 @@ def apply_colab_runtime_settings(
     local_cache_dir: str | None = None,
     tune_for_large_batch: bool = False,
 ) -> dict:
-    recommended_workers = max(2, min(8, (os.cpu_count() or 4) // 2))
+    def _apply_effective_batch_optimizer_scaling(config: dict, base_effective_batch: int = 12) -> None:
+        model_cfg = config.get("model_config")
+        if model_cfg is None or not hasattr(model_cfg, "optimizer"):
+            return
+
+        optimizer_cfg = model_cfg.optimizer
+        batch_size = int(config.get("batch_size", 12))
+        grad_accum_steps = int(config.get("grad_accum_steps", 1))
+        effective_batch = max(1, batch_size * grad_accum_steps)
+
+        ratio = float(effective_batch) / float(max(1, base_effective_batch))
+        lr_scale = float(min(max(math.sqrt(ratio), 0.75), 1.8))
+        wd_scale = float(min(max(pow(ratio, 0.25), 0.9), 1.35))
+
+        for group_name in ("efficientnet", "swin", "residual", "fusion", "decoder"):
+            group = getattr(optimizer_cfg, group_name, None)
+            if group is None:
+                continue
+            group.lr = float(group.lr) * lr_scale
+            group.weight_decay = float(group.weight_decay) * wd_scale
+
+    recommended_workers = max(4, min(12, (os.cpu_count() or 4)))
     cache_dir = local_cache_dir or "/content/cache"
-    training_config.update(
-        {
-            "num_workers": recommended_workers,
-            "persistent_workers": False,
-            "pin_memory": True,
-            "auto_local_cache": True,
-            "local_cache_dir": cache_dir,
-            "reuse_local_cache_manifest": True,
-            "compile_model": True,
-            "compile_mode": "default",
-            "channels_last": True,
-            "use_tf32": True,
-            "balance_sampling": bool(balance_sampling),
-        }
-    )
+    if tune_for_large_batch:
+        training_config.update(
+            {
+                "batch_size": int(training_config.get("batch_size", 12) if int(training_config.get("batch_size", 12)) > 12 else 20),
+                "num_workers": recommended_workers,
+                "persistent_workers": True,
+                "prefetch_factor": 4,
+                "pin_memory": True,
+                "auto_local_cache": True,
+                "local_cache_dir": cache_dir,
+                "reuse_local_cache_manifest": True,
+                "compile_model": True,
+                "compile_mode": "default",
+                "channels_last": True,
+                "use_tf32": True,
+                "precision": "bf16",
+                "max_short_side": int(max(768, int(training_config.get("max_short_side", 640)))),
+                "balance_sampling": bool(balance_sampling),
+            }
+        )
+        _apply_effective_batch_optimizer_scaling(training_config, base_effective_batch=12)
+    else:
+        training_config.update(
+            {
+                "num_workers": recommended_workers,
+                "persistent_workers": False,
+                "pin_memory": True,
+                "auto_local_cache": True,
+                "local_cache_dir": cache_dir,
+                "reuse_local_cache_manifest": True,
+                "compile_model": True,
+                "compile_mode": "default",
+                "channels_last": True,
+                "use_tf32": True,
+                "balance_sampling": bool(balance_sampling),
+            }
+        )
 
     return training_config
 
