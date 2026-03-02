@@ -189,9 +189,9 @@ class TrainConfig:
     views_per_sample: int = 1
     # Cap the short side of input images early in the dataloader to avoid
     # excessive spatial sizes that can trigger timm/Swin assertions or OOMs.
-    max_short_side: int = 640
-    max_rotation_degrees: float = 5.0
-    noise_std_max: float = 0.02
+    max_short_side: int = 384
+    max_rotation_degrees: float = 0.0
+    noise_std_max: float = 0.01
     disable_aug: bool = False
     device: Optional[str] = None
     aug_seed: Optional[int] = None
@@ -358,8 +358,9 @@ def parse_args() -> TrainConfig:
         help="Reuse existing local cached manifest when available to shorten startup",
     )
     parser.add_argument("--views-per-sample", type=int, default=None, help="Number of augmented views per sample (on-the-fly)")
-    parser.add_argument("--max-rotation-degrees", type=float, default=5.0, help="Random rotation range (+/-)")
-    parser.add_argument("--noise-std-max", type=float, default=0.02, help="Max Gaussian noise std")
+    parser.add_argument("--max-short-side", type=int, default=384, help="Cap image short side before batching (lower is faster)")
+    parser.add_argument("--max-rotation-degrees", type=float, default=0.0, help="Random rotation range (+/-)")
+    parser.add_argument("--noise-std-max", type=float, default=0.01, help="Max Gaussian noise std")
     parser.add_argument("--disable-aug", action="store_true", help="Disable GPU augmentations")
     parser.add_argument("--device", type=str, default=None, help="Override device (e.g., cuda:0 or cpu)")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducibility")
@@ -442,6 +443,7 @@ def parse_args() -> TrainConfig:
         local_cache_dir=args.local_cache_dir,
         reuse_local_cache_manifest=args.reuse_local_cache_manifest,
         views_per_sample=args.views_per_sample,
+        max_short_side=max(64, int(args.max_short_side)),
         max_rotation_degrees=args.max_rotation_degrees,
         noise_std_max=args.noise_std_max,
         disable_aug=args.disable_aug,
@@ -520,11 +522,11 @@ def _build_aug_map(names: Sequence[str], cfg: TrainConfig) -> Dict[str, Augmenta
         enable_flips=True,
         enable_rotations=cfg.max_rotation_degrees > 0,
         max_rotation_degrees=cfg.max_rotation_degrees,
-        enable_random_crop=True,
+        enable_random_crop=False,
         object_crop_bias_prob=0.7,
         min_fg_pixels_for_object_crop=16,
-        enable_elastic=True,
-        elastic_prob=0.3,
+        enable_elastic=False,
+        elastic_prob=0.0,
         elastic_alpha=8.0,
         elastic_sigma=5.0,
         enable_color_jitter=True,
