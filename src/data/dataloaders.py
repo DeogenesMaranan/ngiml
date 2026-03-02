@@ -845,8 +845,19 @@ class SizeBucketingBatchSampler:
                 yield remaining
 
     def __len__(self):
-        # best-effort length is unknown because bucketing depends on runtime
-        return NotImplemented
+        # Best-effort batch count from the base sampler cardinality.
+        # Exact count can vary slightly with per-bucket leftovers, but this
+        # provides the correct order of magnitude for progress reporting.
+        try:
+            base_count = int(len(self.base_sampler))
+        except Exception:
+            raise TypeError("base_sampler has no valid __len__ for batch count estimation")
+
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        if self.drop_last:
+            return base_count // self.batch_size
+        return (base_count + self.batch_size - 1) // self.batch_size
 
 
 def _collate_impl(

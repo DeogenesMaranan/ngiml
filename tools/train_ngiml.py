@@ -702,7 +702,9 @@ def _select_threshold_with_precision_guard(
     scored_thresholds: Sequence[tuple[float, dict]],
     optimize_key: str,
     min_precision: float = 0.1,
+    min_recall: float = 0.05,
     metric_tolerance: float = 0.98,
+    cold_start_metric_floor: float = 1e-4,
 ) -> tuple[float, dict]:
     if not scored_thresholds:
         raise ValueError("No scored thresholds provided")
@@ -711,10 +713,20 @@ def _select_threshold_with_precision_guard(
     baseline_threshold, baseline_metrics = max(scored_thresholds, key=lambda item: item[1][metric_key])
     baseline_metric = float(baseline_metrics[metric_key])
 
+    # During cold start when the target metric is essentially zero, avoid
+    # precision-driven extreme thresholds (e.g., all-background at 0.9).
+    # Prefer the threshold nearest to 0.5 to keep gradients/metrics informative.
+    if baseline_metric <= float(cold_start_metric_floor):
+        neutral_threshold, neutral_metrics = min(scored_thresholds, key=lambda item: abs(float(item[0]) - 0.5))
+        return float(neutral_threshold), neutral_metrics
+
     eligible = [
         (threshold, metrics)
         for threshold, metrics in scored_thresholds
-        if float(metrics.get("precision", 0.0)) >= float(min_precision)
+        if (
+            float(metrics.get("precision", 0.0)) >= float(min_precision)
+            and float(metrics.get("recall", 0.0)) >= float(min_recall)
+        )
     ]
     if not eligible:
         return float(baseline_threshold), baseline_metrics
@@ -729,7 +741,7 @@ def _select_threshold_with_precision_guard(
 
     selected_threshold, selected_metrics = max(
         candidate_pool,
-        key=lambda item: (float(item[1].get("precision", 0.0)), float(item[1][metric_key])),
+        key=lambda item: (float(item[1][metric_key]), float(item[1].get("precision", 0.0))),
     )
     return float(selected_threshold), selected_metrics
 
@@ -838,6 +850,15 @@ def _metric_for_monitor(metrics: dict, monitor: str) -> float:
     if key not in metrics:
         raise KeyError(f"Unsupported monitor metric: {monitor}")
     return float(metrics[key])
+
+
+def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
+    for module_name in ("efficientnet", "swin"):
+        module = getattr(model, module_name, None)
+        if module is None:
+            continue
+        for param in module.parameters():
+            param.requires_grad = bool(trainable)
 
 
 def _sample_has_mask_high_pass(record) -> tuple[bool, bool]:
@@ -1141,14 +1162,49 @@ def train_one_epoch(
     if device.type == "cuda":
         loader = _PrefetchLoader(loader, device)
 
-    # Try to determine a sensible total for tqdm so it can show progress as "N/M".
-    try:
-        total = len(loader)
-    except Exception:
+    # Determine a batch-level total for tqdm. Avoid falling back to dataset
+    # sample count, which can massively overstate steps when using custom
+    # samplers/batch samplers.
+    def _safe_len(obj) -> Optional[int]:
+        if obj is None:
+            return None
         try:
-            total = len(getattr(loader, "dataset", []))
+            value = len(obj)
         except Exception:
-            total = None
+            return None
+        try:
+            value_int = int(value)
+        except Exception:
+            return None
+        return value_int if value_int >= 0 else None
+
+    total: Optional[int] = None
+    base_loader = getattr(loader, "_loader", loader)
+
+    total = _safe_len(loader)
+    if total is None:
+        total = _safe_len(base_loader)
+
+    if total is None:
+        batch_sampler = getattr(base_loader, "batch_sampler", None)
+        total = _safe_len(batch_sampler)
+        if total is None and batch_sampler is not None:
+            base_sampler = getattr(batch_sampler, "base_sampler", None)
+            batch_size = int(getattr(batch_sampler, "batch_size", 0) or 0)
+            if base_sampler is not None and batch_size > 0:
+                sample_count = _safe_len(base_sampler)
+                if sample_count is not None:
+                    drop_last = bool(getattr(batch_sampler, "drop_last", False))
+                    total = (sample_count // batch_size) if drop_last else ((sample_count + batch_size - 1) // batch_size)
+
+    if total is None:
+        sampler = getattr(base_loader, "sampler", None)
+        batch_size = int(getattr(base_loader, "batch_size", 0) or 0)
+        if sampler is not None and batch_size > 0:
+            sample_count = _safe_len(sampler)
+            if sample_count is not None:
+                drop_last = bool(getattr(base_loader, "drop_last", False))
+                total = (sample_count // batch_size) if drop_last else ((sample_count + batch_size - 1) // batch_size)
 
     progress = tqdm(loader, desc=f"Epoch {epoch:03d}", leave=False, dynamic_ncols=True, total=total)
     optimizer.zero_grad(set_to_none=True)
@@ -1715,7 +1771,22 @@ def run_training(cfg: TrainConfig) -> None:
     early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
     best_threshold_path = checkpoint_dir / "best_threshold.json"
 
+    freeze_backbone_epochs = int(max(0, getattr(model_cfg.optimizer, "freeze_backbone_epochs", 0)))
+    backbone_was_frozen = False
+
     for epoch in range(start_epoch, cfg.epochs):
+        should_freeze_backbone = epoch < freeze_backbone_epochs
+        _set_backbone_trainable(model, trainable=not should_freeze_backbone)
+        if should_freeze_backbone and not backbone_was_frozen:
+            print(
+                "Backbone freeze enabled: freezing EfficientNet/Swin "
+                f"for first {freeze_backbone_epochs} epochs"
+            )
+            backbone_was_frozen = True
+        elif (not should_freeze_backbone) and backbone_was_frozen:
+            print("Backbone freeze finished: unfreezing EfficientNet/Swin")
+            backbone_was_frozen = False
+
         start_time = time.time()
         train_loss, global_step, train_positive_ratio = train_one_epoch(
             model,
