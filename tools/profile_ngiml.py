@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence, Tuple
@@ -105,11 +106,57 @@ def profile_params(model: torch.nn.Module) -> int:
 def profile_flops(model: torch.nn.Module, sample: torch.Tensor) -> Tuple[float, str]:
     if FlopCountAnalysis is None:
         raise RuntimeError("fvcore is required for FLOP analysis. Install with pip install fvcore")
+
+    from fvcore.nn.jit_handles import elementwise_flop_counter, generic_activation_jit
+
+    def zero_flop_jit(_inputs, _outputs) -> Counter[str]:
+        return Counter()
+
+    elementwise = elementwise_flop_counter(1, 0)
     model.eval()
     with torch.no_grad():
-        flops = FlopCountAnalysis(model, sample)
+        flops = FlopCountAnalysis(model, sample).unsupported_ops_warnings(False)
+        flops = flops.set_op_handle(
+            "aten::add",
+            elementwise,
+            "aten::sub",
+            elementwise,
+            "aten::rsub",
+            elementwise,
+            "aten::mul",
+            elementwise,
+            "aten::div",
+            elementwise,
+            "aten::mean",
+            elementwise,
+            "aten::ne",
+            elementwise,
+            "aten::sigmoid",
+            generic_activation_jit("sigmoid"),
+            "aten::gelu",
+            generic_activation_jit("gelu"),
+            "aten::silu_",
+            generic_activation_jit("silu"),
+            "aten::softmax",
+            generic_activation_jit("softmax"),
+            "aten::pad",
+            zero_flop_jit,
+            "aten::fill_",
+            zero_flop_jit,
+            "aten::repeat",
+            zero_flop_jit,
+            "aten::expand_as",
+            zero_flop_jit,
+            "aten::feature_dropout",
+            zero_flop_jit,
+        )
         total_flops = flops.total()
-        return total_flops, flops.__str__()
+        unsupported = {str(name): int(count) for name, count in flops.unsupported_ops().items()}
+        detail = flops.__str__()
+        if unsupported:
+            detail += "\n\nUnsupported operators after custom handles:\n"
+            detail += json.dumps(unsupported, indent=2)
+        return total_flops, detail
 
 
 def print_config_summary(model: HybridNGIML) -> None:

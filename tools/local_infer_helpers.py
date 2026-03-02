@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Sequence
 
@@ -12,6 +13,53 @@ from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
 from tools.colab_train_helpers import build_default_components
 from tools.local_train_helpers import build_manifest_from_prepared
+
+
+def _zero_flop_jit(_inputs, _outputs) -> Counter[str]:
+    return Counter()
+
+
+def _build_flop_analysis(model: torch.nn.Module, sample: torch.Tensor):
+    from fvcore.nn import FlopCountAnalysis
+    from fvcore.nn.jit_handles import elementwise_flop_counter, generic_activation_jit
+
+    elementwise = elementwise_flop_counter(1, 0)
+    analysis = FlopCountAnalysis(model, sample).unsupported_ops_warnings(False)
+    analysis = analysis.set_op_handle(
+        "aten::add",
+        elementwise,
+        "aten::sub",
+        elementwise,
+        "aten::rsub",
+        elementwise,
+        "aten::mul",
+        elementwise,
+        "aten::div",
+        elementwise,
+        "aten::mean",
+        elementwise,
+        "aten::ne",
+        elementwise,
+        "aten::sigmoid",
+        generic_activation_jit("sigmoid"),
+        "aten::gelu",
+        generic_activation_jit("gelu"),
+        "aten::silu_",
+        generic_activation_jit("silu"),
+        "aten::softmax",
+        generic_activation_jit("softmax"),
+        "aten::pad",
+        _zero_flop_jit,
+        "aten::fill_",
+        _zero_flop_jit,
+        "aten::repeat",
+        _zero_flop_jit,
+        "aten::expand_as",
+        _zero_flop_jit,
+        "aten::feature_dropout",
+        _zero_flop_jit,
+    )
+    return analysis
 
 
 def find_latest_checkpoint(runs_root: Path) -> Path:
@@ -278,14 +326,19 @@ def get_model_complexity_stats(
     model.eval()
     try:
         try:
-            from fvcore.nn import FlopCountAnalysis
-
             with torch.no_grad():
-                analysis = FlopCountAnalysis(model, sample)
+                analysis = _build_flop_analysis(model, sample)
                 total_flops = float(analysis.total())
+                unsupported_ops = {str(name): int(count) for name, count in analysis.unsupported_ops().items()}
             stats["flops"] = total_flops
             stats["macs"] = total_flops / 2.0
-            stats["flops_error"] = None
+            stats["unsupported_ops"] = unsupported_ops
+            stats["flops_source"] = "fvcore+custom_op_handles"
+            stats["flops_error"] = (
+                None
+                if not unsupported_ops
+                else "FLOPs include custom op-handle estimates; unsupported ops remain in `unsupported_ops`."
+            )
         except Exception as fv_error:
             try:
                 from thop import profile as thop_profile
@@ -295,10 +348,14 @@ def get_model_complexity_stats(
                 macs = float(macs)
                 stats["macs"] = macs
                 stats["flops"] = macs * 2.0
+                stats["unsupported_ops"] = None
+                stats["flops_source"] = "thop"
                 stats["flops_error"] = f"fvcore unavailable ({fv_error}); used thop fallback"
             except Exception as thop_error:
                 stats["flops"] = None
                 stats["macs"] = None
+                stats["unsupported_ops"] = None
+                stats["flops_source"] = None
                 stats["flops_error"] = (
                     "FLOPs unavailable. "
                     f"fvcore error: {fv_error}. "
