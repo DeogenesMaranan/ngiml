@@ -5,9 +5,13 @@ import math
 import os
 import shutil
 from pathlib import Path
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 
 from src.data.dataloaders import AugmentationConfig, load_manifest
+
+if TYPE_CHECKING:
+    from src.model.hybrid_ngiml import HybridNGIMLConfig
+    from src.model.losses import MultiStageLossConfig
 
 
 def _norm(value: str) -> str:
@@ -258,9 +262,9 @@ def build_default_components():
         object_crop_bias_prob=0.75,
         min_fg_pixels_for_object_crop=8,
         multiscale_training=True,
-        multiscale_short_side_range=(512, 896),
-        enable_elastic=True,
-        elastic_prob=0.10,
+        multiscale_short_side_range=(384, 640),
+        enable_elastic=False,
+        elastic_prob=0.0,
         elastic_alpha=8.0,
         elastic_sigma=5.0,
         enable_color_jitter=True,
@@ -273,7 +277,7 @@ def build_default_components():
     per_dataset_aug = {
         "IMD2020": AugmentationConfig(
             enable=True,
-            views_per_sample=8,
+            views_per_sample=4,
             enable_flips=True,
             enable_rotations=True,
             max_rotation_degrees=8.0,
@@ -282,9 +286,9 @@ def build_default_components():
             object_crop_bias_prob=0.9,
             min_fg_pixels_for_object_crop=4,
             multiscale_training=True,
-            multiscale_short_side_range=(512, 896),
-            enable_elastic=True,
-            elastic_prob=0.2,
+            multiscale_short_side_range=(384, 640),
+            enable_elastic=False,
+            elastic_prob=0.0,
             elastic_alpha=10.0,
             elastic_sigma=5.0,
             enable_color_jitter=True,
@@ -335,7 +339,7 @@ def build_training_config(
         "drop_last": True,
         "views_per_sample": 1,
         "max_rotation_degrees": 5.0,
-        "noise_std_max": 0.02,
+        "noise_std_max": 0.012,
         "disable_aug": False,
         "device": "cuda",
         "aug_seed": 42,
@@ -350,6 +354,8 @@ def build_training_config(
         "threshold_end": 0.8,
         "threshold_step": 0.02,
         "compute_foreground_ratio": True,
+        "foreground_ratio_max_batches": 20,
+        "short_side_probe_samples": 0,
         "auto_pos_weight": False,
         "pos_weight_min": 0.5,
         "pos_weight_max": 8.0,
@@ -402,15 +408,15 @@ def apply_colab_runtime_settings(
             group.lr = float(group.lr) * lr_scale
             group.weight_decay = float(group.weight_decay) * wd_scale
 
-    recommended_workers = max(4, min(12, (os.cpu_count() or 4)))
+    recommended_workers = max(2, min(6, (os.cpu_count() or 4)))
     cache_dir = local_cache_dir or "/content/cache"
     if tune_for_large_batch:
         training_config.update(
             {
-                "batch_size": int(training_config.get("batch_size", 12) if int(training_config.get("batch_size", 12)) > 12 else 20),
+                "batch_size": int(training_config.get("batch_size", 12)),
                 "num_workers": recommended_workers,
-                "persistent_workers": True,
-                "prefetch_factor": 4,
+                "persistent_workers": False,
+                "prefetch_factor": 1,
                 "pin_memory": True,
                 "auto_local_cache": True,
                 "local_cache_dir": cache_dir,
@@ -420,7 +426,9 @@ def apply_colab_runtime_settings(
                 "channels_last": True,
                 "use_tf32": True,
                 "precision": "bf16",
-                "max_short_side": int(max(768, int(training_config.get("max_short_side", 640)))),
+                "max_short_side": int(min(448, int(training_config.get("max_short_side", 448)))),
+                "foreground_ratio_max_batches": int(training_config.get("foreground_ratio_max_batches", 20)),
+                "short_side_probe_samples": int(training_config.get("short_side_probe_samples", 0)),
                 "balance_sampling": bool(balance_sampling),
             }
         )
