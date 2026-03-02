@@ -215,6 +215,7 @@ class TrainConfig:
     tversky_weight: float = 0.2
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.7
+    lovasz_weight: float = 0.5
     ema_enabled: bool = True
     ema_decay: float = 0.999
     hard_mining_enabled: bool = True
@@ -242,11 +243,11 @@ class Checkpoint:
 
 
 def parse_args() -> TrainConfig:
-    parser.add_argument("--scheduler-type", type=str, default="cosine", choices=["cosine", "step"], help="LR scheduler type (cosine or step)")
     # Use a higher default worker count to better saturate fast GPUs (e.g. A100).
     # Keep a sensible floor to avoid tiny values on CI/low-core systems.
     default_workers = max(4, (os.cpu_count() or 4))
     parser = argparse.ArgumentParser(description="Train NGIML manipulation localization")
+    parser.add_argument("--scheduler-type", type=str, default="cosine", choices=["cosine", "step"], help="LR scheduler type (cosine or step)")
     parser.add_argument("--manifest", required=True, help="Path to prepared manifest JSON")
     parser.add_argument("--output-dir", default="runs/ngiml", help="Directory to write checkpoints/logs")
     parser.add_argument("--batch-size", type=int, default=8, help="Mini-batch size")
@@ -695,6 +696,42 @@ def _build_threshold_grid(cfg: TrainConfig) -> Sequence[float]:
         values.append(0.5)
     values = sorted(set(values))
     return values
+
+
+def _select_threshold_with_precision_guard(
+    scored_thresholds: Sequence[tuple[float, dict]],
+    optimize_key: str,
+    min_precision: float = 0.1,
+    metric_tolerance: float = 0.98,
+) -> tuple[float, dict]:
+    if not scored_thresholds:
+        raise ValueError("No scored thresholds provided")
+
+    metric_key = optimize_key if optimize_key in {"iou", "dice"} else "iou"
+    baseline_threshold, baseline_metrics = max(scored_thresholds, key=lambda item: item[1][metric_key])
+    baseline_metric = float(baseline_metrics[metric_key])
+
+    eligible = [
+        (threshold, metrics)
+        for threshold, metrics in scored_thresholds
+        if float(metrics.get("precision", 0.0)) >= float(min_precision)
+    ]
+    if not eligible:
+        return float(baseline_threshold), baseline_metrics
+
+    metric_floor = baseline_metric * float(metric_tolerance)
+    close = [
+        (threshold, metrics)
+        for threshold, metrics in eligible
+        if float(metrics[metric_key]) >= metric_floor
+    ]
+    candidate_pool = close if close else eligible
+
+    selected_threshold, selected_metrics = max(
+        candidate_pool,
+        key=lambda item: (float(item[1].get("precision", 0.0)), float(item[1][metric_key])),
+    )
+    return float(selected_threshold), selected_metrics
 
 
 def save_checkpoint(
@@ -1367,7 +1404,7 @@ def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: T
         metrics = _metrics_from_counts(stats["tp"], stats["tn"], stats["fp"], stats["fn"])
         scored_thresholds.append((float(threshold), metrics))
 
-    best_threshold, best_metrics = max(scored_thresholds, key=lambda item: item[1][optimize_key])
+    best_threshold, best_metrics = _select_threshold_with_precision_guard(scored_thresholds, optimize_key=optimize_key)
     return {
         "threshold": float(best_threshold),
         "threshold_metric": optimize_key,
@@ -1477,7 +1514,7 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         scored_thresholds.append((float(threshold), metrics))
 
     if cfg.optimize_threshold:
-        best_threshold, best_metrics = max(scored_thresholds, key=lambda item: item[1][optimize_key])
+        best_threshold, best_metrics = _select_threshold_with_precision_guard(scored_thresholds, optimize_key=optimize_key)
     else:
         fixed_threshold = float(cfg.metric_threshold)
         nearest_threshold, best_metrics = min(scored_thresholds, key=lambda item: abs(item[0] - fixed_threshold))
@@ -1590,6 +1627,14 @@ def run_training(cfg: TrainConfig) -> None:
         ratio = max(1e-6, min(1.0 - 1e-6, foreground_ratio))
         pos_weight = (1.0 - ratio) / ratio
         pos_weight = float(min(max(pos_weight, cfg.pos_weight_min), cfg.pos_weight_max))
+        if cfg.balance_real_fake:
+            capped = min(pos_weight, 2.0)
+            if capped < pos_weight:
+                print(
+                    "Balanced class sampling is enabled; capping auto pos_weight "
+                    f"from {pos_weight:.4f} to {capped:.4f} to reduce foreground overprediction"
+                )
+            pos_weight = capped
         loss_cfg = replace(loss_cfg, pos_weight=pos_weight)
         print(f"Auto pos_weight from foreground ratio: {pos_weight:.4f}")
     else:

@@ -322,7 +322,7 @@ def build_training_config(
         "warmup_epochs": 3,
         "early_stopping_patience": 5,
         "early_stopping_min_delta": 1e-4,
-        "threshold_metric": "dice",
+        "threshold_metric": "iou",
         "compute_foreground_ratio": True,
         "auto_pos_weight": False,
         "pos_weight_min": 0.5,
