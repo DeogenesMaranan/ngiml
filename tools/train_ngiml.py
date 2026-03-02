@@ -152,7 +152,7 @@ class TrainConfig:
     output_dir: str = "runs/ngiml"
     batch_size: int = 8
     epochs: int = 50
-    num_workers: int = max(2, (os.cpu_count() or 4) // 2)
+    num_workers: int = max(2, min(8, (os.cpu_count() or 4) // 4))
     amp: bool = True
     pin_memory: bool = True
     channels_last: bool = True
@@ -180,8 +180,8 @@ class TrainConfig:
     balanced_positive_ratio: float = 0.5
     balanced_sampler_seed: int = 42
     balanced_sampler_num_samples: Optional[int] = None
-    prefetch_factor: Optional[int] = 2
-    persistent_workers: bool = True
+    prefetch_factor: Optional[int] = 1
+    persistent_workers: bool = False
     drop_last: bool = True
     auto_local_cache: bool = True
     local_cache_dir: Optional[str] = None
@@ -208,6 +208,8 @@ class TrainConfig:
     small_mask_ratio_max: float = 0.01
     medium_mask_ratio_max: float = 0.05
     compute_foreground_ratio: bool = True
+    foreground_ratio_max_batches: int = 40
+    short_side_probe_samples: int = 128
     auto_pos_weight: bool = False
     pos_weight_min: float = 0.5
     pos_weight_max: float = 20.0
@@ -324,11 +326,11 @@ def parse_args() -> TrainConfig:
         default=None,
         help="Optional number of sampled training items per epoch for real/fake balancing",
     )
-    parser.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor")
+    parser.add_argument("--prefetch-factor", type=int, default=1, help="DataLoader prefetch factor")
     parser.add_argument(
         "--persistent-workers",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Enable persistent DataLoader workers",
     )
     parser.add_argument(
@@ -373,6 +375,18 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--small-mask-ratio-max", type=float, default=0.01, help="Upper foreground-ratio bound for small-mask validation bin")
     parser.add_argument("--medium-mask-ratio-max", type=float, default=0.05, help="Upper foreground-ratio bound for medium-mask validation bin")
     parser.add_argument("--compute-foreground-ratio", action=argparse.BooleanOptionalAction, default=True, help="Compute foreground pixel ratio from train loader")
+    parser.add_argument(
+        "--foreground-ratio-max-batches",
+        type=int,
+        default=40,
+        help="Max train batches sampled when computing foreground pixel ratio",
+    )
+    parser.add_argument(
+        "--short-side-probe-samples",
+        type=int,
+        default=128,
+        help="Max samples per split to probe on disk for size bucketing (0 disables probing)",
+    )
     parser.add_argument("--auto-pos-weight", action=argparse.BooleanOptionalAction, default=False, help="Auto-compute BCE pos_weight from foreground ratio")
     parser.add_argument("--pos-weight-min", type=float, default=1.0, help="Lower clamp for auto pos_weight")
     parser.add_argument("--pos-weight-max", type=float, default=20.0, help="Upper clamp for auto pos_weight")
@@ -445,6 +459,8 @@ def parse_args() -> TrainConfig:
         small_mask_ratio_max=args.small_mask_ratio_max,
         medium_mask_ratio_max=args.medium_mask_ratio_max,
         compute_foreground_ratio=args.compute_foreground_ratio,
+        foreground_ratio_max_batches=max(0, int(args.foreground_ratio_max_batches)),
+        short_side_probe_samples=max(0, int(args.short_side_probe_samples)),
         auto_pos_weight=args.auto_pos_weight,
         pos_weight_min=args.pos_weight_min,
         pos_weight_max=args.pos_weight_max,
@@ -566,6 +582,7 @@ def _prepare_dataloaders(cfg: TrainConfig, device: torch.device):
         prefetch_factor=cfg.prefetch_factor,
         persistent_workers=cfg.persistent_workers,
         max_short_side=cfg.max_short_side,
+        short_side_probe_samples=cfg.short_side_probe_samples,
     )
     return loaders, per_dataset_aug, normalization_mode
 
@@ -1619,8 +1636,12 @@ def run_training(cfg: TrainConfig) -> None:
 
     foreground_ratio = None
     if cfg.compute_foreground_ratio:
-        print("Computing foreground pixel ratio (sampling up to 200 batches)...")
-        foreground_ratio = compute_foreground_pixel_ratio(loaders["train"], max_batches=200)
+        sampled_batches = cfg.foreground_ratio_max_batches if cfg.foreground_ratio_max_batches > 0 else None
+        if sampled_batches is None:
+            print("Computing foreground pixel ratio (sampling full train loader)...")
+        else:
+            print(f"Computing foreground pixel ratio (sampling up to {sampled_batches} batches)...")
+        foreground_ratio = compute_foreground_pixel_ratio(loaders["train"], max_batches=sampled_batches)
         print(f"Foreground pixel ratio (train): {foreground_ratio:.6f}")
 
     model_cfg = cfg.model_config or HybridNGIMLConfig()

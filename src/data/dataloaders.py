@@ -1062,6 +1062,7 @@ def create_dataloaders(
     balanced_sampler_num_samples: int | None = None,
     max_short_side: int | None = None,
     size_bucketing: bool = True,
+    short_side_probe_samples: int = 128,
 ) -> Dict[str, DataLoader]:
     manifest = load_manifest(manifest_path)
     normalization_mode = manifest.normalization_mode
@@ -1079,6 +1080,8 @@ def create_dataloaders(
         combined_short_sides: List[int] = []
         # Track whether each dataset will perform augmentations inside workers
         per_dataset_apply_in_worker: Dict[str, bool] = {}
+        split_probe_budget = max(0, int(short_side_probe_samples))
+        probed_count = 0
         for dataset_name, records in per_dataset_records.items():
             aug_cfg = per_dataset_augmentations.get(dataset_name, AugmentationConfig(enable=False))
             apply_in_worker = bool(aug_cfg.enable and num_workers > 0 and device.type != "cuda")
@@ -1093,39 +1096,43 @@ def create_dataloaders(
                     apply_augmentations=apply_in_worker,
                 )
             )
-            # Estimate short-side per-sample for bucketing heuristics (cheap, best-effort)
+            # Estimate short-side per-sample for bucketing heuristics.
+            # Probing files is expensive for large manifests, so cap the number
+            # of on-disk probes per split and use a bounded fallback afterwards.
             for r in records:
                 ss = None
-                try:
-                    p = str(r.image_path)
-                    if "::" in p and p.endswith(".npz"):
-                        # tar::npz entry: extract member bytes from tar and inspect
-                        archive, member = p.split("::", 1)
-                        try:
-                            tar = _get_tarfile(archive)
-                            member_obj = tar.extractfile(member)
-                            if member_obj is not None:
-                                npz_bytes = member_obj.read()
-                                with np.load(io.BytesIO(npz_bytes), allow_pickle=False) as data:
-                                    img = data["image"]
-                                    ss = int(min(img.shape[0] if img.ndim==3 else img.shape[-2], img.shape[1] if img.ndim==3 else img.shape[-1]))
-                        except Exception:
-                            ss = None
-                    elif p.endswith(".npz"):
-                        with np.load(p, allow_pickle=False) as data:
-                            img = data["image"]
-                            ss = int(min(img.shape[0] if img.ndim==3 else img.shape[-2], img.shape[1] if img.ndim==3 else img.shape[-1]))
-                    else:
-                        try:
-                            from PIL import Image
+                if split_probe_budget > 0 and probed_count < split_probe_budget:
+                    try:
+                        p = str(r.image_path)
+                        if "::" in p and p.endswith(".npz"):
+                            # tar::npz entry: extract member bytes from tar and inspect
+                            archive, member = p.split("::", 1)
+                            try:
+                                tar = _get_tarfile(archive)
+                                member_obj = tar.extractfile(member)
+                                if member_obj is not None:
+                                    npz_bytes = member_obj.read()
+                                    with np.load(io.BytesIO(npz_bytes), allow_pickle=False) as data:
+                                        img = data["image"]
+                                        ss = int(min(img.shape[0] if img.ndim == 3 else img.shape[-2], img.shape[1] if img.ndim == 3 else img.shape[-1]))
+                            except Exception:
+                                ss = None
+                        elif p.endswith(".npz"):
+                            with np.load(p, allow_pickle=False) as data:
+                                img = data["image"]
+                                ss = int(min(img.shape[0] if img.ndim == 3 else img.shape[-2], img.shape[1] if img.ndim == 3 else img.shape[-1]))
+                        else:
+                            try:
+                                from PIL import Image
 
-                            with Image.open(p) as im:
-                                w, h = im.size
-                            ss = int(min(w, h))
-                        except Exception:
-                            ss = None
-                except Exception:
-                    ss = None
+                                with Image.open(p) as im:
+                                    w, h = im.size
+                                ss = int(min(w, h))
+                            except Exception:
+                                ss = None
+                    except Exception:
+                        ss = None
+                    probed_count += 1
                 if ss is None:
                     ss = int(max_short_side) if max_short_side is not None else 320
                 combined_short_sides.append(int(ss))
