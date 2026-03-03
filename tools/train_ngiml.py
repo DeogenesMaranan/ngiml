@@ -186,7 +186,7 @@ class TrainConfig:
     auto_local_cache: bool = True
     local_cache_dir: Optional[str] = None
     reuse_local_cache_manifest: bool = True
-    views_per_sample: int = 1
+    views_per_sample: int = 2
     # Cap the short side of input images early in the dataloader to avoid
     # excessive spatial sizes that can trigger timm/Swin assertions or OOMs.
     max_short_side: int = 384
@@ -201,10 +201,10 @@ class TrainConfig:
     early_stopping_monitor: str = "iou"
     metric_threshold: float = 0.5
     optimize_threshold: bool = True
-    threshold_metric: str = "iou"
-    threshold_start: float = 0.1
-    threshold_end: float = 0.9
-    threshold_step: float = 0.1
+    threshold_metric: str = "dice"
+    threshold_start: float = 0.35
+    threshold_end: float = 0.75
+    threshold_step: float = 0.01
     small_mask_ratio_max: float = 0.01
     medium_mask_ratio_max: float = 0.05
     compute_foreground_ratio: bool = True
@@ -219,15 +219,17 @@ class TrainConfig:
     bce_weight: float = 1.0
     focal_gamma: float = 2.0
     focal_alpha: float = 0.25
-    tversky_weight: float = 0.2
+    tversky_weight: float = 0.1
     tversky_alpha: float = 0.3
-    tversky_beta: float = 0.7
-    lovasz_weight: float = 0.5
+    tversky_beta: float = 0.8
+    lovasz_weight: float = 0.15
+    use_boundary_loss: bool = False
+    boundary_weight: float = 0.05
     ema_enabled: bool = True
     ema_decay: float = 0.999
-    hard_mining_enabled: bool = False
-    hard_mining_start_epoch: int = 8
-    hard_mining_weight: float = 0.05
+    hard_mining_enabled: bool = True
+    hard_mining_start_epoch: int = 5
+    hard_mining_weight: float = 0.03
     hard_mining_gamma: float = 2.0
     default_aug: Optional[AugmentationConfig] = None
     per_dataset_aug: Optional[Dict[str, AugmentationConfig]] = None
@@ -358,7 +360,7 @@ def parse_args() -> TrainConfig:
         default=True,
         help="Reuse existing local cached manifest when available to shorten startup",
     )
-    parser.add_argument("--views-per-sample", type=int, default=None, help="Number of augmented views per sample (on-the-fly)")
+    parser.add_argument("--views-per-sample", type=int, default=2, help="Number of augmented views per sample (on-the-fly)")
     parser.add_argument("--max-short-side", type=int, default=384, help="Cap image short side before batching (lower is faster)")
     parser.add_argument("--max-rotation-degrees", type=float, default=0.0, help="Random rotation range (+/-)")
     parser.add_argument("--noise-std-max", type=float, default=0.01, help="Max Gaussian noise std")
@@ -370,10 +372,10 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--early-stopping-monitor", type=str, default="iou", choices=["iou", "dice", "recall", "precision", "accuracy", "loss"], help="Validation metric used for early stopping and best checkpoint")
     parser.add_argument("--metric-threshold", type=float, default=0.5, help="Fixed threshold for sigmoid outputs when threshold optimization is disabled")
     parser.add_argument("--optimize-threshold", action=argparse.BooleanOptionalAction, default=True, help="Search validation thresholds and use the best for metric reporting")
-    parser.add_argument("--threshold-metric", type=str, default="iou", choices=["iou", "dice"], help="Metric used to select best threshold")
-    parser.add_argument("--threshold-start", type=float, default=0.1, help="Threshold search range start")
-    parser.add_argument("--threshold-end", type=float, default=0.9, help="Threshold search range end")
-    parser.add_argument("--threshold-step", type=float, default=0.1, help="Threshold search step size")
+    parser.add_argument("--threshold-metric", type=str, default="dice", choices=["iou", "dice"], help="Metric used to select best threshold")
+    parser.add_argument("--threshold-start", type=float, default=0.35, help="Threshold search range start")
+    parser.add_argument("--threshold-end", type=float, default=0.75, help="Threshold search range end")
+    parser.add_argument("--threshold-step", type=float, default=0.01, help="Threshold search step size")
     parser.add_argument("--small-mask-ratio-max", type=float, default=0.01, help="Upper foreground-ratio bound for small-mask validation bin")
     parser.add_argument("--medium-mask-ratio-max", type=float, default=0.05, help="Upper foreground-ratio bound for medium-mask validation bin")
     parser.add_argument("--compute-foreground-ratio", action=argparse.BooleanOptionalAction, default=True, help="Compute foreground pixel ratio from train loader")
@@ -403,15 +405,17 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--bce-weight", type=float, default=1.0, help="BCE/Focal term weight in hybrid loss")
     parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (used when loss-hybrid-mode=dice_focal)")
     parser.add_argument("--focal-alpha", type=float, default=0.25, help="Focal loss alpha (used when loss-hybrid-mode=dice_focal)")
-    parser.add_argument("--tversky-weight", type=float, default=0.2, help="Optional Tversky loss weight to improve recall")
+    parser.add_argument("--tversky-weight", type=float, default=0.1, help="Optional Tversky loss weight to improve recall")
     parser.add_argument("--tversky-alpha", type=float, default=0.3, help="Tversky alpha (FP penalty)")
-    parser.add_argument("--tversky-beta", type=float, default=0.7, help="Tversky beta (FN penalty)")
-    parser.add_argument("--lovasz-weight", type=float, default=0.5, help="Lovasz Hinge Loss weight for IoU optimization")
+    parser.add_argument("--tversky-beta", type=float, default=0.8, help="Tversky beta (FN penalty)")
+    parser.add_argument("--lovasz-weight", type=float, default=0.15, help="Lovasz Hinge Loss weight for IoU optimization")
+    parser.add_argument("--use-boundary-loss", action=argparse.BooleanOptionalAction, default=False, help="Enable Sobel boundary loss on final prediction")
+    parser.add_argument("--boundary-weight", type=float, default=0.05, help="Boundary loss weight when --use-boundary-loss is enabled")
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=True, help="Use EMA weights for validation and best checkpoints")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay factor")
-    parser.add_argument("--hard-mining-enabled", action=argparse.BooleanOptionalAction, default=False, help="Enable low-IoU hard-example weighting")
-    parser.add_argument("--hard-mining-start-epoch", type=int, default=8, help="Epoch to start hard-example weighting")
-    parser.add_argument("--hard-mining-weight", type=float, default=0.05, help="Weight of hard-example auxiliary loss")
+    parser.add_argument("--hard-mining-enabled", action=argparse.BooleanOptionalAction, default=True, help="Enable low-IoU hard-example weighting")
+    parser.add_argument("--hard-mining-start-epoch", type=int, default=5, help="Epoch to start hard-example weighting")
+    parser.add_argument("--hard-mining-weight", type=float, default=0.03, help="Weight of hard-example auxiliary loss")
     parser.add_argument("--hard-mining-gamma", type=float, default=2.0, help="Scale for low-IoU hard-example weights")
     args = parser.parse_args()
     return TrainConfig(
@@ -483,6 +487,8 @@ def parse_args() -> TrainConfig:
         tversky_alpha=args.tversky_alpha,
         tversky_beta=args.tversky_beta,
         lovasz_weight=args.lovasz_weight,
+        use_boundary_loss=args.use_boundary_loss,
+        boundary_weight=args.boundary_weight,
         ema_enabled=args.ema_enabled,
         ema_decay=args.ema_decay,
         hard_mining_enabled=args.hard_mining_enabled,
@@ -530,9 +536,10 @@ def _build_aug_map(names: Sequence[str], cfg: TrainConfig) -> Dict[str, Augmenta
         enable_flips=True,
         enable_rotations=cfg.max_rotation_degrees > 0,
         max_rotation_degrees=cfg.max_rotation_degrees,
-        enable_random_crop=False,
-        object_crop_bias_prob=0.7,
-        min_fg_pixels_for_object_crop=16,
+        enable_random_crop=True,
+        crop_scale_range=(0.75, 1.0),
+        object_crop_bias_prob=0.85,
+        min_fg_pixels_for_object_crop=8,
         enable_elastic=False,
         elastic_prob=0.0,
         elastic_alpha=8.0,
@@ -982,6 +989,124 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
         )
 
 
+def _manifest_split_counts(manifest_path: Path) -> dict[str, int]:
+    manifest = load_manifest(manifest_path)
+    counts = {"train": 0, "val": 0, "test": 0}
+    unknown_splits: set[str] = set()
+    for sample in manifest.samples:
+        split_name = str(sample.split).strip().lower()
+        if split_name in counts:
+            counts[split_name] += 1
+        else:
+            unknown_splits.add(split_name)
+    if unknown_splits:
+        unknown = ", ".join(sorted(unknown_splits))
+        raise ValueError(
+            "Manifest contains unsupported split names: "
+            f"{unknown}. Expected only train/val/test."
+        )
+    return counts
+
+
+def _validate_startup_config(cfg: TrainConfig, manifest_path: Path, device: torch.device) -> tuple[dict[str, int], str]:
+    manifest = load_manifest(manifest_path)
+    normalization_mode = str(manifest.normalization_mode).strip().lower()
+    if normalization_mode not in {"zero_one", "imagenet"}:
+        raise ValueError(
+            "Manifest normalization_mode is incompatible with runtime expectations: "
+            f"{manifest.normalization_mode!r}. Supported values: 'zero_one' or 'imagenet'."
+        )
+
+    if device.type == "cuda" and normalization_mode not in {"zero_one", "imagenet"}:
+        raise ValueError(
+            "CUDA runtime normalization path only supports 'zero_one' and 'imagenet'. "
+            f"Got: {manifest.normalization_mode!r}."
+        )
+
+    if cfg.optimize_threshold:
+        if cfg.threshold_step <= 0:
+            raise ValueError(
+                "Invalid threshold search range: threshold_step must be > 0 when optimize_threshold is enabled. "
+                f"Got {cfg.threshold_step}."
+            )
+        if not (0.0 <= float(cfg.threshold_start) <= 1.0 and 0.0 <= float(cfg.threshold_end) <= 1.0):
+            raise ValueError(
+                "Invalid threshold search range: threshold_start/threshold_end must be within [0, 1]. "
+                f"Got start={cfg.threshold_start}, end={cfg.threshold_end}."
+            )
+        if float(cfg.threshold_end) < float(cfg.threshold_start):
+            raise ValueError(
+                "Invalid threshold search range: threshold_end must be >= threshold_start. "
+                f"Got start={cfg.threshold_start}, end={cfg.threshold_end}."
+            )
+    else:
+        if not (0.0 <= float(cfg.metric_threshold) <= 1.0):
+            raise ValueError(
+                "Invalid fixed threshold: metric_threshold must be within [0, 1] when optimize_threshold is disabled. "
+                f"Got {cfg.metric_threshold}."
+            )
+
+    split_counts = _manifest_split_counts(manifest_path)
+    train_count = int(split_counts.get("train", 0))
+    val_count = int(split_counts.get("val", 0))
+
+    if train_count <= 0:
+        raise ValueError("Manifest train split has no samples; cannot start training.")
+
+    if cfg.val_every > 0 and val_count <= 0:
+        raise ValueError(
+            "Validation is enabled (val_every > 0) but manifest has no val split samples. "
+            "Provide a val split or set val_every <= 0."
+        )
+
+    if cfg.early_stopping_patience > 0 and val_count <= 0:
+        raise ValueError(
+            "Early stopping requires validation data, but manifest has no val split samples."
+        )
+
+    if cfg.optimize_threshold and val_count <= 0:
+        raise ValueError(
+            "Threshold optimization requires validation data, but manifest has no val split samples."
+        )
+
+    return split_counts, normalization_mode
+
+
+def _parity_check(cfg: TrainConfig, manifest_path: Path, normalization_mode: str) -> None:
+    manifest = load_manifest(manifest_path)
+    train_labels = [int(sample.label) for sample in manifest.samples if str(sample.split).strip().lower() == "train"]
+    total = len(train_labels)
+    positives = sum(1 for label in train_labels if label == 1)
+    negatives = sum(1 for label in train_labels if label == 0)
+    fake_ratio = (float(positives) / float(total)) if total > 0 else 0.0
+    threshold_policy = "optimized" if cfg.optimize_threshold else f"fixed@{float(cfg.metric_threshold):.3f}"
+
+    print(
+        "Parity check | "
+        f"normalization={normalization_mode} | "
+        f"train_class_ratio(real/fake)={negatives}/{positives} (fake={fake_ratio:.3f}) | "
+        f"balanced_sampler_active={bool(cfg.balance_real_fake)} | "
+        f"eval_threshold_policy={threshold_policy}"
+    )
+
+
+def _print_resolved_config_summary(cfg: TrainConfig, normalization_mode: str) -> None:
+    threshold_mode = (
+        f"optimized[{cfg.threshold_metric}:{cfg.threshold_start:.2f}-{cfg.threshold_end:.2f}@{cfg.threshold_step:.3f}]"
+        if cfg.optimize_threshold
+        else f"fixed[{cfg.metric_threshold:.2f}]"
+    )
+    sampler_mode = "round_robin_balanced" if cfg.balance_real_fake else "round_robin"
+    print(
+        "Resolved config | "
+        f"normalization={normalization_mode} | "
+        f"balance_sampling={bool(cfg.balance_sampling)} | "
+        f"balance_real_fake={bool(cfg.balance_real_fake)} | "
+        f"sampler_mode={sampler_mode} | "
+        f"threshold_mode={threshold_mode}"
+    )
+
+
 def _write_best_threshold_metadata(
     path: Path,
     *,
@@ -1130,6 +1255,8 @@ def _write_experiment_fingerprint(
             "tversky_weight": float(cfg.tversky_weight),
             "tversky_alpha": float(cfg.tversky_alpha),
             "tversky_beta": float(cfg.tversky_beta),
+            "use_boundary_loss": bool(cfg.use_boundary_loss),
+            "boundary_weight": float(cfg.boundary_weight),
             "hard_mining_enabled": bool(cfg.hard_mining_enabled),
             "hard_mining_start_epoch": int(cfg.hard_mining_start_epoch),
             "hard_mining_weight": float(cfg.hard_mining_weight),
@@ -1632,6 +1759,10 @@ def run_training(cfg: TrainConfig) -> None:
     if resolved_manifest != Path(cfg.manifest):
         cfg = replace(cfg, manifest=str(resolved_manifest))
 
+    _, normalization_mode_checked = _validate_startup_config(cfg, Path(cfg.manifest), device)
+    _print_resolved_config_summary(cfg, normalization_mode_checked)
+    _parity_check(cfg, Path(cfg.manifest), normalization_mode_checked)
+
     _print_and_validate_train_dataset_integrity(Path(cfg.manifest))
 
     loaders, per_dataset_aug, normalization_mode = _prepare_dataloaders(cfg, device)
@@ -1686,6 +1817,8 @@ def run_training(cfg: TrainConfig) -> None:
         tversky_alpha=cfg.tversky_alpha,
         tversky_beta=cfg.tversky_beta,
         lovasz_weight=cfg.lovasz_weight,
+        use_boundary_loss=cfg.use_boundary_loss,
+        boundary_weight=cfg.boundary_weight,
     )
     if cfg.auto_pos_weight and foreground_ratio is not None:
         ratio = max(1e-6, min(1.0 - 1e-6, foreground_ratio))

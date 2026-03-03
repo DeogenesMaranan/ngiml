@@ -116,6 +116,8 @@ class MultiStageLossConfig:
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.7
     lovasz_weight: float = 0.0  # Weight for Lovasz Hinge Loss
+    use_boundary_loss: bool = False
+    boundary_weight: float = 0.05
     hard_pixel_mining: bool = False  # Disable hard pixel mining by default to stabilize training
     
 
@@ -126,7 +128,7 @@ class MultiStageManipulationLoss(nn.Module):
 
     Forensic motivation: Adds Sobel-based boundary loss to encourage sharper manipulation boundaries.
     """
-    def __init__(self, config: MultiStageLossConfig | None = None, boundary_weight: float = 0.3) -> None:
+    def __init__(self, config: MultiStageLossConfig | None = None) -> None:
         super().__init__()
         self.cfg = config or MultiStageLossConfig()
         self.dice = SoftDiceLoss(smooth=self.cfg.smooth)
@@ -137,8 +139,9 @@ class MultiStageManipulationLoss(nn.Module):
             smooth=self.cfg.smooth,
         )
         self.lovasz = LovaszHingeLoss()
-        self.boundary_loss = SobelBoundaryLoss()
-        self.boundary_weight = boundary_weight
+        self.boundary_weight = float(max(0.0, getattr(self.cfg, "boundary_weight", 0.0)))
+        self.use_boundary_loss = bool(getattr(self.cfg, "use_boundary_loss", False)) and self.boundary_weight > 0.0
+        self.boundary_loss = SobelBoundaryLoss() if self.use_boundary_loss else None
 
         mode = self.cfg.hybrid_mode.strip().lower()
         if mode not in {"dice_bce", "dice_focal"}:
@@ -204,7 +207,7 @@ class MultiStageManipulationLoss(nn.Module):
             normalizer += stage_weight
 
         # Add boundary loss on final prediction
-        if preds:
+        if self.use_boundary_loss and self.boundary_loss is not None and preds:
             boundary = self.boundary_loss(preds[-1], target)
             total_loss += self.boundary_weight * boundary
 

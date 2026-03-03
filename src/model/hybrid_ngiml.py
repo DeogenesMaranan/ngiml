@@ -24,23 +24,23 @@ class OptimizerGroupConfig:
 
 def _default_efficientnet_optim() -> OptimizerGroupConfig:
     # Forensic motivation: Lower LR for backbone to stabilize early training
-    return OptimizerGroupConfig(lr=1e-5, weight_decay=1e-4)
+    return OptimizerGroupConfig(lr=1e-5, weight_decay=1.5e-4)
 
 
 def _default_swin_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=5e-6, weight_decay=5e-5)
+    return OptimizerGroupConfig(lr=5e-6, weight_decay=1e-4)
 
 
 def _default_residual_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=3e-4, weight_decay=1e-4)
+    return OptimizerGroupConfig(lr=2.5e-4, weight_decay=2e-4)
 
 
 def _default_fusion_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=1.5e-4, weight_decay=1e-4)
+    return OptimizerGroupConfig(lr=1.2e-4, weight_decay=2e-4)
 
 
 def _default_decoder_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=2e-4, weight_decay=1e-4)
+    return OptimizerGroupConfig(lr=1.8e-4, weight_decay=2e-4)
 
 
 @dataclass
