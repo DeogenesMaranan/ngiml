@@ -1107,6 +1107,50 @@ def _print_resolved_config_summary(cfg: TrainConfig, normalization_mode: str) ->
     )
 
 
+def _cuda_supports_bf16() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    checker = getattr(torch.cuda, "is_bf16_supported", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            pass
+    try:
+        major, _minor = torch.cuda.get_device_capability()
+        return int(major) >= 8
+    except Exception:
+        return False
+
+
+def _resolve_cuda_runtime_stability(cfg: TrainConfig, device: torch.device) -> TrainConfig:
+    if device.type != "cuda":
+        return cfg
+
+    updates: dict[str, object] = {}
+    precision = (getattr(cfg, "precision", "fp32") or "fp32").lower()
+    if precision == "bf16" and not _cuda_supports_bf16():
+        updates["precision"] = "fp16"
+
+    if updates:
+        resolved = replace(cfg, **updates)
+        print(
+            "Adjusted CUDA runtime config for stability | "
+            f"precision: {cfg.precision} -> {resolved.precision}"
+        )
+        return resolved
+    return cfg
+
+
+def _is_cudnn_engine_error(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    return (
+        "unable to find an engine" in msg
+        or "find was unable to find an engine" in msg
+        or "no engine to execute this computation" in msg
+    )
+
+
 def _write_best_threshold_metadata(
     path: Path,
     *,
@@ -1732,6 +1776,7 @@ def run_training(cfg: TrainConfig) -> None:
 
     device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
+    cfg = _resolve_cuda_runtime_stability(cfg, device)
 
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high" if cfg.use_tf32 else "highest")
@@ -1919,6 +1964,7 @@ def run_training(cfg: TrainConfig) -> None:
     freeze_backbone_epochs = int(max(0, getattr(model_cfg.optimizer, "freeze_backbone_epochs", 0)))
     backbone_was_frozen = False
 
+    runtime_fallback_used = False
     for epoch in range(start_epoch, cfg.epochs):
         should_freeze_backbone = epoch < freeze_backbone_epochs
         _set_backbone_trainable(model, trainable=not should_freeze_backbone)
@@ -1933,20 +1979,58 @@ def run_training(cfg: TrainConfig) -> None:
             backbone_was_frozen = False
 
         start_time = time.time()
-        train_loss, global_step, train_positive_ratio = train_one_epoch(
-            model,
-            loaders["train"],
-            optimizer,
-            scaler,
-            loss_fn,
-            device,
-            cfg,
-            epoch,
-            global_step,
-            ema_model=ema_model,
-            per_dataset_aug=per_dataset_aug,
-            normalization_mode=normalization_mode,
-        )
+        try:
+            train_loss, global_step, train_positive_ratio = train_one_epoch(
+                model,
+                loaders["train"],
+                optimizer,
+                scaler,
+                loss_fn,
+                device,
+                cfg,
+                epoch,
+                global_step,
+                ema_model=ema_model,
+                per_dataset_aug=per_dataset_aug,
+                normalization_mode=normalization_mode,
+            )
+        except RuntimeError as exc:
+            if (not runtime_fallback_used) and _is_cudnn_engine_error(exc):
+                runtime_fallback_used = True
+                prev_precision = cfg.precision
+                cfg = replace(
+                    cfg,
+                    channels_last=False,
+                    compile_model=False,
+                    flash_attention=False,
+                    xformers=False,
+                    amp=False,
+                    precision="fp32",
+                )
+                model = model.to(memory_format=torch.contiguous_format)
+                if ema_model is not None:
+                    ema_model = ema_model.to(memory_format=torch.contiguous_format)
+                scaler = GradScaler(enabled=False)
+                print(
+                    "Encountered CUDA conv engine selection error; retrying with safe settings | "
+                    f"precision {prev_precision}->fp32, amp off, channels_last off, compile off"
+                )
+                train_loss, global_step, train_positive_ratio = train_one_epoch(
+                    model,
+                    loaders["train"],
+                    optimizer,
+                    scaler,
+                    loss_fn,
+                    device,
+                    cfg,
+                    epoch,
+                    global_step,
+                    ema_model=ema_model,
+                    per_dataset_aug=per_dataset_aug,
+                    normalization_mode=normalization_mode,
+                )
+            else:
+                raise
 
         elapsed = time.time() - start_time
         if scheduler is not None:

@@ -18,6 +18,29 @@ def _norm(value: str) -> str:
     return str(value).replace("\\", "/")
 
 
+def _recommended_cuda_precision(default: str = "fp16") -> str:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            checker = getattr(torch.cuda, "is_bf16_supported", None)
+            if callable(checker):
+                try:
+                    if bool(checker()):
+                        return "bf16"
+                except Exception:
+                    pass
+            try:
+                major, _minor = torch.cuda.get_device_capability()
+                if int(major) >= 8:
+                    return "bf16"
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return str(default)
+
+
 def _suffix_score(a_parts, b_parts) -> int:
     score = 0
     for ax, bx in zip(reversed(a_parts), reversed(b_parts)):
@@ -425,6 +448,7 @@ def apply_colab_runtime_settings(
     recommended_workers = max(2, min(6, (os.cpu_count() or 4)))
     cache_dir = local_cache_dir or "/content/cache"
     if tune_for_large_batch:
+        runtime_precision = _recommended_cuda_precision(default="fp16")
         training_config.update(
             {
                 "batch_size": int(max(20, int(training_config.get("batch_size", 20)))),
@@ -439,7 +463,7 @@ def apply_colab_runtime_settings(
                 "compile_mode": "default",
                 "channels_last": True,
                 "use_tf32": True,
-                "precision": "bf16",
+                "precision": runtime_precision,
                 "max_short_side": int(max(480, int(training_config.get("max_short_side", 480)))),
                 "foreground_ratio_max_batches": int(training_config.get("foreground_ratio_max_batches", 20)),
                 "short_side_probe_samples": int(training_config.get("short_side_probe_samples", 0)),
