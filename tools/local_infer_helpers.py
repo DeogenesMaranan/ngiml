@@ -7,8 +7,17 @@ from typing import Sequence
 
 import torch
 import torch.nn.functional as F
+from torchvision.transforms import functional as TVF
+from torchvision.transforms.functional import InterpolationMode
 
-from src.data.dataloaders import _load_from_npz, _load_from_tar_npz, _load_image, _normalize, load_manifest
+from src.data.dataloaders import (
+    _compute_high_pass_fallback,
+    _load_from_npz,
+    _load_from_tar_npz,
+    _load_image,
+    _normalize,
+    load_manifest,
+)
 from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
 from tools.colab_train_helpers import build_default_components
@@ -209,6 +218,7 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
         "config_source": str(config_source),
         "fusion_channels": tuple(int(value) for value in model.cfg.fusion.fusion_channels),
         "default_threshold": float(load_default_threshold(Path(checkpoint_path), fallback=0.5)),
+        "max_short_side": int((checkpoint.get("train_config") or {}).get("max_short_side", 0) or 0),
     }
     setattr(model, "default_threshold", float(info["default_threshold"]))
     return model, device, info
@@ -243,18 +253,50 @@ def _resolve_possible_local_path(path_str: str) -> str:
     return path.as_posix()
 
 
-def load_image_mask_from_record(record: SampleRecord) -> tuple[torch.Tensor, torch.Tensor]:
+def resize_for_inference(
+    image: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    high_pass: torch.Tensor | None = None,
+    max_short_side: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    cap = int(max_short_side or 0)
+    if cap <= 0:
+        return image, mask, high_pass
+
+    h, w = image.shape[-2:]
+    short_side = min(h, w)
+    if short_side <= 0 or short_side <= cap:
+        return image, mask, high_pass
+
+    scale = float(cap) / float(short_side)
+    new_h, new_w = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+    image = TVF.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+    if mask is not None:
+        mask = TVF.resize(mask, [new_h, new_w], interpolation=InterpolationMode.NEAREST)
+    if high_pass is not None:
+        high_pass = TVF.resize(high_pass, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+    return image, mask, high_pass
+
+
+def load_image_mask_from_record(
+    record: SampleRecord,
+    max_short_side: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     image_path = str(record.image_path)
     if "::" in image_path and image_path.endswith(".npz"):
-        image, mask, _ = _load_from_tar_npz(image_path)
+        image, mask, high_pass = _load_from_tar_npz(image_path)
     elif image_path.endswith(".npz"):
-        image, mask, _ = _load_from_npz(_resolve_possible_local_path(image_path))
+        image, mask, high_pass = _load_from_npz(_resolve_possible_local_path(image_path))
     else:
         image = _load_image(_resolve_possible_local_path(image_path))
+        high_pass = None
         mask = None
         if record.mask_path is not None:
             loaded = _load_image(_resolve_possible_local_path(record.mask_path))
             mask = loaded[:1] if loaded.shape[0] > 1 else loaded
+        if record.high_pass_path is not None:
+            loaded_high = _load_image(_resolve_possible_local_path(record.high_pass_path))
+            high_pass = loaded_high if loaded_high.shape[0] in (1, 3) else loaded_high[:3]
 
     image = image.float()
     if image.max() > 1.0:
@@ -273,7 +315,23 @@ def load_image_mask_from_record(record: SampleRecord) -> tuple[torch.Tensor, tor
         if tuple(mask.shape[-2:]) != tuple(image.shape[-2:]):
             mask = F.interpolate(mask.unsqueeze(0), size=image.shape[-2:], mode="nearest").squeeze(0)
 
-    return image, mask
+    if high_pass is not None:
+        high_pass = high_pass.float()
+        if high_pass.ndim == 2:
+            high_pass = high_pass.unsqueeze(0)
+        if high_pass.shape[0] == 1:
+            high_pass = high_pass.repeat(3, 1, 1)
+        elif high_pass.shape[0] > 3:
+            high_pass = high_pass[:3]
+        if high_pass.max() > 1.0:
+            high_pass = high_pass / 255.0
+        if tuple(high_pass.shape[-2:]) != tuple(image.shape[-2:]):
+            high_pass = F.interpolate(high_pass.unsqueeze(0), size=image.shape[-2:], mode="bilinear", align_corners=False).squeeze(0)
+    else:
+        high_pass = _compute_high_pass_fallback(image)
+
+    image, mask, high_pass = resize_for_inference(image, mask=mask, high_pass=high_pass, max_short_side=max_short_side)
+    return image, mask, high_pass
 
 
 def normalize_image_for_inference(image: torch.Tensor, normalization_mode: str = "zero_one") -> torch.Tensor:
@@ -288,11 +346,18 @@ def predict_probability_map(
     image: torch.Tensor,
     device: torch.device,
     normalization_mode: str = "zero_one",
+    high_pass: torch.Tensor | None = None,
 ) -> torch.Tensor:
     normalized = normalize_image_for_inference(image, normalization_mode=normalization_mode)
     x = normalized.unsqueeze(0).to(device)
+    hp = None
+    if high_pass is not None:
+        hp = high_pass.float()
+        if hp.max() > 1.0:
+            hp = hp / 255.0
+        hp = hp.unsqueeze(0).to(device)
     with torch.no_grad():
-        logits = model(x, target_size=image.shape[-2:])[-1]
+        logits = model(x, target_size=image.shape[-2:], high_pass=hp)[-1]
         prob = torch.sigmoid(logits)[0, 0].detach().cpu()
     return prob
 
@@ -303,8 +368,9 @@ def predict_binary_map(
     device: torch.device,
     threshold: float | None = None,
     normalization_mode: str = "zero_one",
+    high_pass: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    prob = predict_probability_map(model, image, device, normalization_mode=normalization_mode)
+    prob = predict_probability_map(model, image, device, normalization_mode=normalization_mode, high_pass=high_pass)
     if threshold is None:
         threshold = float(getattr(model, "default_threshold", 0.5))
     return (prob >= float(threshold)).float()
@@ -315,11 +381,14 @@ def infer_from_image_path(
     image_path: Path,
     device: torch.device,
     normalization_mode: str = "zero_one",
+    max_short_side: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     image = _load_image(str(Path(image_path).as_posix())).float()
     if image.max() > 1.0:
         image = image / 255.0
-    pred = predict_probability_map(model, image, device, normalization_mode=normalization_mode)
+    high_pass = _compute_high_pass_fallback(image)
+    image, _, high_pass = resize_for_inference(image, mask=None, high_pass=high_pass, max_short_side=max_short_side)
+    pred = predict_probability_map(model, image, device, normalization_mode=normalization_mode, high_pass=high_pass)
     return image, pred
 
 
