@@ -419,6 +419,56 @@ def build_training_config(
     }
 
 
+def apply_phase2_resume_preset(
+    training_config: dict,
+    resume_checkpoint: str,
+    lr_scale: float = 0.33,
+    tversky_weight: float = 0.1,
+    monitor_metric: str = "iou",
+) -> dict:
+    """Apply phase-2 fine-tuning settings after a phase-1 plateau.
+
+    Intended usage in notebooks:
+      1) Build base config.
+      2) Apply runtime/throughput settings.
+      3) Call this function to switch into resume + lower-LR overlap-focused tuning.
+    """
+
+    if not resume_checkpoint:
+        raise ValueError("resume_checkpoint must be a non-empty checkpoint path")
+
+    if lr_scale <= 0.0:
+        raise ValueError("lr_scale must be > 0")
+
+    metric = str(monitor_metric).strip().lower()
+    if metric not in {"iou", "f1", "dice"}:
+        raise ValueError("monitor_metric must be one of: iou, f1, dice")
+
+    training_config.update(
+        {
+            "resume": str(resume_checkpoint),
+            "auto_resume": False,
+            "warmup_epochs": 0,
+            "early_stopping_monitor": metric,
+            "threshold_metric": metric,
+            "tversky_weight": float(tversky_weight),
+            "lovasz_weight": 0.0,
+            "hard_mining_enabled": False,
+        }
+    )
+
+    model_cfg = training_config.get("model_config")
+    optimizer_cfg = getattr(model_cfg, "optimizer", None) if model_cfg is not None else None
+    if optimizer_cfg is not None:
+        for group_name in ("efficientnet", "swin", "residual", "fusion", "decoder"):
+            group = getattr(optimizer_cfg, group_name, None)
+            if group is None:
+                continue
+            group.lr = float(group.lr) * float(lr_scale)
+
+    return training_config
+
+
 def apply_colab_runtime_settings(
     training_config: dict,
     balance_sampling: bool = True,

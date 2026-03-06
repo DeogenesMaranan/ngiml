@@ -8,7 +8,7 @@ from typing import Sequence
 import torch
 import torch.nn.functional as F
 
-from src.data.dataloaders import _load_from_npz, _load_from_tar_npz, _load_image, load_manifest
+from src.data.dataloaders import _load_from_npz, _load_from_tar_npz, _load_image, _normalize, load_manifest
 from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
 from tools.colab_train_helpers import build_default_components
@@ -276,8 +276,21 @@ def load_image_mask_from_record(record: SampleRecord) -> tuple[torch.Tensor, tor
     return image, mask
 
 
-def predict_probability_map(model: HybridNGIML, image: torch.Tensor, device: torch.device) -> torch.Tensor:
-    x = image.unsqueeze(0).to(device)
+def normalize_image_for_inference(image: torch.Tensor, normalization_mode: str = "zero_one") -> torch.Tensor:
+    image = image.float()
+    if image.max() > 1.0:
+        image = image / 255.0
+    return _normalize(image, str(normalization_mode).strip().lower())
+
+
+def predict_probability_map(
+    model: HybridNGIML,
+    image: torch.Tensor,
+    device: torch.device,
+    normalization_mode: str = "zero_one",
+) -> torch.Tensor:
+    normalized = normalize_image_for_inference(image, normalization_mode=normalization_mode)
+    x = normalized.unsqueeze(0).to(device)
     with torch.no_grad():
         logits = model(x, target_size=image.shape[-2:])[-1]
         prob = torch.sigmoid(logits)[0, 0].detach().cpu()
@@ -289,18 +302,24 @@ def predict_binary_map(
     image: torch.Tensor,
     device: torch.device,
     threshold: float | None = None,
+    normalization_mode: str = "zero_one",
 ) -> torch.Tensor:
-    prob = predict_probability_map(model, image, device)
+    prob = predict_probability_map(model, image, device, normalization_mode=normalization_mode)
     if threshold is None:
         threshold = float(getattr(model, "default_threshold", 0.5))
     return (prob >= float(threshold)).float()
 
 
-def infer_from_image_path(model: HybridNGIML, image_path: Path, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def infer_from_image_path(
+    model: HybridNGIML,
+    image_path: Path,
+    device: torch.device,
+    normalization_mode: str = "zero_one",
+) -> tuple[torch.Tensor, torch.Tensor]:
     image = _load_image(str(Path(image_path).as_posix())).float()
     if image.max() > 1.0:
         image = image / 255.0
-    pred = predict_probability_map(model, image, device)
+    pred = predict_probability_map(model, image, device, normalization_mode=normalization_mode)
     return image, pred
 
 
