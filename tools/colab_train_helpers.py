@@ -283,7 +283,7 @@ def build_default_components():
 
     default_aug = AugmentationConfig(
         enable=True,
-        views_per_sample=3,
+        views_per_sample=2,
         enable_flips=True,
         enable_rotations=True,
         max_rotation_degrees=5.0,
@@ -307,7 +307,7 @@ def build_default_components():
     per_dataset_aug = {
         "IMD2020": AugmentationConfig(
             enable=True,
-            views_per_sample=6,
+            views_per_sample=3,
             enable_flips=True,
             enable_rotations=True,
             max_rotation_degrees=8.0,
