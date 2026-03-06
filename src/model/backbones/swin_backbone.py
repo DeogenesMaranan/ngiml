@@ -179,31 +179,28 @@ class SwinBackbone(nn.Module):
             )
             x = NN_F.pad(x, (0, pad_w, 0, pad_h), value=0)
 
-        # If the underlying timm model declares a default input size, always
-        # follow a pad -> resize workflow to that default to avoid forward-time
-        # assertions and ensure consistent attention-mask construction.
+        # Prefer preserving the incoming resolution after patch-multiple padding.
+        # Only fall back to model-default resizing if the underlying timm model
+        # raises an assertion for the current spatial size.
         default_cfg = getattr(self.model, "default_cfg", None) or {}
         input_size = default_cfg.get("input_size") if isinstance(default_cfg, dict) else None
         if input_size:
             exp_h, exp_w = int(input_size[1]), int(input_size[2])
-            # Propagate metadata for the padded size first (helps intermediate masks)
             self._propagate_spatial_metadata(x.shape[-2], x.shape[-1])
-            # Resize to exact expected model input size (pad then resize)
-            if (x.shape[-2], x.shape[-1]) != (exp_h, exp_w):
-                _LOG.warning(
-                    "SwinBackbone internal resize to model default: (%d,%d) -> (%d,%d)",
-                    x.shape[-2], x.shape[-1], exp_h, exp_w,
-                )
-                x_resized = NN_F.interpolate(x, size=(exp_h, exp_w), mode="bilinear", align_corners=False)
-            else:
-                x_resized = x
-            # Re-propagate metadata for final resized dims
-            self._propagate_spatial_metadata(exp_h, exp_w)
             try:
-                features = self.model(x_resized)
+                features = self.model(x)
             except AssertionError as err:
-                _LOG.warning("Swin model assertion during forward even after pad+resize: %s", str(err))
-                raise
+                _LOG.warning("Swin model assertion during forward at native padded size: %s", str(err))
+                if (x.shape[-2], x.shape[-1]) != (exp_h, exp_w):
+                    _LOG.warning(
+                        "SwinBackbone fallback resize to model default: (%d,%d) -> (%d,%d)",
+                        x.shape[-2], x.shape[-1], exp_h, exp_w,
+                    )
+                    x_resized = NN_F.interpolate(x, size=(exp_h, exp_w), mode="bilinear", align_corners=False)
+                    self._propagate_spatial_metadata(exp_h, exp_w)
+                    features = self.model(x_resized)
+                else:
+                    raise
         else:
             # No declared default size; propagate metadata for patched size and call model
             self._propagate_spatial_metadata(x.shape[-2], x.shape[-1])
