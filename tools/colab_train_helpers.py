@@ -273,17 +273,17 @@ def build_default_components():
         stage_weights=[0.05, 0.1, 0.2, 1.0],
         smooth=1e-6,
         hybrid_mode="dice_bce",
-        tversky_weight=0.1,
+        tversky_weight=0.0,
         tversky_alpha=0.3,
         tversky_beta=0.8,
-        lovasz_weight=0.15,
+        lovasz_weight=0.0,
         use_boundary_loss=False,
         boundary_weight=0.05,
     )
 
     default_aug = AugmentationConfig(
         enable=True,
-        views_per_sample=2,
+        views_per_sample=3,
         enable_flips=True,
         enable_rotations=True,
         max_rotation_degrees=5.0,
@@ -307,7 +307,7 @@ def build_default_components():
     per_dataset_aug = {
         "IMD2020": AugmentationConfig(
             enable=True,
-            views_per_sample=4,
+            views_per_sample=6,
             enable_flips=True,
             enable_rotations=True,
             max_rotation_degrees=8.0,
@@ -345,10 +345,10 @@ def build_training_config(
     effective_bce_weight = float(getattr(loss_cfg, "bce_weight", 1.0))
     effective_focal_gamma = float(getattr(loss_cfg, "focal_gamma", 2.0))
     effective_focal_alpha = float(getattr(loss_cfg, "focal_alpha", 0.25))
-    effective_tversky_weight = float(getattr(loss_cfg, "tversky_weight", 0.1))
+    effective_tversky_weight = float(getattr(loss_cfg, "tversky_weight", 0.0))
     effective_tversky_alpha = float(getattr(loss_cfg, "tversky_alpha", 0.3))
     effective_tversky_beta = float(getattr(loss_cfg, "tversky_beta", 0.8))
-    effective_lovasz_weight = float(getattr(loss_cfg, "lovasz_weight", 0.15))
+    effective_lovasz_weight = float(getattr(loss_cfg, "lovasz_weight", 0.0))
     effective_use_boundary_loss = bool(getattr(loss_cfg, "use_boundary_loss", False))
     effective_boundary_weight = float(getattr(loss_cfg, "boundary_weight", 0.05))
 
@@ -366,7 +366,8 @@ def build_training_config(
         "resume": None,
         "auto_resume": True,
         "round_robin_seed": 42,
-        "balance_real_fake": False,
+        "balance_real_fake": True,
+        "balanced_positive_ratio": 0.6,
         "prefetch_factor": 2,
         "persistent_workers": False,
         "drop_last": True,
@@ -383,10 +384,10 @@ def build_training_config(
         "early_stopping_min_delta": 1e-4,
         "metric_threshold": 0.5,
         "optimize_threshold": True,
-        "threshold_metric": "dice",
-        "threshold_start": 0.35,
-        "threshold_end": 0.75,
-        "threshold_step": 0.01,
+        "threshold_metric": "f1",
+        "threshold_start": 0.2,
+        "threshold_end": 0.8,
+        "threshold_step": 0.02,
         "compute_foreground_ratio": True,
         "foreground_ratio_max_batches": 20,
         "short_side_probe_samples": 0,
@@ -407,7 +408,7 @@ def build_training_config(
         "boundary_weight": effective_boundary_weight,
         "ema_enabled": True,
         "ema_decay": 0.999,
-        "hard_mining_enabled": True,
+        "hard_mining_enabled": False,
         "hard_mining_start_epoch": 5,
         "hard_mining_weight": 0.03,
         "hard_mining_gamma": 2.0,

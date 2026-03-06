@@ -176,8 +176,8 @@ class TrainConfig:
     auto_resume: bool = False
     round_robin_seed: Optional[int] = 42
     balance_sampling: bool = False
-    balance_real_fake: bool = False
-    balanced_positive_ratio: float = 0.5
+    balance_real_fake: bool = True
+    balanced_positive_ratio: float = 0.6
     balanced_sampler_seed: int = 42
     balanced_sampler_num_samples: Optional[int] = None
     prefetch_factor: Optional[int] = 1
@@ -198,13 +198,13 @@ class TrainConfig:
     seed: int = 42
     early_stopping_patience: int = 12
     early_stopping_min_delta: float = 1e-4
-    early_stopping_monitor: str = "iou"
+    early_stopping_monitor: str = "f1"
     metric_threshold: float = 0.5
     optimize_threshold: bool = True
-    threshold_metric: str = "dice"
-    threshold_start: float = 0.35
-    threshold_end: float = 0.75
-    threshold_step: float = 0.01
+    threshold_metric: str = "f1"
+    threshold_start: float = 0.2
+    threshold_end: float = 0.8
+    threshold_step: float = 0.02
     small_mask_ratio_max: float = 0.01
     medium_mask_ratio_max: float = 0.05
     compute_foreground_ratio: bool = True
@@ -219,15 +219,15 @@ class TrainConfig:
     bce_weight: float = 1.0
     focal_gamma: float = 2.0
     focal_alpha: float = 0.25
-    tversky_weight: float = 0.1
+    tversky_weight: float = 0.0
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.8
-    lovasz_weight: float = 0.15
+    lovasz_weight: float = 0.0
     use_boundary_loss: bool = False
     boundary_weight: float = 0.05
     ema_enabled: bool = True
     ema_decay: float = 0.999
-    hard_mining_enabled: bool = True
+    hard_mining_enabled: bool = False
     hard_mining_start_epoch: int = 5
     hard_mining_weight: float = 0.03
     hard_mining_gamma: float = 2.0
@@ -308,7 +308,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument(
         "--balance-real-fake",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Enable weighted sampling to match a target fake-positive ratio in train batches",
     )
     parser.add_argument(
@@ -369,13 +369,13 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducibility")
     parser.add_argument("--early-stopping-patience", type=int, default=12, help="Stop after N validations without improvement; <=0 disables")
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4, help="Minimum monitored-metric improvement to reset early stopping")
-    parser.add_argument("--early-stopping-monitor", type=str, default="iou", choices=["iou", "dice", "recall", "precision", "accuracy", "loss"], help="Validation metric used for early stopping and best checkpoint")
+    parser.add_argument("--early-stopping-monitor", type=str, default="f1", choices=["iou", "dice", "f1", "recall", "precision", "accuracy", "loss"], help="Validation metric used for early stopping and best checkpoint")
     parser.add_argument("--metric-threshold", type=float, default=0.5, help="Fixed threshold for sigmoid outputs when threshold optimization is disabled")
     parser.add_argument("--optimize-threshold", action=argparse.BooleanOptionalAction, default=True, help="Search validation thresholds and use the best for metric reporting")
-    parser.add_argument("--threshold-metric", type=str, default="dice", choices=["iou", "dice"], help="Metric used to select best threshold")
-    parser.add_argument("--threshold-start", type=float, default=0.35, help="Threshold search range start")
-    parser.add_argument("--threshold-end", type=float, default=0.75, help="Threshold search range end")
-    parser.add_argument("--threshold-step", type=float, default=0.01, help="Threshold search step size")
+    parser.add_argument("--threshold-metric", type=str, default="f1", choices=["iou", "dice", "f1"], help="Metric used to select best threshold")
+    parser.add_argument("--threshold-start", type=float, default=0.2, help="Threshold search range start")
+    parser.add_argument("--threshold-end", type=float, default=0.8, help="Threshold search range end")
+    parser.add_argument("--threshold-step", type=float, default=0.02, help="Threshold search step size")
     parser.add_argument("--small-mask-ratio-max", type=float, default=0.01, help="Upper foreground-ratio bound for small-mask validation bin")
     parser.add_argument("--medium-mask-ratio-max", type=float, default=0.05, help="Upper foreground-ratio bound for medium-mask validation bin")
     parser.add_argument("--compute-foreground-ratio", action=argparse.BooleanOptionalAction, default=True, help="Compute foreground pixel ratio from train loader")
@@ -405,15 +405,15 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--bce-weight", type=float, default=1.0, help="BCE/Focal term weight in hybrid loss")
     parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (used when loss-hybrid-mode=dice_focal)")
     parser.add_argument("--focal-alpha", type=float, default=0.25, help="Focal loss alpha (used when loss-hybrid-mode=dice_focal)")
-    parser.add_argument("--tversky-weight", type=float, default=0.1, help="Optional Tversky loss weight to improve recall")
+    parser.add_argument("--tversky-weight", type=float, default=0.0, help="Optional Tversky loss weight to improve recall")
     parser.add_argument("--tversky-alpha", type=float, default=0.3, help="Tversky alpha (FP penalty)")
     parser.add_argument("--tversky-beta", type=float, default=0.8, help="Tversky beta (FN penalty)")
-    parser.add_argument("--lovasz-weight", type=float, default=0.15, help="Lovasz Hinge Loss weight for IoU optimization")
+    parser.add_argument("--lovasz-weight", type=float, default=0.0, help="Lovasz Hinge Loss weight for IoU optimization")
     parser.add_argument("--use-boundary-loss", action=argparse.BooleanOptionalAction, default=False, help="Enable Sobel boundary loss on final prediction")
     parser.add_argument("--boundary-weight", type=float, default=0.05, help="Boundary loss weight when --use-boundary-loss is enabled")
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=True, help="Use EMA weights for validation and best checkpoints")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay factor")
-    parser.add_argument("--hard-mining-enabled", action=argparse.BooleanOptionalAction, default=True, help="Enable low-IoU hard-example weighting")
+    parser.add_argument("--hard-mining-enabled", action=argparse.BooleanOptionalAction, default=False, help="Enable low-IoU hard-example weighting")
     parser.add_argument("--hard-mining-start-epoch", type=int, default=5, help="Epoch to start hard-example weighting")
     parser.add_argument("--hard-mining-weight", type=float, default=0.03, help="Weight of hard-example auxiliary loss")
     parser.add_argument("--hard-mining-gamma", type=float, default=2.0, help="Scale for low-IoU hard-example weights")
@@ -704,6 +704,7 @@ def _metrics_from_counts(tp: float, tn: float, fp: float, fn: float, eps: float 
     dice = (2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)
     precision = (tp + eps) / (tp + fp + eps)
     recall = (tp + eps) / (tp + fn + eps)
+    f1 = (2.0 * precision * recall) / (precision + recall + eps)
     accuracy = (tp + tn + eps) / (tp + tn + fp + fn + eps)
 
     return {
@@ -711,6 +712,7 @@ def _metrics_from_counts(tp: float, tn: float, fp: float, fn: float, eps: float 
         "iou": float(iou),
         "precision": float(precision),
         "recall": float(recall),
+        "f1": float(f1),
         "accuracy": float(accuracy),
     }
 
@@ -748,7 +750,7 @@ def _select_threshold_with_precision_guard(
     if not scored_thresholds:
         raise ValueError("No scored thresholds provided")
 
-    metric_key = optimize_key if optimize_key in {"iou", "dice"} else "iou"
+    metric_key = optimize_key if optimize_key in {"iou", "dice", "f1"} else "f1"
     baseline_threshold, baseline_metrics = max(scored_thresholds, key=lambda item: item[1][metric_key])
     baseline_metric = float(baseline_metrics[metric_key])
 
@@ -1199,6 +1201,7 @@ def _write_best_threshold_metadata(
         "monitor_value": float(monitor_value),
         "val_iou": float(metrics.get("iou")) if metrics.get("iou") is not None else None,
         "val_dice": float(metrics.get("dice")) if metrics.get("dice") is not None else None,
+        "val_f1": float(metrics.get("f1")) if metrics.get("f1") is not None else None,
         "val_precision": float(metrics.get("precision")) if metrics.get("precision") is not None else None,
         "val_recall": float(metrics.get("recall")) if metrics.get("recall") is not None else None,
         "val_accuracy": float(metrics.get("accuracy")) if metrics.get("accuracy") is not None else None,
@@ -1654,8 +1657,8 @@ def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: T
             threshold_stats[float(threshold)]["fn"] += counts["fn"]
 
     optimize_key = cfg.threshold_metric.lower()
-    if optimize_key not in {"iou", "dice"}:
-        optimize_key = "iou"
+    if optimize_key not in {"iou", "dice", "f1"}:
+        optimize_key = "f1"
 
     scored_thresholds: list[tuple[float, dict]] = []
     for threshold in thresholds:
@@ -1671,6 +1674,7 @@ def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: T
         "iou": float(best_metrics["iou"]),
         "precision": float(best_metrics["precision"]),
         "recall": float(best_metrics["recall"]),
+        "f1": float(best_metrics["f1"]),
         "accuracy": float(best_metrics["accuracy"]),
     }
 
@@ -1758,8 +1762,8 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         progress.set_postfix(loss=f"{(total_loss / max(1, batches)):.4f}", step=f"{batches:05d}")
 
     optimize_key = cfg.threshold_metric.lower()
-    if optimize_key not in {"iou", "dice"}:
-        optimize_key = "iou"
+    if optimize_key not in {"iou", "dice", "f1"}:
+        optimize_key = "f1"
 
     scored_thresholds: list[tuple[float, dict]] = []
     for threshold in thresholds:
@@ -1788,6 +1792,7 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         "iou": float(best_metrics["iou"]),
         "precision": float(best_metrics["precision"]),
         "recall": float(best_metrics["recall"]),
+        "f1": float(best_metrics["f1"]),
         "accuracy": float(best_metrics["accuracy"]),
         "threshold": float(best_threshold),
         "threshold_metric": optimize_key,
@@ -2077,6 +2082,7 @@ def run_training(cfg: TrainConfig) -> None:
         val_loss = None
         val_dice = None
         val_iou = None
+        val_f1 = None
         val_precision = None
         val_recall = None
         val_accuracy = None
@@ -2088,6 +2094,7 @@ def run_training(cfg: TrainConfig) -> None:
             val_loss = float(metrics["loss"])
             val_dice = float(metrics["dice"])
             val_iou = float(metrics["iou"])
+            val_f1 = float(metrics["f1"])
             val_precision = float(metrics["precision"])
             val_recall = float(metrics["recall"])
             val_accuracy = float(metrics["accuracy"])
@@ -2095,7 +2102,7 @@ def run_training(cfg: TrainConfig) -> None:
             val_size_bins = metrics.get("size_bins")
             print(
                 f"Val | loss {val_loss:.4f} | dice {val_dice:.4f} | iou {val_iou:.4f} "
-                f"| precision {val_precision:.4f} | recall {val_recall:.4f} | accuracy {val_accuracy:.4f} "
+                f"| f1 {val_f1:.4f} | precision {val_precision:.4f} | recall {val_recall:.4f} | accuracy {val_accuracy:.4f} "
                 f"| threshold {val_threshold:.2f}"
             )
             if isinstance(val_size_bins, dict):
@@ -2200,6 +2207,7 @@ def run_training(cfg: TrainConfig) -> None:
                     "val_loss": val_loss,
                     "val_dice": val_dice,
                     "val_iou": val_iou,
+                    "val_f1": val_f1,
                     "val_precision": val_precision,
                     "val_recall": val_recall,
                     "val_accuracy": val_accuracy,
