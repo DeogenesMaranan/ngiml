@@ -29,7 +29,7 @@ def test_default_components_use_shared_augmentation_defaults():
 
     assert default_aug.enable is True
     assert default_aug.views_per_sample == 2
-    assert default_aug.max_rotation_degrees == 4.0
-    assert default_aug.crop_scale_range == (0.8, 1.0)
-    assert default_aug.noise_std_range == (0.0, 0.01)
+    assert default_aug.max_rotation_degrees == 6.0
+    assert default_aug.crop_scale_range == (0.75, 1.0)
+    assert default_aug.noise_std_range == (0.0, 0.012)
     assert per_dataset_aug == {}

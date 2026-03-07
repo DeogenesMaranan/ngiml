@@ -286,10 +286,10 @@ def build_default_components():
         views_per_sample=2,
         enable_flips=True,
         enable_rotations=True,
-        max_rotation_degrees=4.0,
+        max_rotation_degrees=6.0,
         enable_random_crop=True,
-        crop_scale_range=(0.8, 1.0),
-        object_crop_bias_prob=0.8,
+        crop_scale_range=(0.75, 1.0),
+        object_crop_bias_prob=0.85,
         min_fg_pixels_for_object_crop=8,
         multiscale_training=False,
         multiscale_short_side_range=(384, 640),
@@ -301,7 +301,7 @@ def build_default_components():
         brightness_jitter_factors=(0.9, 1.1),
         contrast_jitter_factors=(0.9, 1.1),
         enable_noise=True,
-        noise_std_range=(0.0, 0.01),
+        noise_std_range=(0.0, 0.012),
     )
 
     per_dataset_aug = {}
@@ -349,7 +349,7 @@ def build_training_config(
         "persistent_workers": False,
         "drop_last": True,
         "views_per_sample": 2,
-        "max_rotation_degrees": 5.0,
+        "max_rotation_degrees": 6.0,
         "noise_std_max": 0.012,
         "disable_aug": False,
         "max_short_side": 480,
