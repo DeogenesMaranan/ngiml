@@ -155,10 +155,20 @@ class MultiStageManipulationLoss(nn.Module):
             raise ValueError("Provided stage_weights shorter than number of stages")
         return list(self.cfg.stage_weights[:num_stages])
 
-    def forward(self, preds: List[Tensor], target: Tensor) -> Tensor:
+    def forward(
+        self,
+        preds: List[Tensor],
+        target: Tensor,
+        edge_target: Tensor | None = None,
+        edge_target_present: Tensor | None = None,
+    ) -> Tensor:
         if not preds:
             raise ValueError("Loss received empty predictions list")
         target = target.float()
+        if edge_target is not None:
+            edge_target = edge_target.float()
+        if edge_target_present is not None:
+            edge_target_present = edge_target_present.to(device=target.device, dtype=torch.bool).view(-1)
         stage_weights = self._stage_weights(len(preds))
         pos_weight = torch.as_tensor(
             self.cfg.pos_weight,
@@ -208,7 +218,12 @@ class MultiStageManipulationLoss(nn.Module):
 
         # Add boundary loss on final prediction
         if self.use_boundary_loss and self.boundary_loss is not None and preds:
-            boundary = self.boundary_loss(preds[-1], target)
+            boundary = self.boundary_loss(
+                preds[-1],
+                target,
+                edge_target=edge_target,
+                edge_target_present=edge_target_present,
+            )
             total_loss += self.boundary_weight * boundary
 
         return total_loss / max(normalizer, 1e-6)
@@ -226,9 +241,17 @@ class SobelBoundaryLoss(nn.Module):
         self.register_buffer('sobel_x', sobel_x)
         self.register_buffer('sobel_y', sobel_y)
 
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+    def forward(
+        self,
+        pred: Tensor,
+        target: Tensor,
+        edge_target: Tensor | None = None,
+        edge_target_present: Tensor | None = None,
+    ) -> Tensor:
         pred = torch.sigmoid(pred)
         target = target.float()
+        if edge_target is not None:
+            edge_target = edge_target.float()
         # Ensure sobel kernels match input dtype/device to avoid type-mismatch
         # errors when using mixed precision (e.g., fp16/bf16).
         sobel_x = self.sobel_x.to(dtype=pred.dtype, device=pred.device)
@@ -240,6 +263,16 @@ class SobelBoundaryLoss(nn.Module):
         grad_target_y = F.conv2d(target, sobel_y, padding=1)
         grad_pred = torch.sqrt(grad_pred_x ** 2 + grad_pred_y ** 2 + 1e-6)
         grad_target = torch.sqrt(grad_target_x ** 2 + grad_target_y ** 2 + 1e-6)
+        if edge_target is not None:
+            explicit_edge = edge_target.to(dtype=pred.dtype, device=pred.device)
+            if explicit_edge.shape[-2:] != grad_target.shape[-2:]:
+                explicit_edge = F.interpolate(explicit_edge, size=grad_target.shape[-2:], mode="nearest")
+            explicit_edge = explicit_edge.clamp(0.0, 1.0)
+            if edge_target_present is None:
+                grad_target = explicit_edge
+            else:
+                present = edge_target_present.to(device=pred.device, dtype=pred.dtype).view(-1, 1, 1, 1)
+                grad_target = present * explicit_edge + (1.0 - present) * grad_target
         return F.l1_loss(grad_pred, grad_target)
 
 __all__ = [

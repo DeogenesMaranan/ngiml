@@ -58,6 +58,7 @@ def build_manifest_from_prepared(prepared_root: Path, manifest_out: Path | None 
                         mask_path=None,
                         label=label,
                         high_pass_path=None,
+                        edge_mask_path=None,
                     )
                 )
 
@@ -79,6 +80,7 @@ def build_manifest_from_prepared(prepared_root: Path, manifest_out: Path | None 
                                 mask_path=None,
                                 label=label,
                                 high_pass_path=None,
+                                edge_mask_path=None,
                             )
                         )
 

@@ -9,6 +9,7 @@ save checkpoints plus a copy of the training arguments inside the output dir.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import io
 import json
 import random
@@ -199,6 +200,12 @@ class TrainConfig:
     early_stopping_patience: int = 12
     early_stopping_min_delta: float = 1e-4
     early_stopping_monitor: str = "f1"
+    training_phase: str = "phase1"
+    auto_phase2_enabled: bool = False
+    auto_phase2_patience: int = 5
+    auto_phase2_lr_scale: float = 0.33
+    auto_phase2_tversky_weight: float = 0.1
+    auto_phase2_monitor: str = "iou"
     metric_threshold: float = 0.5
     optimize_threshold: bool = True
     threshold_metric: str = "f1"
@@ -212,7 +219,7 @@ class TrainConfig:
     short_side_probe_samples: int = 128
     auto_pos_weight: bool = True
     pos_weight_min: float = 0.5
-    pos_weight_max: float = 20.0
+    pos_weight_max: float = 10.0
     balanced_pos_weight_cap: float = 3.0
     loss_hybrid_mode: str = "dice_bce"
     dice_weight: float = 1.0
@@ -370,6 +377,12 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--early-stopping-patience", type=int, default=12, help="Stop after N validations without improvement; <=0 disables")
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4, help="Minimum monitored-metric improvement to reset early stopping")
     parser.add_argument("--early-stopping-monitor", type=str, default="f1", choices=["iou", "dice", "f1", "recall", "precision", "accuracy", "loss"], help="Validation metric used for early stopping and best checkpoint")
+    parser.add_argument("--training-phase", type=str, default="phase1", choices=["phase1", "phase2"], help="Training phase label stored in checkpoints and logs")
+    parser.add_argument("--auto-phase2-enabled", action=argparse.BooleanOptionalAction, default=False, help="Automatically switch to phase 2 from the best IoU checkpoint after a phase-1 plateau")
+    parser.add_argument("--auto-phase2-patience", type=int, default=5, help="Validations without improvement before auto phase-2 triggers during phase 1")
+    parser.add_argument("--auto-phase2-lr-scale", type=float, default=0.33, help="LR multiplier applied when auto phase-2 activates")
+    parser.add_argument("--auto-phase2-tversky-weight", type=float, default=0.1, help="Tversky loss weight applied during auto phase-2")
+    parser.add_argument("--auto-phase2-monitor", type=str, default="iou", choices=["iou", "f1", "dice"], help="Validation metric used for auto phase-2 monitoring and threshold selection")
     parser.add_argument("--metric-threshold", type=float, default=0.5, help="Fixed threshold for sigmoid outputs when threshold optimization is disabled")
     parser.add_argument("--optimize-threshold", action=argparse.BooleanOptionalAction, default=True, help="Search validation thresholds and use the best for metric reporting")
     parser.add_argument("--threshold-metric", type=str, default="f1", choices=["iou", "dice", "f1"], help="Metric used to select best threshold")
@@ -393,7 +406,7 @@ def parse_args() -> TrainConfig:
     )
     parser.add_argument("--auto-pos-weight", action=argparse.BooleanOptionalAction, default=True, help="Auto-compute BCE pos_weight from foreground ratio")
     parser.add_argument("--pos-weight-min", type=float, default=0.5, help="Lower clamp for auto pos_weight")
-    parser.add_argument("--pos-weight-max", type=float, default=20.0, help="Upper clamp for auto pos_weight")
+    parser.add_argument("--pos-weight-max", type=float, default=10.0, help="Upper clamp for auto pos_weight")
     parser.add_argument(
         "--balanced-pos-weight-cap",
         type=float,
@@ -463,6 +476,12 @@ def parse_args() -> TrainConfig:
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
         early_stopping_monitor=args.early_stopping_monitor,
+        training_phase=args.training_phase,
+        auto_phase2_enabled=args.auto_phase2_enabled,
+        auto_phase2_patience=max(1, int(args.auto_phase2_patience)),
+        auto_phase2_lr_scale=float(args.auto_phase2_lr_scale),
+        auto_phase2_tversky_weight=float(args.auto_phase2_tversky_weight),
+        auto_phase2_monitor=args.auto_phase2_monitor,
         metric_threshold=args.metric_threshold,
         optimize_threshold=args.optimize_threshold,
         threshold_metric=args.threshold_metric,
@@ -921,6 +940,56 @@ def _metric_for_monitor(metrics: dict, monitor: str) -> float:
     return float(metrics[key])
 
 
+def _scale_optimizer_and_scheduler_for_phase2(
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
+    lr_scale: float,
+) -> None:
+    scale = float(lr_scale)
+    if scale <= 0.0:
+        raise ValueError("phase-2 lr_scale must be > 0")
+
+    for group in optimizer.param_groups:
+        group["lr"] = float(group["lr"]) * scale
+        if "initial_lr" in group:
+            group["initial_lr"] = float(group["initial_lr"]) * scale
+
+    if scheduler is not None:
+        if hasattr(scheduler, "base_lrs"):
+            scheduler.base_lrs = [float(lr) * scale for lr in scheduler.base_lrs]
+        if hasattr(scheduler, "_last_lr") and getattr(scheduler, "_last_lr") is not None:
+            scheduler._last_lr = [float(lr) * scale for lr in scheduler._last_lr]
+
+
+def _build_phase2_config(cfg: TrainConfig, best_iou_path: Path) -> TrainConfig:
+    phase2_metric = str(cfg.auto_phase2_monitor).strip().lower()
+    if phase2_metric not in {"iou", "f1", "dice"}:
+        phase2_metric = "iou"
+
+    phase2_model_cfg = deepcopy(cfg.model_config) if cfg.model_config is not None else None
+    optimizer_cfg = getattr(phase2_model_cfg, "optimizer", None) if phase2_model_cfg is not None else None
+    if optimizer_cfg is not None:
+        for group_name in ("efficientnet", "swin", "residual", "fusion", "decoder"):
+            group = getattr(optimizer_cfg, group_name, None)
+            if group is None:
+                continue
+            group.lr = float(group.lr) * float(cfg.auto_phase2_lr_scale)
+
+    return replace(
+        cfg,
+        training_phase="phase2",
+        resume=str(best_iou_path),
+        auto_resume=False,
+        warmup_epochs=0,
+        early_stopping_monitor=phase2_metric,
+        threshold_metric=phase2_metric,
+        tversky_weight=float(cfg.auto_phase2_tversky_weight),
+        lovasz_weight=0.0,
+        hard_mining_enabled=False,
+        model_config=phase2_model_cfg,
+    )
+
+
 def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
     for module_name in ("efficientnet", "swin"):
         module = getattr(model, module_name, None)
@@ -930,12 +999,13 @@ def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
             param.requires_grad = bool(trainable)
 
 
-def _sample_has_mask_high_pass(record) -> tuple[bool, bool]:
+def _sample_has_mask_high_pass_edge(record) -> tuple[bool, bool, bool]:
     has_mask = bool(record.mask_path)
     has_high_pass = bool(record.high_pass_path)
+    has_edge_mask = bool(getattr(record, "edge_mask_path", None))
     image_path = str(record.image_path)
     if not image_path.endswith(".npz"):
-        return has_mask, has_high_pass
+        return has_mask, has_high_pass, has_edge_mask
 
     try:
         if "::" in image_path:
@@ -947,14 +1017,16 @@ def _sample_has_mask_high_pass(record) -> tuple[bool, bool]:
                 with np.load(io.BytesIO(member.read()), allow_pickle=False) as npz_data:
                     has_mask = has_mask or ("mask" in npz_data and npz_data["mask"].size > 0)
                     has_high_pass = has_high_pass or ("high_pass" in npz_data and npz_data["high_pass"].size > 0)
+                    has_edge_mask = has_edge_mask or ("edge_mask" in npz_data and npz_data["edge_mask"].size > 0)
         else:
             with np.load(image_path, allow_pickle=False) as npz_data:
                 has_mask = has_mask or ("mask" in npz_data and npz_data["mask"].size > 0)
                 has_high_pass = has_high_pass or ("high_pass" in npz_data and npz_data["high_pass"].size > 0)
+                has_edge_mask = has_edge_mask or ("edge_mask" in npz_data and npz_data["edge_mask"].size > 0)
     except Exception as exc:
         raise ValueError(f"Failed to inspect NPZ sample for mask/high_pass fields: {image_path}") from exc
 
-    return has_mask, has_high_pass
+    return has_mask, has_high_pass, has_edge_mask
 
 
 def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
@@ -968,6 +1040,7 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
     fake_count = 0
     mask_count = 0
     high_pass_count = 0
+    edge_mask_count = 0
 
     for sample in train_samples:
         per_dataset_counts[sample.dataset] = per_dataset_counts.get(sample.dataset, 0) + 1
@@ -979,11 +1052,13 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
         else:
             raise ValueError(f"Unexpected train label {label} for sample: {sample.image_path}")
 
-        has_mask, has_high_pass = _sample_has_mask_high_pass(sample)
+        has_mask, has_high_pass, has_edge_mask = _sample_has_mask_high_pass_edge(sample)
         if has_mask:
             mask_count += 1
         if has_high_pass:
             high_pass_count += 1
+        if has_edge_mask:
+            edge_mask_count += 1
 
     total = len(train_samples)
     print("Train dataset integrity summary")
@@ -1001,7 +1076,8 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
     print(
         "  Coverage: "
         f"masks={100.0 * (mask_count / max(total, 1)):.1f}% "
-        f"high_pass={100.0 * (high_pass_count / max(total, 1)):.1f}%"
+        f"high_pass={100.0 * (high_pass_count / max(total, 1)):.1f}% "
+        f"edge_masks={100.0 * (edge_mask_count / max(total, 1)):.1f}%"
     )
 
     if fake_count <= 0:
@@ -1446,10 +1522,16 @@ def train_one_epoch(
         batch_start = time.perf_counter()
         images = batch["images"]
         masks = batch["masks"]
+        edge_masks = batch.get("edge_masks")
+        edge_mask_present = batch.get("edge_mask_present")
         if images.device != device:
             images = images.to(device, non_blocking=True)
         if masks.device != device:
             masks = masks.to(device, non_blocking=True)
+        if isinstance(edge_masks, torch.Tensor) and edge_masks.device != device:
+            edge_masks = edge_masks.to(device, non_blocking=True)
+        if isinstance(edge_mask_present, torch.Tensor) and edge_mask_present.device != device:
+            edge_mask_present = edge_mask_present.to(device, non_blocking=True)
         high_pass = batch.get("high_pass")
         if isinstance(high_pass, torch.Tensor):
             if high_pass.device != device:
@@ -1503,12 +1585,18 @@ def train_one_epoch(
                     # Slice the batch and apply batched augmentations
                     img_slice = images[idxs]
                     mask_slice = masks[idxs]
+                    edge_mask_slice = edge_masks[idxs] if isinstance(edge_masks, torch.Tensor) else None
                     hp_slice = None
                     if high_pass is not None:
                         hp_slice = high_pass[idxs]
 
-                    img_out, mask_out, hp_out = _apply_gpu_augmentations_batch(
-                        img_slice, mask_slice, aug_cfg, high_pass=hp_slice, generator=gen
+                    img_out, mask_out, hp_out, edge_mask_out = _apply_gpu_augmentations_batch(
+                        img_slice,
+                        mask_slice,
+                        aug_cfg,
+                        high_pass=hp_slice,
+                        edge_masks=edge_mask_slice,
+                        generator=gen,
                     )
 
                     # Apply normalization to the augmented slice
@@ -1521,6 +1609,8 @@ def train_one_epoch(
                     masks[idxs] = mask_out
                     if hp_out is not None and high_pass is not None:
                         high_pass[idxs] = hp_out
+                    if edge_mask_out is not None and isinstance(edge_masks, torch.Tensor):
+                        edge_masks[idxs] = edge_mask_out
             aug_end = time.perf_counter()
         else:
             aug_end = None
@@ -1540,12 +1630,12 @@ def train_one_epoch(
             forward_start = time.perf_counter()
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
-                loss = loss_fn(preds, masks)
+                loss = loss_fn(preds, masks, edge_target=edge_masks, edge_target_present=edge_mask_present)
             forward_end = time.perf_counter()
         else:
             forward_start = time.perf_counter()
             preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
-            loss = loss_fn(preds, masks)
+            loss = loss_fn(preds, masks, edge_target=edge_masks, edge_target_present=edge_mask_present)
             forward_end = time.perf_counter()
 
         if cfg.hard_mining_enabled and epoch >= int(max(0, cfg.hard_mining_start_epoch)):
@@ -1698,6 +1788,16 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
     for batch in progress:
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
+        edge_masks = batch.get("edge_masks")
+        if isinstance(edge_masks, torch.Tensor):
+            edge_masks = edge_masks.to(device, non_blocking=True)
+        else:
+            edge_masks = None
+        edge_mask_present = batch.get("edge_mask_present")
+        if isinstance(edge_mask_present, torch.Tensor):
+            edge_mask_present = edge_mask_present.to(device, non_blocking=True)
+        else:
+            edge_mask_present = None
         high_pass = batch.get("high_pass")
         if isinstance(high_pass, torch.Tensor):
             high_pass = high_pass.to(device, non_blocking=True)
@@ -1721,10 +1821,10 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         if amp_dtype is not None:
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
-                loss = loss_fn(preds, masks)
+                loss = loss_fn(preds, masks, edge_target=edge_masks, edge_target_present=edge_mask_present)
         else:
             preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
-            loss = loss_fn(preds, masks)
+            loss = loss_fn(preds, masks, edge_target=edge_masks, edge_target_present=edge_mask_present)
         logits = preds[-1]
 
         with torch.no_grad():
@@ -1993,6 +2093,7 @@ def run_training(cfg: TrainConfig) -> None:
     no_improve_epochs = 0
     early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
     best_threshold_path = checkpoint_dir / "best_threshold.json"
+    auto_phase2_triggered = str(getattr(cfg, "training_phase", "phase1")).strip().lower() == "phase2"
 
     freeze_backbone_epochs = int(max(0, getattr(model_cfg.optimizer, "freeze_backbone_epochs", 0)))
     backbone_was_frozen = False
@@ -2218,6 +2319,51 @@ def run_training(cfg: TrainConfig) -> None:
                 },
             )
             print(f"Saved checkpoint to {ckpt_path}")
+
+        auto_phase2_ready = (
+            "val" in loaders
+            and not auto_phase2_triggered
+            and bool(getattr(cfg, "auto_phase2_enabled", False))
+            and str(getattr(cfg, "training_phase", "phase1")).strip().lower() == "phase1"
+            and (epoch + 1) % cfg.val_every == 0
+            and no_improve_epochs >= max(1, int(getattr(cfg, "auto_phase2_patience", 0)))
+        )
+        if auto_phase2_ready:
+            best_iou_path = checkpoint_dir / "best_iou_checkpoint.pt"
+            if best_iou_path.is_file():
+                auto_phase2_triggered = True
+                cfg = _build_phase2_config(cfg, best_iou_path)
+                load_checkpoint(
+                    best_iou_path,
+                    model,
+                    optimizer,
+                    scaler,
+                    device,
+                    scheduler=scheduler,
+                    ema_model=ema_model,
+                )
+                _scale_optimizer_and_scheduler_for_phase2(
+                    optimizer,
+                    scheduler,
+                    cfg.auto_phase2_lr_scale,
+                )
+                no_improve_epochs = 0
+                if cfg.early_stopping_monitor == "iou":
+                    best_monitor_value = best_val_iou
+                else:
+                    best_monitor_value = float("-inf")
+                early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
+                print(
+                    "Auto phase-2 triggered | "
+                    f"resume={best_iou_path} | monitor={cfg.early_stopping_monitor} | "
+                    f"threshold_metric={cfg.threshold_metric} | lr_scale={cfg.auto_phase2_lr_scale:.3f} | "
+                    f"tversky_weight={cfg.tversky_weight:.3f}"
+                )
+                continue
+            print(
+                "Auto phase-2 wanted to trigger, but no best_iou_checkpoint.pt was found; "
+                "continuing with normal early stopping"
+            )
 
         if early_stopping_enabled and "val" in loaders and (epoch + 1) % cfg.val_every == 0:
             if no_improve_epochs >= cfg.early_stopping_patience:

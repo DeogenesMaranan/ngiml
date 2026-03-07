@@ -158,21 +158,27 @@ def _split_records(records: Sequence[SampleRecord], split_cfg: SplitConfig) -> D
 def _build_npz_bytes(
     image_path: Path,
     mask_path: Path | None,
+    edge_mask_path: Path | None,
     target_size: int,
     include_high_pass: bool = True,
 ) -> bytes:
     image = Image.open(image_path).convert("RGB")
     mask_img = Image.open(mask_path).convert("L") if mask_path is not None else None
+    edge_mask_img = Image.open(edge_mask_path).convert("L") if edge_mask_path is not None else None
 
     if target_size > 0:
         image = image.resize((target_size, target_size), Image.BILINEAR)
         if mask_img is not None:
             mask_img = mask_img.resize((target_size, target_size), Image.NEAREST)
+        if edge_mask_img is not None:
+            edge_mask_img = edge_mask_img.resize((target_size, target_size), Image.NEAREST)
 
     image_np = np.array(image, dtype=np.uint8)
     payload = {"image": image_np}
     if mask_img is not None:
         payload["mask"] = np.array(mask_img, dtype=np.uint8)
+    if edge_mask_img is not None:
+        payload["edge_mask"] = np.array(edge_mask_img, dtype=np.uint8)
     if include_high_pass:
         payload["high_pass"] = _compute_high_pass(image_np)
 
@@ -194,6 +200,7 @@ def prepare_single_dataset(
     real_dir = root / cfg.real_subdir
     fake_dir = root / cfg.fake_subdir
     mask_dir = root / cfg.mask_subdir
+    edge_mask_dir = root / cfg.edge_mask_subdir if cfg.edge_mask_subdir else mask_dir
 
     real_images = _discover_images(real_dir) if real_dir.exists() else []
     fake_images = _discover_images(fake_dir) if fake_dir.exists() else []
@@ -216,6 +223,9 @@ def prepare_single_dataset(
         if mask_path is None:
             print(f"Skipping fake image without mask: {fake_img}", file=sys.stderr)
             continue
+        edge_mask_path = None
+        if cfg.edge_mask_suffix:
+            edge_mask_path = _find_mask(fake_img, edge_mask_dir, cfg.edge_mask_suffix)
         records.append(
             SampleRecord(
                 dataset=cfg.dataset_name,
@@ -223,6 +233,7 @@ def prepare_single_dataset(
                 image_path=str(fake_img),
                 mask_path=str(mask_path),
                 label=1,
+                edge_mask_path=str(edge_mask_path) if edge_mask_path is not None else None,
             )
         )
 
@@ -239,9 +250,11 @@ def prepare_single_dataset(
         for idx, rec in enumerate(tqdm(split_records, desc=f"{cfg.dataset_name} {split_name}", leave=False)):
             image_path = Path(rec.image_path)
             mask_path = Path(rec.mask_path) if rec.mask_path is not None else None
+            edge_mask_path = Path(rec.edge_mask_path) if rec.edge_mask_path is not None else None
             npz_bytes = _build_npz_bytes(
                 image_path=image_path,
                 mask_path=mask_path,
+                edge_mask_path=edge_mask_path,
                 target_size=target_size,
                 include_high_pass=prep_cfg.enable_high_pass,
             )
@@ -265,6 +278,7 @@ def prepare_single_dataset(
                     mask_path=None,
                     label=rec.label,
                     high_pass_path=None,
+                    edge_mask_path=None,
                 )
             )
 
@@ -342,7 +356,7 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
         "Columbia": SplitConfig(train=0.0, val=0.0, test=1.0, seed=shared_seed),
     }
 
-    prep_cfg = PreparationConfig(target_sizes=(320,), normalization_mode="imagenet", tar_shard_size=500)
+    prep_cfg = PreparationConfig(target_sizes=(384,), normalization_mode="imagenet", tar_shard_size=500)
 
     return datasets, per_dataset_splits, prep_cfg
 

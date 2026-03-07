@@ -250,7 +250,7 @@ def build_default_components():
 
     model_cfg = HybridNGIMLConfig(
         efficientnet=EfficientNetBackboneConfig(pretrained=True),
-        swin=SwinBackboneConfig(model_name="swin_tiny_patch4_window7_224", pretrained=True, input_size=320),
+        swin=SwinBackboneConfig(model_name="swin_tiny_patch4_window7_224", pretrained=True, input_size=384),
         residual=ResidualNoiseConfig(num_kernels=3, base_channels=32, num_stages=4),
         fusion=FeatureFusionConfig(fusion_channels=(64, 128, 192, 256)),
         decoder=UNetDecoderConfig(decoder_channels=None, out_channels=1, per_stage_heads=True),
@@ -277,8 +277,8 @@ def build_default_components():
         tversky_alpha=0.3,
         tversky_beta=0.8,
         lovasz_weight=0.0,
-        use_boundary_loss=False,
-        boundary_weight=0.05,
+        use_boundary_loss=True,
+        boundary_weight=0.03,
     )
 
     default_aug = AugmentationConfig(
@@ -382,6 +382,12 @@ def build_training_config(
         "warmup_epochs": 3,
         "early_stopping_patience": 12,
         "early_stopping_min_delta": 1e-4,
+        "training_phase": "phase1",
+        "auto_phase2_enabled": True,
+        "auto_phase2_patience": 5,
+        "auto_phase2_lr_scale": 0.33,
+        "auto_phase2_tversky_weight": 0.1,
+        "auto_phase2_monitor": "iou",
         "metric_threshold": 0.5,
         "optimize_threshold": True,
         "threshold_metric": "f1",
@@ -393,7 +399,7 @@ def build_training_config(
         "short_side_probe_samples": 0,
         "auto_pos_weight": True,
         "pos_weight_min": 0.5,
-        "pos_weight_max": 20.0,
+        "pos_weight_max": 10.0,
         "balanced_pos_weight_cap": 3.0,
         "loss_hybrid_mode": effective_hybrid_mode,
         "dice_weight": effective_dice_weight,
@@ -448,6 +454,8 @@ def apply_phase2_resume_preset(
         {
             "resume": str(resume_checkpoint),
             "auto_resume": False,
+            "training_phase": "phase2",
+            "auto_phase2_enabled": False,
             "warmup_epochs": 0,
             "early_stopping_monitor": metric,
             "threshold_metric": metric,

@@ -79,6 +79,12 @@ def _load_mask(mask_path: str | None, target_hw: Sequence[int]) -> torch.Tensor:
     return mask
 
 
+def _load_optional_mask(mask_path: str | None, target_hw: Sequence[int]) -> torch.Tensor | None:
+    if mask_path is None:
+        return None
+    return _load_mask(mask_path, target_hw)
+
+
 def _safe_scale_to_unit_float32(tensor: torch.Tensor) -> torch.Tensor:
     source_dtype = tensor.dtype
     tensor = tensor.float()
@@ -100,7 +106,9 @@ def _compute_high_pass_fallback(image: torch.Tensor) -> torch.Tensor:
     return high_pass.repeat(3, 1, 1).to(dtype=torch.float32)
 
 
-def _load_from_npz(path: str | io.BytesIO) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+def _load_from_npz(
+    path: str | io.BytesIO,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     global _MISSING_HIGH_PASS_WARNED
     with np.load(path, allow_pickle=False) as data:
         image_np = data["image"]
@@ -135,6 +143,22 @@ def _load_from_npz(path: str | io.BytesIO) -> tuple[torch.Tensor, torch.Tensor |
                 mask = mask / 255.0
             mask = mask.float()
 
+        edge_mask = None
+        if "edge_mask" in data:
+            edge_mask_np = data["edge_mask"]
+            edge_mask = torch.from_numpy(edge_mask_np)
+            if edge_mask.ndim == 2:
+                edge_mask = edge_mask.unsqueeze(0)
+            elif edge_mask.ndim == 3 and edge_mask.shape[-1] == 1:
+                edge_mask = edge_mask.permute(2, 0, 1)
+            elif edge_mask.ndim == 3 and edge_mask.shape[0] == 1:
+                pass
+            else:
+                raise ValueError(f"Unexpected edge_mask shape in NPZ: {edge_mask.shape}")
+            if edge_mask.max() > 1.0:
+                edge_mask = edge_mask / 255.0
+            edge_mask = edge_mask.float()
+
         high_pass = None
         if "high_pass" in data:
             hp_np = data["high_pass"]
@@ -162,10 +186,12 @@ def _load_from_npz(path: str | io.BytesIO) -> tuple[torch.Tensor, torch.Tensor |
                 _MISSING_HIGH_PASS_WARNED = True
             high_pass = _compute_high_pass_fallback(image)
 
-    return image, mask, high_pass
+    return image, mask, high_pass, edge_mask
 
 
-def _load_from_tar_npz(tar_spec: str) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+def _load_from_tar_npz(
+    tar_spec: str,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     if "::" not in tar_spec:
         raise ValueError(f"Invalid tar npz spec: {tar_spec}")
     archive_path, member_name = tar_spec.split("::", 1)
@@ -216,12 +242,13 @@ class PerDatasetDataset(Dataset):
         record = self.samples[index]
 
         if "::" in record.image_path and record.image_path.endswith(".npz"):
-            image, mask, high_pass = _load_from_tar_npz(record.image_path)
+            image, mask, high_pass, edge_mask = _load_from_tar_npz(record.image_path)
         elif record.image_path.endswith(".npz"):
-            image, mask, high_pass = _load_from_npz(record.image_path)
+            image, mask, high_pass, edge_mask = _load_from_npz(record.image_path)
         else:
             image = _load_image(record.image_path)
             mask = _load_mask(record.mask_path, image.shape[-2:])
+            edge_mask = _load_optional_mask(record.edge_mask_path, image.shape[-2:])
             high_pass = None
 
         if mask is None:
@@ -237,6 +264,8 @@ class PerDatasetDataset(Dataset):
                 # Resize before any augmentations to keep sizes bounded
                 image = F.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
                 mask = F.resize(mask, [new_h, new_w], interpolation=InterpolationMode.NEAREST)
+                if edge_mask is not None:
+                    edge_mask = F.resize(edge_mask, [new_h, new_w], interpolation=InterpolationMode.NEAREST)
                 if high_pass is not None:
                     high_pass = F.resize(high_pass, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
 
@@ -252,6 +281,8 @@ class PerDatasetDataset(Dataset):
             new_h, new_w = int(round(h * scale)), int(round(w * scale))
             image = F.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
             mask = F.resize(mask, [new_h, new_w], interpolation=InterpolationMode.NEAREST)
+            if edge_mask is not None:
+                edge_mask = F.resize(edge_mask, [new_h, new_w], interpolation=InterpolationMode.NEAREST)
             if high_pass is not None:
                 high_pass = F.resize(high_pass, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
 
@@ -263,8 +294,13 @@ class PerDatasetDataset(Dataset):
             if self.aug_seed is not None:
                 gen = torch.Generator()
                 gen.manual_seed(int(self.aug_seed) + int(worker_offset) + int(index))
-            image, mask, high_pass = _apply_gpu_augmentations(
-                image, mask, cfg, high_pass=high_pass, generator=gen
+            image, mask, high_pass, edge_mask = _apply_gpu_augmentations(
+                image,
+                mask,
+                cfg,
+                high_pass=high_pass,
+                edge_mask=edge_mask,
+                generator=gen,
             )
 
         label = torch.tensor(record.label, dtype=torch.long)
@@ -275,6 +311,8 @@ class PerDatasetDataset(Dataset):
             "label": label,
             "dataset": record.dataset,
             "high_pass": high_pass,
+            "edge_mask": edge_mask,
+            "has_edge_mask": edge_mask is not None,
         }
 
 
@@ -512,8 +550,9 @@ def _apply_gpu_augmentations(
     mask: torch.Tensor,
     cfg: AugmentationConfig,
     high_pass: torch.Tensor | None = None,
+    edge_mask: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     def _rand_scalar() -> torch.Tensor:
         return torch.rand((), device=image.device, generator=generator)
 
@@ -533,12 +572,13 @@ def _apply_gpu_augmentations(
         image_t: torch.Tensor,
         mask_t: torch.Tensor,
         high_pass_t: torch.Tensor | None,
+        edge_mask_t: torch.Tensor | None,
         alpha: float,
         sigma: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         _, h, w = image_t.shape
         if h < 4 or w < 4:
-            return image_t, mask_t, high_pass_t
+            return image_t, mask_t, high_pass_t, edge_mask_t
 
         dx = torch.rand((1, 1, h, w), device=image_t.device, generator=generator) * 2.0 - 1.0
         dy = torch.rand((1, 1, h, w), device=image_t.device, generator=generator) * 2.0 - 1.0
@@ -580,7 +620,17 @@ def _apply_gpu_augmentations(
                 align_corners=True,
             ).squeeze(0)
 
-        return image_out, mask_out, high_pass_out
+        edge_mask_out = None
+        if edge_mask_t is not None:
+            edge_mask_out = NN_F.grid_sample(
+                edge_mask_t.unsqueeze(0),
+                grid,
+                mode="nearest",
+                padding_mode="zeros",
+                align_corners=True,
+            ).squeeze(0)
+
+        return image_out, mask_out, high_pass_out, edge_mask_out
 
     if cfg.enable_flips:
         if _rand_scalar() < 0.5:
@@ -588,11 +638,15 @@ def _apply_gpu_augmentations(
             mask = torch.flip(mask, dims=[2])
             if high_pass is not None:
                 high_pass = torch.flip(high_pass, dims=[2])
+            if edge_mask is not None:
+                edge_mask = torch.flip(edge_mask, dims=[2])
         if _rand_scalar() < 0.2:
             image = torch.flip(image, dims=[1])
             mask = torch.flip(mask, dims=[1])
             if high_pass is not None:
                 high_pass = torch.flip(high_pass, dims=[1])
+            if edge_mask is not None:
+                edge_mask = torch.flip(edge_mask, dims=[1])
 
     if cfg.enable_rotations and cfg.max_rotation_degrees > 0:
         angle = float((_rand_scalar() * 2 - 1) * cfg.max_rotation_degrees)
@@ -601,6 +655,8 @@ def _apply_gpu_augmentations(
             mask = F.rotate(mask, angle=angle, interpolation=InterpolationMode.NEAREST)
             if high_pass is not None:
                 high_pass = F.rotate(high_pass, angle=angle, interpolation=InterpolationMode.BILINEAR)
+            if edge_mask is not None:
+                edge_mask = F.rotate(edge_mask, angle=angle, interpolation=InterpolationMode.NEAREST)
 
     if cfg.enable_random_crop:
         scale = float(
@@ -631,16 +687,19 @@ def _apply_gpu_augmentations(
             mask = F.resized_crop(mask, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.NEAREST)
             if high_pass is not None:
                 high_pass = F.resized_crop(high_pass, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.BILINEAR)
+            if edge_mask is not None:
+                edge_mask = F.resized_crop(edge_mask, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.NEAREST)
 
     if getattr(cfg, "enable_elastic", False):
         elastic_prob = float(min(max(getattr(cfg, "elastic_prob", 0.0), 0.0), 1.0))
         elastic_alpha = float(max(0.0, getattr(cfg, "elastic_alpha", 0.0)))
         elastic_sigma = float(max(0.5, getattr(cfg, "elastic_sigma", 1.0)))
         if elastic_prob > 0 and elastic_alpha > 0 and _rand_scalar() < elastic_prob:
-            image, mask, high_pass = _elastic_deform(
+            image, mask, high_pass, edge_mask = _elastic_deform(
                 image,
                 mask,
                 high_pass,
+                edge_mask,
                 alpha=elastic_alpha,
                 sigma=elastic_sigma,
             )
@@ -663,7 +722,7 @@ def _apply_gpu_augmentations(
             noise = torch.randn_like(image) * std
             image = torch.clamp(image + noise, 0.0, 1.0)
 
-    return image, mask, high_pass
+    return image, mask, high_pass, edge_mask
 
 
 def _apply_gpu_augmentations_batch(
@@ -671,8 +730,9 @@ def _apply_gpu_augmentations_batch(
     masks: torch.Tensor,
     cfg: AugmentationConfig,
     high_pass: torch.Tensor | None = None,
+    edge_masks: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Batched version of `_apply_gpu_augmentations` operating on tensors
     shaped `(B,C,H,W)` and `(B,1,H,W)` for masks. This implements the
     most common augmentations (random flips, rotations, color jitter, noise)
@@ -700,11 +760,15 @@ def _apply_gpu_augmentations_batch(
             masks[horiz] = torch.flip(masks[horiz], dims=[3])
             if high_pass is not None:
                 high_pass[horiz] = torch.flip(high_pass[horiz], dims=[3])
+            if edge_masks is not None:
+                edge_masks[horiz] = torch.flip(edge_masks[horiz], dims=[3])
         if vert.any():
             images[vert] = torch.flip(images[vert], dims=[2])
             masks[vert] = torch.flip(masks[vert], dims=[2])
             if high_pass is not None:
                 high_pass[vert] = torch.flip(high_pass[vert], dims=[2])
+            if edge_masks is not None:
+                edge_masks[vert] = torch.flip(edge_masks[vert], dims=[2])
 
     # Rotations via affine grid (vectorized)
     if cfg.enable_rotations and cfg.max_rotation_degrees > 0:
@@ -724,6 +788,8 @@ def _apply_gpu_augmentations_batch(
             masks = torch.nn.functional.grid_sample(masks, grid, mode="nearest", padding_mode="zeros", align_corners=True)
             if high_pass is not None:
                 high_pass = torch.nn.functional.grid_sample(high_pass, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
+            if edge_masks is not None:
+                edge_masks = torch.nn.functional.grid_sample(edge_masks, grid, mode="nearest", padding_mode="zeros", align_corners=True)
 
     # Color jitter (brightness/contrast) vectorized
     if cfg.enable_color_jitter:
@@ -795,8 +861,10 @@ def _apply_gpu_augmentations_batch(
             masks = torch.nn.functional.grid_sample(masks, grid, mode="nearest", padding_mode="zeros", align_corners=True)
             if high_pass is not None:
                 high_pass = torch.nn.functional.grid_sample(high_pass, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
+            if edge_masks is not None:
+                edge_masks = torch.nn.functional.grid_sample(edge_masks, grid, mode="nearest", padding_mode="zeros", align_corners=True)
 
-    return images, masks, high_pass
+    return images, masks, high_pass, edge_masks
 
 
 
@@ -885,6 +953,8 @@ def _collate_impl(
     labels: List[torch.Tensor] = []
     datasets: List[str] = []
     high_passes: List[torch.Tensor] = []
+    edge_masks: List[torch.Tensor] = []
+    edge_mask_present: List[torch.Tensor] = []
     collect_high_pass = True
 
     for sample in batch:
@@ -893,6 +963,8 @@ def _collate_impl(
         label = sample["label"]
         dataset_name = str(sample["dataset"])
         high_pass = sample.get("high_pass")
+        edge_mask = sample.get("edge_mask")
+        has_edge_mask = bool(sample.get("has_edge_mask", edge_mask is not None))
         if high_pass is None:
             collect_high_pass = False
         aug_cfg = per_dataset_aug.get(dataset_name, AugmentationConfig(enable=False))
@@ -902,18 +974,21 @@ def _collate_impl(
         base_image = image
         base_mask = mask
         base_high_pass = high_pass
+        base_edge_mask = edge_mask
 
         for _ in range(views):
             view_image = base_image
             view_mask = base_mask
             view_high_pass = base_high_pass
+            view_edge_mask = base_edge_mask
 
             if training and aug_cfg.enable:
-                view_image, view_mask, view_high_pass = _apply_gpu_augmentations(
+                view_image, view_mask, view_high_pass, view_edge_mask = _apply_gpu_augmentations(
                     view_image,
                     view_mask,
                     aug_cfg,
                     high_pass=view_high_pass,
+                    edge_mask=view_edge_mask,
                     generator=aug_generator,
                 )
 
@@ -926,6 +1001,12 @@ def _collate_impl(
 
             images.append(view_image)
             masks.append(view_mask)
+            if view_edge_mask is None:
+                edge_masks.append(torch.zeros_like(view_mask))
+                edge_mask_present.append(torch.tensor(False, dtype=torch.bool))
+            else:
+                edge_masks.append(view_edge_mask)
+                edge_mask_present.append(torch.tensor(has_edge_mask, dtype=torch.bool))
             labels.append(label)
             datasets.append(dataset_name)
             if collect_high_pass and view_high_pass is not None:
@@ -954,6 +1035,7 @@ def _collate_impl(
                     masks[i] = torch.zeros((1, new_h, new_w), dtype=torch.float32, device=images[i].device)
                 else:
                     masks[i] = F.resize(masks[i], [new_h, new_w], interpolation=InterpolationMode.NEAREST)
+                edge_masks[i] = F.resize(edge_masks[i], [new_h, new_w], interpolation=InterpolationMode.NEAREST)
                 if collect_high_pass and i < len(high_passes):
                     high_passes[i] = F.resize(high_passes[i], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
 
@@ -966,7 +1048,8 @@ def _collate_impl(
 
         padded_images: List[torch.Tensor] = []
         padded_masks: List[torch.Tensor] = []
-        for img, m in zip(images, masks):
+        padded_edge_masks: List[torch.Tensor] = []
+        for img, m, edge_m in zip(images, masks, edge_masks):
             c, h, w = img.shape
             # pad channels if necessary (unlikely)
             if c < max_c:
@@ -987,9 +1070,13 @@ def _collate_impl(
 
             padded_images.append(img)
             padded_masks.append(m)
+            if edge_m.shape[-2:] != (max_h, max_w):
+                edge_m = NN_F.pad(edge_m, (0, max_w - edge_m.shape[-1], 0, max_h - edge_m.shape[-2]), value=0)
+            padded_edge_masks.append(edge_m)
 
         images = padded_images
         masks = padded_masks
+        edge_masks = padded_edge_masks
 
         if collect_high_pass and high_passes:
             padded_high: List[torch.Tensor] = []
@@ -1005,6 +1092,8 @@ def _collate_impl(
     batch_dict = {
         "images": torch.stack(images, dim=0),
         "masks": torch.stack(masks, dim=0),
+        "edge_masks": torch.stack(edge_masks, dim=0),
+        "edge_mask_present": torch.stack(edge_mask_present, dim=0),
         "labels": torch.stack(labels, dim=0),
         "datasets": datasets,
     }
@@ -1141,7 +1230,7 @@ def create_dataloaders(
                         ss = None
                     probed_count += 1
                 if ss is None:
-                    ss = int(max_short_side) if max_short_side is not None else 320
+                    ss = int(max_short_side) if max_short_side is not None else 384
                 combined_short_sides.append(int(ss))
 
         if not datasets:
