@@ -52,6 +52,34 @@ def _compute_high_pass(image_np: np.ndarray) -> np.ndarray:
     return hp_uint8
 
 
+def _compute_edge_mask(mask_np: np.ndarray) -> np.ndarray:
+    """Compute a thin binary edge map from a single-channel mask."""
+    if mask_np.ndim != 2:
+        raise ValueError(f"Expected grayscale mask HxW, got shape {mask_np.shape}")
+
+    mask_bin = (mask_np > 127).astype(np.uint8, copy=False)
+    if not np.any(mask_bin):
+        return np.zeros_like(mask_np, dtype=np.uint8)
+
+    padded = np.pad(mask_bin, ((1, 1), (1, 1)), mode="edge")
+    center = padded[1:-1, 1:-1]
+    neighbors = (
+        padded[:-2, 1:-1],
+        padded[2:, 1:-1],
+        padded[1:-1, :-2],
+        padded[1:-1, 2:],
+        padded[:-2, :-2],
+        padded[:-2, 2:],
+        padded[2:, :-2],
+        padded[2:, 2:],
+    )
+    eroded = center.copy()
+    for neighbor in neighbors:
+        np.bitwise_and(eroded, neighbor, out=eroded)
+    edge = np.bitwise_and(center, np.uint8(1) - eroded)
+    return edge * np.uint8(255)
+
+
 class TarShardWriter:
     """Utility to write NPZ payloads into sequential tar shards."""
 
@@ -161,6 +189,7 @@ def _build_npz_bytes(
     edge_mask_path: Path | None,
     target_size: int,
     include_high_pass: bool = True,
+    compute_edge_mask: bool = False,
 ) -> bytes:
     image = Image.open(image_path).convert("RGB")
     mask_img = Image.open(mask_path).convert("L") if mask_path is not None else None
@@ -173,12 +202,21 @@ def _build_npz_bytes(
         if edge_mask_img is not None:
             edge_mask_img = edge_mask_img.resize((target_size, target_size), Image.NEAREST)
 
-    image_np = np.array(image, dtype=np.uint8)
+    image_np = np.asarray(image, dtype=np.uint8)
     payload = {"image": image_np}
     if mask_img is not None:
-        payload["mask"] = np.array(mask_img, dtype=np.uint8)
-    if edge_mask_img is not None:
-        payload["edge_mask"] = np.array(edge_mask_img, dtype=np.uint8)
+        mask_np = np.asarray(mask_img, dtype=np.uint8)
+        payload["mask"] = mask_np
+    else:
+        mask_np = None
+    if edge_mask_img is None and compute_edge_mask and mask_np is not None:
+        edge_mask_np = _compute_edge_mask(mask_np)
+    elif edge_mask_img is not None:
+        edge_mask_np = np.asarray(edge_mask_img, dtype=np.uint8)
+    else:
+        edge_mask_np = None
+    if edge_mask_np is not None:
+        payload["edge_mask"] = edge_mask_np
     if include_high_pass:
         payload["high_pass"] = _compute_high_pass(image_np)
 
@@ -257,6 +295,7 @@ def prepare_single_dataset(
                 edge_mask_path=edge_mask_path,
                 target_size=target_size,
                 include_high_pass=prep_cfg.enable_high_pass,
+                compute_edge_mask=(split_name == "train"),
             )
 
             stem = f"{cfg.dataset_name}_{split_name}_{'fake' if rec.label else 'real'}_{idx:06d}"

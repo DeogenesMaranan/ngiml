@@ -1,7 +1,12 @@
+import io
+
 import torch
+import numpy as np
+from PIL import Image
 
 from src.data.config import Manifest, SampleRecord
 from src.model.losses import MultiStageLossConfig, MultiStageManipulationLoss
+from tools.prepare_datasets import _build_npz_bytes
 
 
 def test_manifest_roundtrip_preserves_edge_mask_path():
@@ -43,3 +48,59 @@ def test_boundary_loss_uses_explicit_edge_target_when_present():
     fallback_loss = loss_fn(preds, target)
 
     assert explicit_loss.item() > fallback_loss.item()
+
+
+def test_prepare_dataset_computes_train_edge_mask_from_main_mask(tmp_path):
+    image_path = tmp_path / "image.png"
+    mask_path = tmp_path / "mask.png"
+
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    image[..., 0] = 255
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[2:6, 2:6] = 255
+
+    Image.fromarray(image).save(image_path)
+    Image.fromarray(mask).save(mask_path)
+
+    npz_bytes = _build_npz_bytes(
+        image_path=image_path,
+        mask_path=mask_path,
+        edge_mask_path=None,
+        target_size=8,
+        include_high_pass=False,
+        compute_edge_mask=True,
+    )
+
+    with np.load(io.BytesIO(npz_bytes), allow_pickle=False) as data:
+        assert "edge_mask" in data
+        edge_mask = data["edge_mask"]
+
+    assert edge_mask.shape == (8, 8)
+    assert edge_mask.dtype == np.uint8
+    assert edge_mask.max() == 255
+    assert edge_mask[2, 2] == 255
+    assert edge_mask[3, 3] == 0
+
+
+def test_prepare_dataset_skips_computed_edge_mask_outside_train(tmp_path):
+    image_path = tmp_path / "image.png"
+    mask_path = tmp_path / "mask.png"
+
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[2:6, 2:6] = 255
+
+    Image.fromarray(image).save(image_path)
+    Image.fromarray(mask).save(mask_path)
+
+    npz_bytes = _build_npz_bytes(
+        image_path=image_path,
+        mask_path=mask_path,
+        edge_mask_path=None,
+        target_size=8,
+        include_high_pass=False,
+        compute_edge_mask=False,
+    )
+
+    with np.load(io.BytesIO(npz_bytes), allow_pickle=False) as data:
+        assert "edge_mask" not in data
