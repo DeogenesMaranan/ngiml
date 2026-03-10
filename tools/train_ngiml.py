@@ -187,7 +187,7 @@ class TrainConfig:
     auto_local_cache: bool = True
     local_cache_dir: Optional[str] = None
     reuse_local_cache_manifest: bool = True
-    views_per_sample: int = 2
+    views_per_sample: int = 3
     # Cap the short side of input images early in the dataloader to avoid
     # excessive spatial sizes that can trigger timm/Swin assertions or OOMs.
     max_short_side: int = 384

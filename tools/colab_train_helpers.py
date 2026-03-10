@@ -283,7 +283,7 @@ def build_default_components():
 
     default_aug = AugmentationConfig(
         enable=True,
-        views_per_sample=2,
+        views_per_sample=3,
         enable_flips=True,
         enable_rotations=True,
         max_rotation_degrees=6.0,
@@ -348,7 +348,7 @@ def build_training_config(
         "prefetch_factor": 2,
         "persistent_workers": False,
         "drop_last": True,
-        "views_per_sample": 2,
+        "views_per_sample": 3,
         "max_rotation_degrees": 6.0,
         "noise_std_max": 0.012,
         "disable_aug": False,
