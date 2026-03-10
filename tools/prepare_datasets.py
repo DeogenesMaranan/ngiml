@@ -353,9 +353,9 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
         DatasetStructureConfig(
             dataset_root="./datasets",
             dataset_name="CASIA2",
-            real_subdir="real",
-            fake_subdir="fake",
-            mask_subdir="mask",
+            real_subdir="Au",
+            fake_subdir="Tp",
+            mask_subdir="Gt",
             mask_suffix="_gt",
             prepared_root="./prepared",
         ),
