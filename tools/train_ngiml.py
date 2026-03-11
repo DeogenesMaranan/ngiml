@@ -151,7 +151,7 @@ class TrainConfig:
     manifest: str
     scheduler_type: str = "cosine"  # one of: 'cosine', 'step' (cosine enabled by default)
     output_dir: str = "runs/ngiml"
-    batch_size: int = 8
+    batch_size: int = 12
     epochs: int = 50
     num_workers: int = max(2, min(8, (os.cpu_count() or 4) // 4))
     amp: bool = True
@@ -190,26 +190,26 @@ class TrainConfig:
     views_per_sample: int = 3
     # Cap the short side of input images early in the dataloader to avoid
     # excessive spatial sizes that can trigger timm/Swin assertions or OOMs.
-    max_short_side: int = 384
-    max_rotation_degrees: float = 0.0
-    noise_std_max: float = 0.01
+    max_short_side: int = 480
+    max_rotation_degrees: float = 10.0
+    noise_std_max: float = 0.02
     disable_aug: bool = False
     device: Optional[str] = None
     aug_seed: Optional[int] = None
     seed: int = 42
     early_stopping_patience: int = 12
     early_stopping_min_delta: float = 1e-4
-    early_stopping_monitor: str = "f1"
+    early_stopping_monitor: str = "iou"
     training_phase: str = "phase1"
-    auto_phase2_enabled: bool = False
-    auto_phase2_patience: int = 5
+    auto_phase2_enabled: bool = True
+    auto_phase2_patience: int = 4
     auto_phase2_lr_scale: float = 0.33
-    auto_phase2_tversky_weight: float = 0.1
+    auto_phase2_tversky_weight: float = 0.15
     auto_phase2_monitor: str = "iou"
     metric_threshold: float = 0.5
     optimize_threshold: bool = True
-    threshold_metric: str = "f1"
-    threshold_start: float = 0.2
+    threshold_metric: str = "dice"
+    threshold_start: float = 0.1
     threshold_end: float = 0.8
     threshold_step: float = 0.02
     small_mask_ratio_max: float = 0.01
@@ -219,7 +219,7 @@ class TrainConfig:
     short_side_probe_samples: int = 128
     auto_pos_weight: bool = True
     pos_weight_min: float = 0.5
-    pos_weight_max: float = 10.0
+    pos_weight_max: float = 12.0
     balanced_pos_weight_cap: float = 3.0
     loss_hybrid_mode: str = "dice_bce"
     dice_weight: float = 1.0
@@ -230,7 +230,7 @@ class TrainConfig:
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.8
     lovasz_weight: float = 0.0
-    use_boundary_loss: bool = False
+    use_boundary_loss: bool = True
     boundary_weight: float = 0.05
     ema_enabled: bool = True
     ema_decay: float = 0.999
@@ -266,7 +266,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--scheduler-type", type=str, default="cosine", choices=["cosine", "step"], help="LR scheduler type (cosine or step)")
     parser.add_argument("--manifest", required=True, help="Path to prepared manifest JSON")
     parser.add_argument("--output-dir", default="runs/ngiml", help="Directory to write checkpoints/logs")
-    parser.add_argument("--batch-size", type=int, default=8, help="Mini-batch size")
+    parser.add_argument("--batch-size", type=int, default=12, help="Mini-batch size")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--num-workers", type=int, default=default_workers, help="DataLoader workers")
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision training")
@@ -321,7 +321,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument(
         "--balanced-positive-ratio",
         type=float,
-        default=0.5,
+        default=0.6,
         help="Target fake-positive sampling ratio when --balance-real-fake is enabled",
     )
     parser.add_argument(
@@ -367,26 +367,26 @@ def parse_args() -> TrainConfig:
         default=True,
         help="Reuse existing local cached manifest when available to shorten startup",
     )
-    parser.add_argument("--views-per-sample", type=int, default=2, help="Number of augmented views per sample (on-the-fly)")
-    parser.add_argument("--max-short-side", type=int, default=384, help="Cap image short side before batching (lower is faster)")
-    parser.add_argument("--max-rotation-degrees", type=float, default=0.0, help="Random rotation range (+/-)")
-    parser.add_argument("--noise-std-max", type=float, default=0.01, help="Max Gaussian noise std")
+    parser.add_argument("--views-per-sample", type=int, default=3, help="Number of augmented views per sample (on-the-fly)")
+    parser.add_argument("--max-short-side", type=int, default=480, help="Cap image short side before batching (lower is faster)")
+    parser.add_argument("--max-rotation-degrees", type=float, default=10.0, help="Random rotation range (+/-)")
+    parser.add_argument("--noise-std-max", type=float, default=0.02, help="Max Gaussian noise std")
     parser.add_argument("--disable-aug", action="store_true", help="Disable GPU augmentations")
     parser.add_argument("--device", type=str, default=None, help="Override device (e.g., cuda:0 or cpu)")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducibility")
     parser.add_argument("--early-stopping-patience", type=int, default=12, help="Stop after N validations without improvement; <=0 disables")
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4, help="Minimum monitored-metric improvement to reset early stopping")
-    parser.add_argument("--early-stopping-monitor", type=str, default="f1", choices=["iou", "dice", "f1", "recall", "precision", "accuracy", "loss"], help="Validation metric used for early stopping and best checkpoint")
+    parser.add_argument("--early-stopping-monitor", type=str, default="iou", choices=["iou", "dice", "f1", "recall", "precision", "accuracy", "loss"], help="Validation metric used for early stopping and best checkpoint")
     parser.add_argument("--training-phase", type=str, default="phase1", choices=["phase1", "phase2"], help="Training phase label stored in checkpoints and logs")
-    parser.add_argument("--auto-phase2-enabled", action=argparse.BooleanOptionalAction, default=False, help="Automatically switch to phase 2 from the best IoU checkpoint after a phase-1 plateau")
-    parser.add_argument("--auto-phase2-patience", type=int, default=5, help="Validations without improvement before auto phase-2 triggers during phase 1")
+    parser.add_argument("--auto-phase2-enabled", action=argparse.BooleanOptionalAction, default=True, help="Automatically switch to phase 2 from the best IoU checkpoint after a phase-1 plateau")
+    parser.add_argument("--auto-phase2-patience", type=int, default=4, help="Validations without improvement before auto phase-2 triggers during phase 1")
     parser.add_argument("--auto-phase2-lr-scale", type=float, default=0.33, help="LR multiplier applied when auto phase-2 activates")
-    parser.add_argument("--auto-phase2-tversky-weight", type=float, default=0.1, help="Tversky loss weight applied during auto phase-2")
+    parser.add_argument("--auto-phase2-tversky-weight", type=float, default=0.15, help="Tversky loss weight applied during auto phase-2")
     parser.add_argument("--auto-phase2-monitor", type=str, default="iou", choices=["iou", "f1", "dice"], help="Validation metric used for auto phase-2 monitoring and threshold selection")
     parser.add_argument("--metric-threshold", type=float, default=0.5, help="Fixed threshold for sigmoid outputs when threshold optimization is disabled")
     parser.add_argument("--optimize-threshold", action=argparse.BooleanOptionalAction, default=True, help="Search validation thresholds and use the best for metric reporting")
-    parser.add_argument("--threshold-metric", type=str, default="f1", choices=["iou", "dice", "f1"], help="Metric used to select best threshold")
-    parser.add_argument("--threshold-start", type=float, default=0.2, help="Threshold search range start")
+    parser.add_argument("--threshold-metric", type=str, default="dice", choices=["iou", "dice", "f1"], help="Metric used to select best threshold")
+    parser.add_argument("--threshold-start", type=float, default=0.1, help="Threshold search range start")
     parser.add_argument("--threshold-end", type=float, default=0.8, help="Threshold search range end")
     parser.add_argument("--threshold-step", type=float, default=0.02, help="Threshold search step size")
     parser.add_argument("--small-mask-ratio-max", type=float, default=0.01, help="Upper foreground-ratio bound for small-mask validation bin")
@@ -406,7 +406,7 @@ def parse_args() -> TrainConfig:
     )
     parser.add_argument("--auto-pos-weight", action=argparse.BooleanOptionalAction, default=True, help="Auto-compute BCE pos_weight from foreground ratio")
     parser.add_argument("--pos-weight-min", type=float, default=0.5, help="Lower clamp for auto pos_weight")
-    parser.add_argument("--pos-weight-max", type=float, default=10.0, help="Upper clamp for auto pos_weight")
+    parser.add_argument("--pos-weight-max", type=float, default=12.0, help="Upper clamp for auto pos_weight")
     parser.add_argument(
         "--balanced-pos-weight-cap",
         type=float,
@@ -422,7 +422,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--tversky-alpha", type=float, default=0.3, help="Tversky alpha (FP penalty)")
     parser.add_argument("--tversky-beta", type=float, default=0.8, help="Tversky beta (FN penalty)")
     parser.add_argument("--lovasz-weight", type=float, default=0.0, help="Lovasz Hinge Loss weight for IoU optimization")
-    parser.add_argument("--use-boundary-loss", action=argparse.BooleanOptionalAction, default=False, help="Enable Sobel boundary loss on final prediction")
+    parser.add_argument("--use-boundary-loss", action=argparse.BooleanOptionalAction, default=True, help="Enable boundary-band loss on final prediction")
     parser.add_argument("--boundary-weight", type=float, default=0.05, help="Boundary loss weight when --use-boundary-loss is enabled")
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=True, help="Use EMA weights for validation and best checkpoints")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay factor")
@@ -556,18 +556,19 @@ def _build_aug_map(names: Sequence[str], cfg: TrainConfig) -> Dict[str, Augmenta
         enable_rotations=cfg.max_rotation_degrees > 0,
         max_rotation_degrees=cfg.max_rotation_degrees,
         enable_random_crop=True,
-        crop_scale_range=(0.75, 1.0),
-        object_crop_bias_prob=0.85,
-        min_fg_pixels_for_object_crop=8,
-        enable_elastic=False,
-        elastic_prob=0.0,
+        crop_scale_range=(0.65, 1.0),
+        object_crop_bias_prob=0.9,
+        min_fg_pixels_for_object_crop=4,
+        enable_elastic=True,
+        elastic_prob=0.15,
         elastic_alpha=8.0,
         elastic_sigma=5.0,
         enable_color_jitter=True,
-        brightness_jitter_factors=(0.9, 1.1),
-        contrast_jitter_factors=(0.9, 1.1),
+        brightness_jitter_factors=(0.85, 1.15),
+        contrast_jitter_factors=(0.85, 1.15),
         enable_noise=cfg.noise_std_max > 0,
         noise_std_range=(0.0, max(0.0, cfg.noise_std_max)),
+        multiscale_training=False,
     )
 
     aug_map: Dict[str, AugmentationConfig] = {name: _coerce_aug(base_aug) for name in names}
@@ -984,7 +985,7 @@ def _build_phase2_config(cfg: TrainConfig, best_iou_path: Path) -> TrainConfig:
         early_stopping_monitor=phase2_metric,
         threshold_metric=phase2_metric,
         tversky_weight=float(cfg.auto_phase2_tversky_weight),
-        lovasz_weight=0.0,
+        lovasz_weight=0.05,
         hard_mining_enabled=False,
         model_config=phase2_model_cfg,
     )

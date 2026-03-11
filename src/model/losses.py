@@ -229,9 +229,10 @@ class MultiStageManipulationLoss(nn.Module):
         return total_loss / max(normalizer, 1e-6)
 
 class SobelBoundaryLoss(nn.Module):
-    """Sobel-based boundary loss for sharper manipulation boundaries.
+    """Boundary-band loss using Sobel-derived edge probabilities.
 
-    Forensic motivation: Penalizes boundary errors by comparing Sobel gradient magnitudes of prediction and target.
+    Forensic motivation: Supervises a soft predicted edge map against a thicker
+    symmetric boundary band, which is more stable than a 1-pixel contour.
     """
     def __init__(self):
         super().__init__()
@@ -241,6 +242,29 @@ class SobelBoundaryLoss(nn.Module):
         self.register_buffer('sobel_x', sobel_x)
         self.register_buffer('sobel_y', sobel_y)
 
+    @staticmethod
+    def _edge_prob_from_logits(pred: Tensor, sobel_x: Tensor, sobel_y: Tensor) -> Tensor:
+        pred_prob = torch.sigmoid(pred)
+        grad_pred_x = F.conv2d(pred_prob, sobel_x, padding=1)
+        grad_pred_y = F.conv2d(pred_prob, sobel_y, padding=1)
+        grad_pred = torch.sqrt(grad_pred_x ** 2 + grad_pred_y ** 2 + 1e-6)
+        return torch.clamp(grad_pred / 4.0, 0.0, 1.0)
+
+    @staticmethod
+    def _boundary_band_from_mask(mask: Tensor) -> Tensor:
+        mask_bin = (mask > 0.5).float()
+        dilated = F.max_pool2d(mask_bin, kernel_size=3, stride=1, padding=1)
+        eroded = 1.0 - F.max_pool2d(1.0 - mask_bin, kernel_size=3, stride=1, padding=1)
+        return (dilated - eroded).clamp(0.0, 1.0)
+
+    @staticmethod
+    def _soft_dice(prob: Tensor, target: Tensor, smooth: float = 1e-6) -> Tensor:
+        dims = (1, 2, 3)
+        intersection = torch.sum(prob * target, dim=dims)
+        denom = torch.sum(prob, dim=dims) + torch.sum(target, dim=dims)
+        dice = (2.0 * intersection + smooth) / (denom + smooth)
+        return 1.0 - dice.mean()
+
     def forward(
         self,
         pred: Tensor,
@@ -248,7 +272,6 @@ class SobelBoundaryLoss(nn.Module):
         edge_target: Tensor | None = None,
         edge_target_present: Tensor | None = None,
     ) -> Tensor:
-        pred = torch.sigmoid(pred)
         target = target.float()
         if edge_target is not None:
             edge_target = edge_target.float()
@@ -256,24 +279,22 @@ class SobelBoundaryLoss(nn.Module):
         # errors when using mixed precision (e.g., fp16/bf16).
         sobel_x = self.sobel_x.to(dtype=pred.dtype, device=pred.device)
         sobel_y = self.sobel_y.to(dtype=pred.dtype, device=pred.device)
-        # Compute gradients
-        grad_pred_x = F.conv2d(pred, sobel_x, padding=1)
-        grad_pred_y = F.conv2d(pred, sobel_y, padding=1)
-        grad_target_x = F.conv2d(target, sobel_x, padding=1)
-        grad_target_y = F.conv2d(target, sobel_y, padding=1)
-        grad_pred = torch.sqrt(grad_pred_x ** 2 + grad_pred_y ** 2 + 1e-6)
-        grad_target = torch.sqrt(grad_target_x ** 2 + grad_target_y ** 2 + 1e-6)
+        edge_prob = self._edge_prob_from_logits(pred, sobel_x, sobel_y)
+        band_target = self._boundary_band_from_mask(target)
         if edge_target is not None:
             explicit_edge = edge_target.to(dtype=pred.dtype, device=pred.device)
-            if explicit_edge.shape[-2:] != grad_target.shape[-2:]:
-                explicit_edge = F.interpolate(explicit_edge, size=grad_target.shape[-2:], mode="nearest")
+            if explicit_edge.shape[-2:] != band_target.shape[-2:]:
+                explicit_edge = F.interpolate(explicit_edge, size=band_target.shape[-2:], mode="nearest")
             explicit_edge = explicit_edge.clamp(0.0, 1.0)
             if edge_target_present is None:
-                grad_target = explicit_edge
+                band_target = explicit_edge
             else:
                 present = edge_target_present.to(device=pred.device, dtype=pred.dtype).view(-1, 1, 1, 1)
-                grad_target = present * explicit_edge + (1.0 - present) * grad_target
-        return F.l1_loss(grad_pred, grad_target)
+                band_target = present * explicit_edge + (1.0 - present) * band_target
+
+        bce = F.binary_cross_entropy(edge_prob, band_target)
+        dice = self._soft_dice(edge_prob, band_target)
+        return 0.5 * (bce + dice)
 
 __all__ = [
     "SoftDiceLoss",

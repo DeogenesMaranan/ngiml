@@ -2,11 +2,16 @@ from tools.colab_train_helpers import build_default_components
 from tools.prepare_datasets import build_default_configs
 
 
-def test_prepare_default_configs_use_casia2_for_training_and_coverage_columbia_for_test():
+def test_prepare_default_configs_use_casia2_for_training_and_casia1_coverage_columbia_for_test():
     datasets, per_dataset_splits, prep_cfg = build_default_configs()
 
-    assert [dataset.dataset_name for dataset in datasets] == ["CASIA2", "COVERAGE", "Columbia"]
+    assert [dataset.dataset_name for dataset in datasets] == ["CASIA1", "CASIA2", "COVERAGE", "Columbia"]
     assert prep_cfg.target_sizes == (384,)
+
+    casia1_split = per_dataset_splits["CASIA1"]
+    assert casia1_split.train == 0.0
+    assert casia1_split.val == 0.0
+    assert casia1_split.test == 1.0
 
     casia2_split = per_dataset_splits["CASIA2"]
     assert casia2_split.train == 0.8
@@ -25,11 +30,18 @@ def test_prepare_default_configs_use_casia2_for_training_and_coverage_columbia_f
 
 
 def test_default_components_use_shared_augmentation_defaults():
-    _model_cfg, _loss_cfg, default_aug, per_dataset_aug = build_default_components()
+    model_cfg, loss_cfg, default_aug, per_dataset_aug = build_default_components()
 
     assert default_aug.enable is True
-    assert default_aug.views_per_sample == 2
-    assert default_aug.max_rotation_degrees == 6.0
-    assert default_aug.crop_scale_range == (0.75, 1.0)
-    assert default_aug.noise_std_range == (0.0, 0.012)
+    assert default_aug.views_per_sample == 3
+    assert default_aug.max_rotation_degrees == 10.0
+    assert default_aug.crop_scale_range == (0.65, 1.0)
+    assert default_aug.enable_elastic is True
+    assert default_aug.elastic_prob == 0.15
+    assert default_aug.noise_std_range == (0.0, 0.02)
+    assert default_aug.multiscale_training is False
+    assert model_cfg.residual.base_channels == 32
+    assert tuple(model_cfg.fusion.fusion_channels) == (64, 128, 192, 256)
+    assert loss_cfg.use_boundary_loss is True
+    assert loss_cfg.boundary_weight == 0.05
     assert per_dataset_aug == {}

@@ -27,6 +27,18 @@ if str(ROOT) not in sys.path:
 from src.data.config import DatasetStructureConfig, Manifest, PreparationConfig, SampleRecord, SplitConfig
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+JPEG_EXTENSIONS = {".jpg", ".jpeg"}
+MORPH_KERNEL_SHIFTS = (
+    (-1, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, -1),
+    (0, 0),
+    (0, 1),
+    (1, -1),
+    (1, 0),
+    (1, 1),
+)
 
 
 def _compute_high_pass(image_np: np.ndarray) -> np.ndarray:
@@ -53,7 +65,7 @@ def _compute_high_pass(image_np: np.ndarray) -> np.ndarray:
 
 
 def _compute_edge_mask(mask_np: np.ndarray) -> np.ndarray:
-    """Compute a thin binary edge map from a single-channel mask."""
+    """Compute a symmetric boundary band from a single-channel mask."""
     if mask_np.ndim != 2:
         raise ValueError(f"Expected grayscale mask HxW, got shape {mask_np.shape}")
 
@@ -62,22 +74,30 @@ def _compute_edge_mask(mask_np: np.ndarray) -> np.ndarray:
         return np.zeros_like(mask_np, dtype=np.uint8)
 
     padded = np.pad(mask_bin, ((1, 1), (1, 1)), mode="edge")
-    center = padded[1:-1, 1:-1]
-    neighbors = (
-        padded[:-2, 1:-1],
-        padded[2:, 1:-1],
-        padded[1:-1, :-2],
-        padded[1:-1, 2:],
-        padded[:-2, :-2],
-        padded[:-2, 2:],
-        padded[2:, :-2],
-        padded[2:, 2:],
-    )
-    eroded = center.copy()
-    for neighbor in neighbors:
+    neighborhoods = [
+        padded[1 + dy : 1 + dy + mask_bin.shape[0], 1 + dx : 1 + dx + mask_bin.shape[1]]
+        for dy, dx in MORPH_KERNEL_SHIFTS
+    ]
+
+    eroded = neighborhoods[0].copy()
+    dilated = neighborhoods[0].copy()
+    for neighbor in neighborhoods[1:]:
         np.bitwise_and(eroded, neighbor, out=eroded)
-    edge = np.bitwise_and(center, np.uint8(1) - eroded)
-    return edge * np.uint8(255)
+        np.bitwise_or(dilated, neighbor, out=dilated)
+
+    boundary = np.bitwise_and(dilated, np.uint8(1) - eroded)
+    return boundary * np.uint8(255)
+
+
+def _normalize_non_jpeg_to_jpeg(image: Image.Image, image_path: Path) -> Image.Image:
+    """Round-trip non-JPEG images through JPEG before array serialization."""
+    if image_path.suffix.lower() in JPEG_EXTENSIONS:
+        return image
+
+    jpeg_buffer = io.BytesIO()
+    image.save(jpeg_buffer, format="JPEG", quality=95, subsampling=0)
+    jpeg_buffer.seek(0)
+    return Image.open(jpeg_buffer).convert("RGB")
 
 
 class TarShardWriter:
@@ -193,14 +213,13 @@ def _build_npz_bytes(
 ) -> bytes:
     image = Image.open(image_path).convert("RGB")
     mask_img = Image.open(mask_path).convert("L") if mask_path is not None else None
-    edge_mask_img = Image.open(edge_mask_path).convert("L") if edge_mask_path is not None else None
 
     if target_size > 0:
         image = image.resize((target_size, target_size), Image.BILINEAR)
         if mask_img is not None:
             mask_img = mask_img.resize((target_size, target_size), Image.NEAREST)
-        if edge_mask_img is not None:
-            edge_mask_img = edge_mask_img.resize((target_size, target_size), Image.NEAREST)
+
+    image = _normalize_non_jpeg_to_jpeg(image, image_path)
 
     image_np = np.asarray(image, dtype=np.uint8)
     payload = {"image": image_np}
@@ -209,14 +228,6 @@ def _build_npz_bytes(
         payload["mask"] = mask_np
     else:
         mask_np = None
-    if edge_mask_img is None and compute_edge_mask and mask_np is not None:
-        edge_mask_np = _compute_edge_mask(mask_np)
-    elif edge_mask_img is not None:
-        edge_mask_np = np.asarray(edge_mask_img, dtype=np.uint8)
-    else:
-        edge_mask_np = None
-    if edge_mask_np is not None:
-        payload["edge_mask"] = edge_mask_np
     if include_high_pass:
         payload["high_pass"] = _compute_high_pass(image_np)
 
@@ -295,7 +306,7 @@ def prepare_single_dataset(
                 edge_mask_path=edge_mask_path,
                 target_size=target_size,
                 include_high_pass=prep_cfg.enable_high_pass,
-                compute_edge_mask=(split_name == "train"),
+                compute_edge_mask=False,
             )
 
             stem = f"{cfg.dataset_name}_{split_name}_{'fake' if rec.label else 'real'}_{idx:06d}"
@@ -352,6 +363,15 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
     datasets = [
         DatasetStructureConfig(
             dataset_root="./datasets",
+            dataset_name="CASIA1",
+            real_subdir="Au",
+            fake_subdir="Tp",
+            mask_subdir="Gt",
+            mask_suffix="_gt",
+            prepared_root="./prepared",
+        ),
+        DatasetStructureConfig(
+            dataset_root="./datasets",
             dataset_name="CASIA2",
             real_subdir="Au",
             fake_subdir="Tp",
@@ -380,6 +400,7 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
     ]
 
     per_dataset_splits = {
+        "CASIA1": SplitConfig(train=0.0, val=0.0, test=1.0, seed=shared_seed),
         "CASIA2": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
         "COVERAGE": SplitConfig(train=0.0, val=0.0, test=1.0, seed=shared_seed),
         "Columbia": SplitConfig(train=0.0, val=0.0, test=1.0, seed=shared_seed),
