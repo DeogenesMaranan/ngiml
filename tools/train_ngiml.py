@@ -227,6 +227,11 @@ class TrainConfig:
     early_stopping_patience: int = 12
     early_stopping_min_delta: float = 1e-4
     early_stopping_monitor: str = "f1"
+    overfit_guard_enabled: bool = False
+    overfit_guard_patience: int = 3
+    overfit_guard_min_epochs: int = 4
+    overfit_guard_loss_gap: float = 0.08
+    overfit_guard_min_val_increase: float = 0.01
     training_phase: str = "phase1"
     auto_phase2_enabled: bool = False
     auto_phase2_patience: int = 5
@@ -404,6 +409,11 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--early-stopping-patience", type=int, default=12, help="Stop after N validations without improvement; <=0 disables")
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4, help="Minimum monitored-metric improvement to reset early stopping")
     parser.add_argument("--early-stopping-monitor", type=str, default="f1", choices=["iou", "dice", "f1", "recall", "precision", "accuracy", "loss"], help="Validation metric used for early stopping and best checkpoint")
+    parser.add_argument("--overfit-guard-enabled", action=argparse.BooleanOptionalAction, default=False, help="Stop early when validation loss stays meaningfully above train loss and worsens across validations")
+    parser.add_argument("--overfit-guard-patience", type=int, default=3, help="Consecutive overfit signals required before stopping")
+    parser.add_argument("--overfit-guard-min-epochs", type=int, default=4, help="Minimum completed epochs before overfit guard can trigger")
+    parser.add_argument("--overfit-guard-loss-gap", type=float, default=0.08, help="Minimum val_loss - train_loss gap treated as overfitting")
+    parser.add_argument("--overfit-guard-min-val-increase", type=float, default=0.01, help="Minimum validation-loss increase above the best seen val loss to count as overfitting")
     parser.add_argument("--training-phase", type=str, default="phase1", choices=["phase1", "phase2"], help="Training phase label stored in checkpoints and logs")
     parser.add_argument("--auto-phase2-enabled", action=argparse.BooleanOptionalAction, default=False, help="Automatically switch to phase 2 from the best IoU checkpoint after a phase-1 plateau")
     parser.add_argument("--auto-phase2-patience", type=int, default=5, help="Validations without improvement before auto phase-2 triggers during phase 1")
@@ -503,6 +513,11 @@ def parse_args() -> TrainConfig:
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
         early_stopping_monitor=args.early_stopping_monitor,
+        overfit_guard_enabled=args.overfit_guard_enabled,
+        overfit_guard_patience=max(1, int(args.overfit_guard_patience)),
+        overfit_guard_min_epochs=max(1, int(args.overfit_guard_min_epochs)),
+        overfit_guard_loss_gap=float(args.overfit_guard_loss_gap),
+        overfit_guard_min_val_increase=float(args.overfit_guard_min_val_increase),
         training_phase=args.training_phase,
         auto_phase2_enabled=args.auto_phase2_enabled,
         auto_phase2_patience=max(1, int(args.auto_phase2_patience)),
@@ -2128,7 +2143,9 @@ def run_training(cfg: TrainConfig) -> None:
 
     best_monitor_value = float("-inf")
     best_val_iou = float("-inf")
+    best_val_loss = float("inf")
     no_improve_epochs = 0
+    overfit_epochs = 0
     early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
     best_threshold_path = checkpoint_dir / "best_threshold.json"
     auto_phase2_triggered = str(getattr(cfg, "training_phase", "phase1")).strip().lower() == "phase2"
@@ -2321,6 +2338,26 @@ def run_training(cfg: TrainConfig) -> None:
                     f"without val {cfg.early_stopping_monitor} improvement"
                 )
 
+            loss_gap = float(val_loss - train_loss)
+            if val_loss < best_val_loss:
+                best_val_loss = float(val_loss)
+
+            overfit_signal = (
+                bool(getattr(cfg, "overfit_guard_enabled", False))
+                and (epoch + 1) >= int(max(1, getattr(cfg, "overfit_guard_min_epochs", 1)))
+                and loss_gap >= float(getattr(cfg, "overfit_guard_loss_gap", 0.0))
+                and val_loss >= (best_val_loss + float(getattr(cfg, "overfit_guard_min_val_increase", 0.0)))
+            )
+            if overfit_signal:
+                overfit_epochs += 1
+                print(
+                    "Overfit guard: "
+                    f"{overfit_epochs}/{cfg.overfit_guard_patience} | "
+                    f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | gap={loss_gap:.4f}"
+                )
+            else:
+                overfit_epochs = 0
+
         should_checkpoint = ((epoch + 1) % cfg.checkpoint_every == 0) or (epoch + 1 == cfg.epochs)
         if should_checkpoint:
             ckpt_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1:03d}.pt"
@@ -2352,6 +2389,8 @@ def run_training(cfg: TrainConfig) -> None:
                     "val_accuracy": val_accuracy,
                     "val_threshold": val_threshold,
                     "val_size_bins": val_size_bins,
+                    "overfit_loss_gap": (float(val_loss - train_loss) if val_loss is not None else None),
+                    "overfit_guard_counter": int(overfit_epochs),
                     "epoch_seconds": float(elapsed),
                     "checkpoint_path": str(ckpt_path),
                 },
@@ -2407,6 +2446,17 @@ def run_training(cfg: TrainConfig) -> None:
             if no_improve_epochs >= cfg.early_stopping_patience:
                 print(f"Early stopping triggered at epoch {epoch + 1}")
                 break
+        if (
+            bool(getattr(cfg, "overfit_guard_enabled", False))
+            and "val" in loaders
+            and (epoch + 1) % cfg.val_every == 0
+            and overfit_epochs >= int(max(1, getattr(cfg, "overfit_guard_patience", 1)))
+        ):
+            print(
+                f"Overfit guard triggered at epoch {epoch + 1} | "
+                f"patience={cfg.overfit_guard_patience}"
+            )
+            break
 
     print("Training complete")
 

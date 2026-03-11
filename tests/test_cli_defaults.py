@@ -63,3 +63,8 @@ def test_overlap_focused_threshold_and_mining_defaults(monkeypatch):
     assert cfg.hard_mining_enabled is False
     assert cfg.hard_mining_start_epoch == 5
     assert cfg.hard_mining_weight == 0.03
+    assert cfg.overfit_guard_enabled is False
+    assert cfg.overfit_guard_patience == 3
+    assert cfg.overfit_guard_min_epochs == 4
+    assert cfg.overfit_guard_loss_gap == 0.08
+    assert cfg.overfit_guard_min_val_increase == 0.01

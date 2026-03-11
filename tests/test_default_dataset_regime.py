@@ -97,6 +97,11 @@ def test_colab_training_config_defaults_batch_size_to_20(tmp_path):
 
     assert training_config["batch_size"] == 20
     assert training_config["auto_phase2_enabled"] is False
+    assert training_config["overfit_guard_enabled"] is True
+    assert training_config["overfit_guard_patience"] == 2
+    assert training_config["overfit_guard_min_epochs"] == 4
+    assert training_config["overfit_guard_loss_gap"] == 0.08
+    assert training_config["overfit_guard_min_val_increase"] == 0.01
     assert training_config["hard_mining_enabled"] is True
     assert training_config["hard_mining_start_epoch"] == 2
     assert training_config["hard_mining_weight"] == 0.05
