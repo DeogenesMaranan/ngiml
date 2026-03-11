@@ -15,6 +15,12 @@ _LOG = logging.getLogger(__name__)
 logging.getLogger("timm.models._builder").setLevel(logging.ERROR)
 
 
+CANONICAL_SWIN_TINY_EMBED_DIM = 96
+CANONICAL_SWIN_TINY_DEPTHS = (2, 2, 6, 2)
+CANONICAL_SWIN_TINY_NUM_HEADS = (3, 6, 12, 24)
+CANONICAL_SWIN_TINY_WINDOW_SIZE = 7
+
+
 @dataclass
 class SwinBackboneConfig:
     """Configuration for the Swin Transformer feature extractor."""
@@ -23,6 +29,12 @@ class SwinBackboneConfig:
     pretrained: bool = True
     out_indices: Sequence[int] = (0, 1, 2, 3)
     input_size: Union[int, Tuple[int, int], None] = 384
+    embed_dim: int = 64
+    depths: Tuple[int, int, int, int] = (2, 2, 4, 2)
+    num_heads: Tuple[int, int, int, int] = (2, 4, 8, 16)
+    window_size: int = 7
+    adapt_pretrained: bool = True
+    pretrained_source_model_name: str = "swin_tiny_patch4_window7_224"
 
 
 class SwinBackbone(nn.Module):
@@ -32,7 +44,15 @@ class SwinBackbone(nn.Module):
         super().__init__()
         cfg = config or SwinBackboneConfig()
         self.config = cfg
-        model_kwargs = {"pretrained": cfg.pretrained, "features_only": True}
+        direct_pretrained = bool(cfg.pretrained) and self._uses_canonical_tiny_geometry(cfg)
+        model_kwargs = {
+            "pretrained": direct_pretrained,
+            "features_only": True,
+            "embed_dim": int(cfg.embed_dim),
+            "depths": tuple(int(v) for v in cfg.depths),
+            "num_heads": tuple(int(v) for v in cfg.num_heads),
+            "window_size": int(cfg.window_size),
+        }
         if cfg.input_size is not None:
             if isinstance(cfg.input_size, int):
                 model_kwargs["img_size"] = (int(cfg.input_size), int(cfg.input_size))
@@ -41,6 +61,14 @@ class SwinBackbone(nn.Module):
         # Create model without forcing out_indices first, then clamp requested indices
         # to the model's available feature levels and recreate with valid indices.
         self.model = timm.create_model(cfg.model_name, **model_kwargs)
+        if bool(cfg.pretrained) and not direct_pretrained:
+            if getattr(cfg, "adapt_pretrained", False):
+                self._adapt_from_pretrained_tiny(cfg)
+            else:
+                _LOG.warning(
+                    "custom Swin geometry requested with pretrained=True, but canonical weights do not match exactly; "
+                    "continuing with random init. Set adapt_pretrained=True to slice-initialize from pretrained Swin-Tiny."
+                )
         avail_n = len(self.model.feature_info)
         requested = tuple(cfg.out_indices) if cfg.out_indices is not None else tuple(range(avail_n))
         valid_indices = tuple(i for i in requested if 0 <= i < avail_n)
@@ -89,6 +117,49 @@ class SwinBackbone(nn.Module):
                 # Insert xformers logic here if needed
             except ImportError:
                 _LOG.info("xformers not installed; xformers attention will not be used.")
+
+    @staticmethod
+    def _uses_canonical_tiny_geometry(cfg: SwinBackboneConfig) -> bool:
+        return (
+            int(cfg.embed_dim) == CANONICAL_SWIN_TINY_EMBED_DIM
+            and tuple(int(v) for v in cfg.depths) == CANONICAL_SWIN_TINY_DEPTHS
+            and tuple(int(v) for v in cfg.num_heads) == CANONICAL_SWIN_TINY_NUM_HEADS
+            and int(cfg.window_size) == CANONICAL_SWIN_TINY_WINDOW_SIZE
+        )
+
+    @staticmethod
+    def _adapt_tensor(source: Tensor, target: Tensor) -> Tensor | None:
+        if source.ndim != target.ndim:
+            return None
+        adapted = target.clone()
+        common_slices = tuple(slice(0, min(src_dim, tgt_dim)) for src_dim, tgt_dim in zip(source.shape, target.shape))
+        adapted[common_slices] = source[common_slices].to(device=target.device, dtype=target.dtype)
+        return adapted
+
+    def _adapt_from_pretrained_tiny(self, cfg: SwinBackboneConfig) -> None:
+        source_model = timm.create_model(
+            cfg.pretrained_source_model_name,
+            pretrained=True,
+            features_only=True,
+        )
+        source_state = source_model.state_dict()
+        target_state = self.model.state_dict()
+        loaded = 0
+        for name, target in target_state.items():
+            source = source_state.get(name)
+            if source is None:
+                continue
+            adapted = self._adapt_tensor(source, target)
+            if adapted is None:
+                continue
+            target.copy_(adapted)
+            loaded += 1
+        self.model.load_state_dict(target_state, strict=False)
+        _LOG.info(
+            "adapted pretrained Swin-Tiny weights into custom geometry %s using %d parameter tensors",
+            cfg.model_name,
+            loaded,
+        )
 
     @staticmethod
     def _normalize_spatial_size(value: object) -> Tuple[int, int] | None:

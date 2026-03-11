@@ -28,16 +28,39 @@ def _build_activation(name: str) -> nn.Module:
 
 
 class _ConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, norm: str, activation: str) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        norm: str,
+        activation: str,
+        depthwise_separable: bool,
+    ) -> None:
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            _build_norm(norm, out_channels),
-            _build_activation(activation),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            _build_norm(norm, out_channels),
-            _build_activation(activation),
-        )
+        if depthwise_separable:
+            self.block = nn.Sequential(
+                nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels, bias=False),
+                _build_norm(norm, in_channels),
+                _build_activation(activation),
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                _build_norm(norm, out_channels),
+                _build_activation(activation),
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=False),
+                _build_norm(norm, out_channels),
+                _build_activation(activation),
+                nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
+                _build_norm(norm, out_channels),
+                _build_activation(activation),
+            )
+        else:
+            self.block = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+                _build_norm(norm, out_channels),
+                _build_activation(activation),
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+                _build_norm(norm, out_channels),
+                _build_activation(activation),
+            )
 
     def forward(self, x: Tensor) -> Tensor:
         return self.block(x)
@@ -55,6 +78,7 @@ class UNetDecoderConfig:
     norm: str = "in"  # Default to InstanceNorm
     activation: str = "relu"
     per_stage_heads: bool = True
+    depthwise_separable: bool = True
     enable_edge_guidance: bool = True  # Edge-aware decoder refinement (enabled by default)
     use_dropout: bool = True  # Dropout2d in highest-res decoder output enabled by default
     dropout_p: float = 0.2
@@ -116,6 +140,7 @@ class UNetDecoder(nn.Module):
             self.decoder_channels[-1],
             self.cfg.norm,
             self.cfg.activation,
+            self.cfg.depthwise_separable,
         )
 
         self.decode_blocks = nn.ModuleList(
@@ -125,6 +150,7 @@ class UNetDecoder(nn.Module):
                     self.decoder_channels[idx],
                     self.cfg.norm,
                     self.cfg.activation,
+                    self.cfg.depthwise_separable,
                 )
                 for idx in range(len(self.stage_channels) - 1)
             ]

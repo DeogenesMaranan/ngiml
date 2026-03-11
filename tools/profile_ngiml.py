@@ -26,7 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from src.model.feature_fusion import FeatureFusionConfig
-from src.model.hybrid_ngiml import HybridNGIML, HybridNGIMLConfig
+from src.model.hybrid_ngiml import DEFAULT_FUSION_CHANNELS, HybridNGIML, HybridNGIMLConfig
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fusion-channels",
         type=str,
-        default="128,192,256,320",
+        default=",".join(str(channel) for channel in DEFAULT_FUSION_CHANNELS),
         help="Comma-separated channel counts for each fusion stage",
     )
     parser.add_argument("--noise-branch", type=str, default="residual", help="Noise branch name")

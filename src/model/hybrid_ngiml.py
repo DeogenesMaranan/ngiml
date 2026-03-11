@@ -15,6 +15,14 @@ from .feature_fusion import FeatureFusionConfig, MultiStageFeatureFusion
 from .unet_decoder import UNetDecoder, UNetDecoderConfig
 
 
+DEFAULT_FUSION_CHANNELS = (40, 80, 128, 160)
+DEFAULT_DECODER_CHANNELS = (20, 40, 64, 96)
+LEGACY_FUSION_CHANNELS = (64, 128, 192, 256)
+DEFAULT_SWIN_EMBED_DIM = 64
+DEFAULT_SWIN_DEPTHS = (2, 2, 4, 2)
+DEFAULT_SWIN_NUM_HEADS = (2, 4, 8, 16)
+
+
 @dataclass
 class OptimizerGroupConfig:
     """Learning rate / weight decay pair for an optimizer parameter group."""
@@ -64,12 +72,22 @@ class HybridNGIMLConfig:
     """Aggregated configuration for the hybrid NGIML model."""
 
     efficientnet: EfficientNetBackboneConfig = field(default_factory=EfficientNetBackboneConfig)
-    swin: SwinBackboneConfig = field(default_factory=SwinBackboneConfig)
+    swin: SwinBackboneConfig = field(
+        default_factory=lambda: SwinBackboneConfig(
+            embed_dim=DEFAULT_SWIN_EMBED_DIM,
+            depths=DEFAULT_SWIN_DEPTHS,
+            num_heads=DEFAULT_SWIN_NUM_HEADS,
+            pretrained=True,
+            adapt_pretrained=True,
+        )
+    )
     residual: ResidualNoiseConfig = field(default_factory=ResidualNoiseConfig)
     fusion: FeatureFusionConfig = field(
-        default_factory=lambda: FeatureFusionConfig(fusion_channels=(64, 128, 192, 256))
+        default_factory=lambda: FeatureFusionConfig(fusion_channels=DEFAULT_FUSION_CHANNELS)
     )
-    decoder: UNetDecoderConfig = field(default_factory=UNetDecoderConfig)
+    decoder: UNetDecoderConfig = field(
+        default_factory=lambda: UNetDecoderConfig(decoder_channels=DEFAULT_DECODER_CHANNELS)
+    )
     optimizer: HybridNGIMLOptimizerConfig = field(default_factory=HybridNGIMLOptimizerConfig)
     use_low_level: bool = True
     use_context: bool = True
@@ -78,7 +96,6 @@ class HybridNGIMLConfig:
     gradient_checkpointing: bool = True  # Enable gradient checkpointing for memory savings
     flash_attention: bool = True  # Enable flash attention by default
     xformers: bool = True  # Enable xformers by default
-
 
 class HybridNGIML(nn.Module):
     """Full NGIML model exposing fused multi-scale features.
@@ -237,8 +254,14 @@ class HybridNGIML(nn.Module):
 
 
 __all__ = [
+    "DEFAULT_DECODER_CHANNELS",
+    "DEFAULT_FUSION_CHANNELS",
+    "DEFAULT_SWIN_DEPTHS",
+    "DEFAULT_SWIN_EMBED_DIM",
+    "DEFAULT_SWIN_NUM_HEADS",
     "HybridNGIML",
     "HybridNGIMLConfig",
+    "LEGACY_FUSION_CHANNELS",
     "HybridNGIMLOptimizerConfig",
     "OptimizerGroupConfig",
     "UNetDecoderConfig",
