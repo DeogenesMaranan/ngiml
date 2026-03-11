@@ -545,6 +545,100 @@ def _normalize(
     return image
 
 
+def _as_batched_image_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    if tensor.ndim == 3:
+        return tensor.unsqueeze(0), True
+    return tensor, False
+
+
+def _restore_batched_image_tensor(tensor: torch.Tensor, squeezed: bool) -> torch.Tensor:
+    return tensor.squeeze(0) if squeezed else tensor
+
+
+def _box_blur_tensor(tensor: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    kernel = max(1, int(kernel_size))
+    if kernel % 2 == 0:
+        kernel += 1
+    if kernel <= 1:
+        return tensor
+
+    batched, squeezed = _as_batched_image_tensor(tensor)
+    blurred = NN_F.avg_pool2d(batched, kernel_size=kernel, stride=1, padding=kernel // 2)
+    return _restore_batched_image_tensor(blurred, squeezed)
+
+
+def _rescale_tensor(tensor: torch.Tensor, scale: float, mode: str) -> torch.Tensor:
+    factor = float(scale)
+    if factor <= 0.0 or factor >= 0.999:
+        return tensor
+
+    batched, squeezed = _as_batched_image_tensor(tensor)
+    _, _, height, width = batched.shape
+    new_height = max(1, int(round(height * factor)))
+    new_width = max(1, int(round(width * factor)))
+    kwargs = {"size": (new_height, new_width), "mode": mode}
+    if mode != "nearest":
+        kwargs["align_corners"] = False
+    down = NN_F.interpolate(batched, **kwargs)
+    kwargs["size"] = (height, width)
+    up = NN_F.interpolate(down, **kwargs)
+    return _restore_batched_image_tensor(up, squeezed)
+
+
+def _compression_artifact_tensor(tensor: torch.Tensor, quality: int) -> torch.Tensor:
+    q = int(max(10, min(quality, 100)))
+    strength = float(100 - q) / 90.0
+    degraded = _rescale_tensor(tensor, scale=max(0.55, 1.0 - 0.4 * strength), mode="bilinear")
+    levels = max(16, int(round(256 - 192 * strength)))
+    return torch.round(degraded * float(levels - 1)) / float(max(1, levels - 1))
+
+
+def _apply_forensic_degradations(
+    image: torch.Tensor,
+    cfg: AugmentationConfig,
+    generator: torch.Generator | None = None,
+    high_pass: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def _rand_scalar() -> float:
+        return float(torch.rand((), device=image.device, generator=generator).item())
+
+    def _rand_range(low: float, high: float) -> float:
+        if high <= low:
+            return float(low)
+        return float(low + (high - low) * _rand_scalar())
+
+    if getattr(cfg, "enable_rescale", False):
+        rescale_prob = float(min(max(getattr(cfg, "rescale_prob", 0.0), 0.0), 1.0))
+        if rescale_prob > 0 and _rand_scalar() < rescale_prob:
+            factor_range = getattr(cfg, "rescale_factor_range", (0.6, 0.95))
+            factor = _rand_range(float(factor_range[0]), float(factor_range[1]))
+            image = _rescale_tensor(image, scale=factor, mode="bilinear")
+            if high_pass is not None:
+                high_pass = _rescale_tensor(high_pass, scale=factor, mode="bilinear")
+
+    if getattr(cfg, "enable_blur", False):
+        blur_prob = float(min(max(getattr(cfg, "blur_prob", 0.0), 0.0), 1.0))
+        if blur_prob > 0 and _rand_scalar() < blur_prob:
+            kernel_range = getattr(cfg, "blur_kernel_range", (3, 5))
+            kernel_low = int(kernel_range[0])
+            kernel_high = int(kernel_range[1])
+            kernel = int(round(_rand_range(kernel_low, kernel_high)))
+            image = _box_blur_tensor(image, kernel)
+            if high_pass is not None:
+                high_pass = _box_blur_tensor(high_pass, kernel)
+
+    if getattr(cfg, "enable_compression", False):
+        compression_prob = float(min(max(getattr(cfg, "compression_prob", 0.0), 0.0), 1.0))
+        if compression_prob > 0 and _rand_scalar() < compression_prob:
+            quality_range = getattr(cfg, "compression_quality_range", (35, 90))
+            quality = int(round(_rand_range(float(quality_range[0]), float(quality_range[1]))))
+            image = _compression_artifact_tensor(image, quality=quality)
+            if high_pass is not None:
+                high_pass = _compression_artifact_tensor(high_pass, quality=quality)
+
+    return torch.clamp(image, 0.0, 1.0), None if high_pass is None else torch.clamp(high_pass, 0.0, 1.0)
+
+
 def _apply_gpu_augmentations(
     image: torch.Tensor,
     mask: torch.Tensor,
@@ -722,6 +816,13 @@ def _apply_gpu_augmentations(
             noise = torch.randn_like(image) * std
             image = torch.clamp(image + noise, 0.0, 1.0)
 
+    image, high_pass = _apply_forensic_degradations(
+        image,
+        cfg,
+        generator=generator,
+        high_pass=high_pass,
+    )
+
     return image, mask, high_pass, edge_mask
 
 
@@ -890,6 +991,22 @@ def _apply_gpu_augmentations_batch(
                 high_pass = torch.nn.functional.grid_sample(high_pass, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
             if edge_masks is not None:
                 edge_masks = torch.nn.functional.grid_sample(edge_masks, grid, mode="nearest", padding_mode="zeros", align_corners=True)
+
+    if any(
+        bool(getattr(cfg, attr, False))
+        for attr in ("enable_rescale", "enable_blur", "enable_compression")
+    ):
+        for idx in range(B):
+            sample_high_pass = high_pass[idx] if high_pass is not None else None
+            out_image, out_high_pass = _apply_forensic_degradations(
+                images[idx],
+                cfg,
+                generator=generator,
+                high_pass=sample_high_pass,
+            )
+            images[idx] = out_image
+            if high_pass is not None and out_high_pass is not None:
+                high_pass[idx] = out_high_pass
 
     return images, masks, high_pass, edge_masks
 

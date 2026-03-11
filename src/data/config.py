@@ -78,6 +78,15 @@ class AugmentationConfig:
     contrast_jitter_factors: Sequence[float] = (0.9, 1.1)
     enable_noise: bool = True
     noise_std_range: Sequence[float] = (0.0, 0.0)
+    enable_blur: bool = False
+    blur_prob: float = 0.0
+    blur_kernel_range: Sequence[int] = (3, 5)
+    enable_rescale: bool = False
+    rescale_prob: float = 0.0
+    rescale_factor_range: Sequence[float] = (0.6, 0.95)
+    enable_compression: bool = False
+    compression_prob: float = 0.0
+    compression_quality_range: Sequence[int] = (35, 90)
     
     # Multi-scale training
     multiscale_training: bool = False
