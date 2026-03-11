@@ -42,7 +42,7 @@ def test_default_components_use_shared_augmentation_defaults():
     assert default_aug.max_rotation_degrees == 10.0
     assert default_aug.crop_scale_range == (0.75, 1.0)
     assert default_aug.noise_std_range == (0.0, 0.012)
-    assert default_aug.multiscale_training is True
+    assert default_aug.multiscale_training is False
     assert default_aug.multiscale_short_side_range == (384, 576)
     assert default_aug.enable_blur is True
     assert default_aug.blur_prob == 0.2
