@@ -935,6 +935,8 @@ def _collate_impl(
     normalization_mode: str,
     training: bool,
     aug_seed: int | None,
+    defer_transforms_to_device: bool,
+    defer_normalization_to_device: bool,
     batch: List[dict[str, object]],
 ) -> dict[str, object]:
     imagenet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
@@ -982,7 +984,7 @@ def _collate_impl(
             view_high_pass = base_high_pass
             view_edge_mask = base_edge_mask
 
-            if training and aug_cfg.enable:
+            if training and aug_cfg.enable and not defer_transforms_to_device:
                 view_image, view_mask, view_high_pass, view_edge_mask = _apply_gpu_augmentations(
                     view_image,
                     view_mask,
@@ -992,12 +994,13 @@ def _collate_impl(
                     generator=aug_generator,
                 )
 
-            view_image = _normalize(
-                view_image,
-                normalization_mode,
-                imagenet_mean=imagenet_mean,
-                imagenet_std=imagenet_std,
-            )
+            if not defer_normalization_to_device:
+                view_image = _normalize(
+                    view_image,
+                    normalization_mode,
+                    imagenet_mean=imagenet_mean,
+                    imagenet_std=imagenet_std,
+                )
 
             images.append(view_image)
             masks.append(view_mask)
@@ -1109,10 +1112,20 @@ def _collate_builder(
     normalization_mode: str,
     training: bool,
     aug_seed: int | None = None,
+    defer_transforms_to_device: bool = False,
+    defer_normalization_to_device: bool = False,
 ):
     # Return a picklable partial of the top-level collate implementation so
     # spawn-based multiprocessing (Windows) can serialize it.
-    return functools.partial(_collate_impl, per_dataset_aug, normalization_mode, training, aug_seed)
+    return functools.partial(
+        _collate_impl,
+        per_dataset_aug,
+        normalization_mode,
+        training,
+        aug_seed,
+        defer_transforms_to_device,
+        defer_normalization_to_device,
+    )
 
 
 def _group_by(split: str, samples: Iterable[SampleRecord]) -> Dict[str, list[SampleRecord]]:
@@ -1172,6 +1185,7 @@ def create_dataloaders(
 
     for split_name, per_dataset_records in splits.items():
         training = split_name == "train"
+        use_device_side_pipeline = device.type == "cuda"
         datasets: List[PerDatasetDataset] = []
         combined_short_sides: List[int] = []
         # Track whether each dataset will perform augmentations inside workers
@@ -1180,12 +1194,16 @@ def create_dataloaders(
         probed_count = 0
         for dataset_name, records in per_dataset_records.items():
             aug_cfg = per_dataset_augmentations.get(dataset_name, AugmentationConfig(enable=False))
-            apply_in_worker = bool(aug_cfg.enable and num_workers > 0 and device.type != "cuda")
+            dataset_aug_cfg = aug_cfg
+            if use_device_side_pipeline and training and getattr(dataset_aug_cfg, "multiscale_training", False):
+                dataset_aug_cfg = _dc_replace(dataset_aug_cfg, multiscale_training=False)
+
+            apply_in_worker = bool(dataset_aug_cfg.enable and num_workers > 0 and device.type != "cuda")
             per_dataset_apply_in_worker[dataset_name] = apply_in_worker
             datasets.append(
                 PerDatasetDataset(
                     records,
-                    aug_cfg=aug_cfg,
+                    aug_cfg=dataset_aug_cfg,
                     training=training,
                     max_short_side=max_short_side,
                     aug_seed=aug_seed,
@@ -1271,6 +1289,8 @@ def create_dataloaders(
             normalization_mode,
             training=training,
             aug_seed=aug_seed,
+            defer_transforms_to_device=bool(training and use_device_side_pipeline),
+            defer_normalization_to_device=bool(use_device_side_pipeline),
         )
 
         pf = prefetch_factor if num_workers > 0 else None

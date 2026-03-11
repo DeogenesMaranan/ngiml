@@ -20,9 +20,12 @@ class SwinBackboneConfig:
     """Configuration for the Swin Transformer feature extractor."""
 
     model_name: str = "swin_tiny_patch4_window7_224"
-    pretrained: bool = True
+    pretrained: bool = False
     out_indices: Sequence[int] = (0, 1, 2, 3)
     input_size: Union[int, Tuple[int, int], None] = 384
+    embed_dim: int = 64
+    depths: Sequence[int] = (2, 2, 4, 2)
+    num_heads: Sequence[int] = (2, 4, 8, 16)
 
 
 class SwinBackbone(nn.Module):
@@ -32,7 +35,13 @@ class SwinBackbone(nn.Module):
         super().__init__()
         cfg = config or SwinBackboneConfig()
         self.config = cfg
-        model_kwargs = {"pretrained": cfg.pretrained, "features_only": True}
+        model_kwargs = {
+            "pretrained": cfg.pretrained,
+            "features_only": True,
+            "embed_dim": int(cfg.embed_dim),
+            "depths": tuple(int(v) for v in cfg.depths),
+            "num_heads": tuple(int(v) for v in cfg.num_heads),
+        }
         if cfg.input_size is not None:
             if isinstance(cfg.input_size, int):
                 model_kwargs["img_size"] = (int(cfg.input_size), int(cfg.input_size))

@@ -250,9 +250,16 @@ def build_default_components():
 
     model_cfg = HybridNGIMLConfig(
         efficientnet=EfficientNetBackboneConfig(pretrained=True),
-        swin=SwinBackboneConfig(model_name="swin_tiny_patch4_window7_224", pretrained=True, input_size=384),
-        residual=ResidualNoiseConfig(num_kernels=3, base_channels=32, num_stages=4),
-        fusion=FeatureFusionConfig(fusion_channels=(64, 128, 192, 256)),
+        swin=SwinBackboneConfig(
+            model_name="swin_tiny_patch4_window7_224",
+            pretrained=False,
+            input_size=384,
+            embed_dim=64,
+            depths=(2, 2, 4, 2),
+            num_heads=(2, 4, 8, 16),
+        ),
+        residual=ResidualNoiseConfig(num_kernels=3, base_channels=24, num_stages=4),
+        fusion=FeatureFusionConfig(fusion_channels=(48, 96, 144, 192)),
         decoder=UNetDecoderConfig(decoder_channels=None, out_channels=1, per_stage_heads=True),
         optimizer=HybridNGIMLOptimizerConfig(
             efficientnet=OptimizerGroupConfig(lr=1e-5, weight_decay=1.5e-4),
@@ -283,7 +290,7 @@ def build_default_components():
 
     default_aug = AugmentationConfig(
         enable=True,
-        views_per_sample=3,
+        views_per_sample=2,
         enable_flips=True,
         enable_rotations=True,
         max_rotation_degrees=6.0,
@@ -332,7 +339,7 @@ def build_training_config(
     return {
         "manifest": str(manifest_path),
         "output_dir": output_dir,
-        "batch_size": 20,
+        "batch_size": 12,
         "grad_accum_steps": 1,
         "epochs": 50,
         "num_workers": 0,
@@ -348,11 +355,11 @@ def build_training_config(
         "prefetch_factor": 2,
         "persistent_workers": False,
         "drop_last": True,
-        "views_per_sample": 3,
-        "max_rotation_degrees": 6.0,
-        "noise_std_max": 0.012,
+        "views_per_sample": int(getattr(default_aug, "views_per_sample", 1)),
+        "max_rotation_degrees": float(getattr(default_aug, "max_rotation_degrees", 0.0)),
+        "noise_std_max": float(getattr(default_aug, "noise_std_range", (0.0, 0.0))[1]),
         "disable_aug": False,
-        "max_short_side": 480,
+        "max_short_side": 384,
         "device": "cuda",
         "aug_seed": 42,
         "seed": 42,

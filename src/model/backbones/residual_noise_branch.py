@@ -11,7 +11,7 @@ from torch import nn, Tensor
 class ResidualNoiseConfig:
     """Configuration for the SRM residual branch / multi-scale backbone."""
     num_kernels: int = 3  # SRM kernels (fixed)
-    base_channels: int = 32  # CNN backbone base channels
+    base_channels: int = 24  # CNN backbone base channels
     num_stages: int = 4      # Number of pyramid stages
 
 

@@ -67,7 +67,7 @@ class HybridNGIMLConfig:
     swin: SwinBackboneConfig = field(default_factory=SwinBackboneConfig)
     residual: ResidualNoiseConfig = field(default_factory=ResidualNoiseConfig)
     fusion: FeatureFusionConfig = field(
-        default_factory=lambda: FeatureFusionConfig(fusion_channels=(64, 128, 192, 256))
+        default_factory=lambda: FeatureFusionConfig(fusion_channels=(48, 96, 144, 192))
     )
     decoder: UNetDecoderConfig = field(default_factory=UNetDecoderConfig)
     optimizer: HybridNGIMLOptimizerConfig = field(default_factory=HybridNGIMLOptimizerConfig)

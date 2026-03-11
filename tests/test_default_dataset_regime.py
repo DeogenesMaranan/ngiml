@@ -25,11 +25,17 @@ def test_prepare_default_configs_use_casia2_for_training_and_coverage_columbia_f
 
 
 def test_default_components_use_shared_augmentation_defaults():
-    _model_cfg, _loss_cfg, default_aug, per_dataset_aug = build_default_components()
+    model_cfg, _loss_cfg, default_aug, per_dataset_aug = build_default_components()
 
     assert default_aug.enable is True
     assert default_aug.views_per_sample == 2
     assert default_aug.max_rotation_degrees == 6.0
     assert default_aug.crop_scale_range == (0.75, 1.0)
     assert default_aug.noise_std_range == (0.0, 0.012)
+    assert model_cfg.swin.pretrained is False
+    assert model_cfg.swin.embed_dim == 64
+    assert model_cfg.swin.depths == (2, 2, 4, 2)
+    assert model_cfg.swin.num_heads == (2, 4, 8, 16)
+    assert model_cfg.residual.base_channels == 24
+    assert model_cfg.fusion.fusion_channels == (48, 96, 144, 192)
     assert per_dataset_aug == {}
