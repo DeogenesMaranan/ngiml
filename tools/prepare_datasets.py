@@ -29,6 +29,24 @@ from src.data.config import DatasetStructureConfig, Manifest, PreparationConfig,
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
+def _load_rgb_image_for_npz(image_path: Path, jpeg_quality: int = 95) -> Image.Image:
+    """Load an RGB image and standardize non-JPEG sources through JPEG encoding.
+
+    This keeps preprocessing consistent by ensuring PNG/BMP/TIFF inputs pass
+    through the same JPEG artifact domain before the NPZ payload is written.
+    """
+    image = Image.open(image_path).convert("RGB")
+    if image_path.suffix.lower() in {".jpg", ".jpeg"}:
+        return image
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=int(jpeg_quality))
+    buffer.seek(0)
+    standardized = Image.open(buffer).convert("RGB")
+    standardized.load()
+    return standardized
+
+
 def _compute_high_pass(image_np: np.ndarray) -> np.ndarray:
     """Compute a deterministic per-channel high-pass map (uint8 HWC)."""
     if image_np.ndim != 3 or image_np.shape[2] != 3:
@@ -191,7 +209,7 @@ def _build_npz_bytes(
     include_high_pass: bool = True,
     compute_edge_mask: bool = False,
 ) -> bytes:
-    image = Image.open(image_path).convert("RGB")
+    image = _load_rgb_image_for_npz(image_path)
     mask_img = Image.open(mask_path).convert("L") if mask_path is not None else None
     edge_mask_img = Image.open(edge_mask_path).convert("L") if edge_mask_path is not None else None
 
