@@ -357,7 +357,7 @@ def build_training_config(
         "aug_seed": 42,
         "seed": 42,
         "warmup_epochs": 5,
-        "early_stopping_patience": 12,
+        "early_stopping_patience": 5,
         "early_stopping_min_delta": 1e-4,
         "early_stopping_monitor": "iou",
         "training_phase": "phase1",
