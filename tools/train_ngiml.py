@@ -946,6 +946,15 @@ def append_checkpoint_log(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     records: list[dict] = []
 
+    def _backup_corrupt(existing: Path) -> None:
+        try:
+            ts = int(time.time())
+            corrupt = existing.with_name(f"{existing.name}.corrupt.{ts}")
+            existing.replace(corrupt)
+            print(f"Backed up corrupt checkpoint log to {corrupt}")
+        except Exception:
+            pass
+
     if path.exists() and path.stat().st_size > 0:
         try:
             with open(path, "r", encoding="utf-8") as handle:
@@ -954,7 +963,10 @@ def append_checkpoint_log(path: Path, record: dict) -> None:
                 records = [item for item in payload if isinstance(item, dict)]
             elif isinstance(payload, dict):
                 records = [payload]
-        except Exception:
+        except Exception as exc:
+            # Preserve the corrupt file for inspection and continue with empty records
+            print(f"Warning: failed to read existing checkpoint log {path}: {exc}")
+            _backup_corrupt(path)
             records = []
     else:
         legacy_jsonl = path.with_suffix(".jsonl")
@@ -968,12 +980,25 @@ def append_checkpoint_log(path: Path, record: dict) -> None:
                         item = json.loads(line)
                         if isinstance(item, dict):
                             records.append(item)
-            except Exception:
+            except Exception as exc:
+                print(f"Warning: failed to read legacy jsonl checkpoint log {legacy_jsonl}: {exc}")
+                _backup_corrupt(legacy_jsonl)
                 records = []
 
     records.append(record)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(records, handle, indent=2)
+
+    # Write atomically to avoid truncation/corruption from concurrent writers or syncs.
+    tmp_path = path.with_suffix(".tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(records, handle, indent=2)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
 
 
 def load_checkpoint(
