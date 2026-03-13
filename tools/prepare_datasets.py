@@ -461,14 +461,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    args = parse_args()
+    datasets, per_dataset_splits, prep_cfg = build_default_configs()
     # Inject sample_limit into split configs if set
     if hasattr(args, 'sample_limit') and args.sample_limit is not None:
         for cfg in datasets:
             split_cfg = per_dataset_splits.get(cfg.dataset_name)
             if split_cfg is not None:
                 setattr(split_cfg, 'sample_limit_override', args.sample_limit)
-    args = parse_args()
-    datasets, per_dataset_splits, prep_cfg = build_default_configs()
 
     # Filter datasets if --dataset is specified
     if args.dataset:
