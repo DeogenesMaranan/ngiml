@@ -985,7 +985,43 @@ def load_checkpoint(
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     ema_model: Optional[HybridNGIML] = None,
 ) -> Tuple[int, int]:
-    data = torch.load(path, map_location=device)
+    # Attempt to load the requested checkpoint; if it's corrupt/unreadable,
+    # try earlier "checkpoint_epoch_*.pt" files in the same directory as fallbacks.
+    original_exc: Exception | None = None
+
+    def _attempt_load(p: Path):
+        try:
+            return torch.load(p, map_location=device)
+        except Exception as exc:
+            return exc
+
+    loaded = _attempt_load(path)
+    if isinstance(loaded, Exception):
+        original_exc = loaded
+        print(f"Failed to load checkpoint {path}: {loaded}")
+        # Search for other checkpoint candidates in the same directory
+        cand_dir = path.parent
+        try:
+            candidates = sorted(cand_dir.glob("checkpoint_epoch_*.pt"), key=_checkpoint_epoch)
+        except Exception:
+            candidates = []
+
+        for cand in reversed(candidates):
+            if cand == path:
+                continue
+            cand_loaded = _attempt_load(cand)
+            if not isinstance(cand_loaded, Exception):
+                print(f"Loaded fallback checkpoint {cand}")
+                loaded = cand_loaded
+                break
+            else:
+                print(f"Skipping unreadable checkpoint {cand}: {cand_loaded}")
+
+    if isinstance(loaded, Exception):
+        # Nothing usable found
+        raise RuntimeError(f"Unable to load checkpoint {path} or any fallback checkpoints: {original_exc}") from original_exc
+
+    data = loaded
     model_state = data.get("raw_model_state") or data["model_state"]
     model.load_state_dict(model_state)
     if ema_model is not None:
