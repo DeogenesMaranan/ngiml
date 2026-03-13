@@ -174,7 +174,7 @@ class TrainConfig:
     val_every: int = 1
     checkpoint_every: int = 1
     resume: Optional[str] = None
-    auto_resume: bool = False
+    auto_resume: bool = True
     round_robin_seed: Optional[int] = 42
     balance_sampling: bool = False
     balance_real_fake: bool = True
