@@ -2469,13 +2469,15 @@ def run_training(cfg: TrainConfig) -> None:
                         )
                         print(f"New best val f1 {best_val_f1:.4f}; saved to {best_f1_path}")
 
-            # Require BOTH f1 and loss to improve for early stopping reset and best checkpoint
-            both_improved = f1_improved and loss_improved
-            if both_improved:
+            # Use the configured early-stopping monitor to determine when to reset patience
+            monitor_value = _metric_for_monitor(metrics, cfg.early_stopping_monitor)
+            monitor_improved = monitor_value > (best_monitor_value + cfg.early_stopping_min_delta)
+
+            if monitor_improved:
+                # Update recorded bests and reset patience
+                best_monitor_value = monitor_value
                 best_val_f1 = val_f1
                 best_val_loss = val_loss
-                monitor_value = _metric_for_monitor(metrics, cfg.early_stopping_monitor)
-                best_monitor_value = monitor_value
                 no_improve_epochs = 0
                 best_alias_path = checkpoint_dir / "best_checkpoint.pt"
                 save_checkpoint(
@@ -2512,14 +2514,14 @@ def run_training(cfg: TrainConfig) -> None:
                     },
                 )
                 print(
-                    f"New best val f1 {val_f1:.4f} and loss {val_loss:.4f}; "
+                    f"New best {cfg.early_stopping_monitor} {monitor_value:.4f}; "
                     f"saved to {best_alias_path} (threshold metadata: {best_threshold_path})"
                 )
             elif early_stopping_enabled:
                 no_improve_epochs += 1
                 print(
                     f"Early stopping patience: {no_improve_epochs}/{cfg.early_stopping_patience} "
-                    f"without BOTH val_f1 and val_loss improvement"
+                    f"without {cfg.early_stopping_monitor} improvement"
                 )
 
         should_checkpoint = ((epoch + 1) % cfg.checkpoint_every == 0) or (epoch + 1 == cfg.epochs)
