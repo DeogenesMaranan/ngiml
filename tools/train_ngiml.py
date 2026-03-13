@@ -1063,8 +1063,8 @@ def find_latest_checkpoint(output_dir: Path) -> Optional[Path]:
     checkpoint_dir = output_dir / "checkpoints"
     if not checkpoint_dir.exists():
         return None
-        candidates = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pt"), key=_checkpoint_epoch)
-        return candidates[-1] if candidates else None
+    candidates = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pt"), key=_checkpoint_epoch)
+    return candidates[-1] if candidates else None
 
 
 @torch.inference_mode()
