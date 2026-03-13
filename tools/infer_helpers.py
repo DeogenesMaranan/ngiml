@@ -21,7 +21,6 @@ from src.data.dataloaders import (
 from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
 from tools.train_ngiml import build_default_components
-from tools.local_train_helpers import build_manifest_from_prepared
 
 
 def _zero_flop_jit(_inputs, _outputs) -> Counter[str]:
@@ -77,19 +76,6 @@ def find_latest_checkpoint(runs_root: Path) -> Path:
     if not candidates:
         raise FileNotFoundError(f"No checkpoint found under {runs_root}/**/checkpoints/checkpoint_epoch_*.pt")
     return candidates[-1]
-
-
-def ensure_local_manifest(prepared_root: Path, manifest_path: Path | None = None) -> Path:
-    prepared_root = Path(prepared_root)
-    if manifest_path is not None and Path(manifest_path).exists():
-        return Path(manifest_path)
-
-    default_manifest = prepared_root / "manifest_local.json"
-    if default_manifest.exists() and default_manifest.stat().st_size > 0:
-        return default_manifest
-
-    return build_manifest_from_prepared(prepared_root, manifest_out=default_manifest)
-
 
 def load_default_threshold(checkpoint_path: Path, fallback: float = 0.5) -> float:
     checkpoint_path = Path(checkpoint_path)
