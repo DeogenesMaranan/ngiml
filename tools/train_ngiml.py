@@ -226,7 +226,7 @@ class TrainConfig:
     bce_weight: float = 1.0
     focal_gamma: float = 2.0
     focal_alpha: float = 0.25
-    tversky_weight: float = 0.0
+    tversky_weight: float = 0.2
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.8
     lovasz_weight: float = 0.0
