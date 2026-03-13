@@ -271,21 +271,6 @@ class PerDatasetDataset(Dataset):
 
         cfg = self.aug_cfg
 
-        # --- Multi-scale training (random resize before crop) ---
-        if cfg.multiscale_training and self.training:
-            short_min, short_max = cfg.multiscale_short_side_range
-            h, w = image.shape[-2:]
-            short_side = min(h, w)
-            target_short = random.randint(short_min, short_max)
-            scale = target_short / float(short_side)
-            new_h, new_w = int(round(h * scale)), int(round(w * scale))
-            image = F.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-            mask = F.resize(mask, [new_h, new_w], interpolation=InterpolationMode.NEAREST)
-            if edge_mask is not None:
-                edge_mask = F.resize(edge_mask, [new_h, new_w], interpolation=InterpolationMode.NEAREST)
-            if high_pass is not None:
-                high_pass = F.resize(high_pass, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-
         # If configured, perform per-sample augmentations inside the worker.
         if self.apply_augmentations and self.training and cfg.enable:
             worker_info = torch.utils.data.get_worker_info()

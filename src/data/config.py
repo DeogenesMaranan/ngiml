@@ -55,8 +55,8 @@ class PreparationConfig:
 class AugmentationConfig:
     """Augmentation config for NGIML dataloader.
 
-    Forensic motivation: Applies multi-scale resizing and other lightweight
-    augmentations to improve generalization and robustness to manipulation
+    Forensic motivation: Applies lightweight augmentations to improve
+    generalization and robustness to manipulation
     scale/quality.
     """
     enable: bool = True
@@ -78,10 +78,6 @@ class AugmentationConfig:
     contrast_jitter_factors: Sequence[float] = (0.9, 1.1)
     enable_noise: bool = True
     noise_std_range: Sequence[float] = (0.0, 0.0)
-    
-    # Multi-scale training
-    multiscale_training: bool = False
-    multiscale_short_side_range: Sequence[int] = (384, 640)
 
 
 @dataclass
