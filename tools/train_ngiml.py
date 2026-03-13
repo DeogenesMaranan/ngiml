@@ -204,7 +204,7 @@ class TrainConfig:
     auto_phase2_enabled: bool = True
     auto_phase2_patience: int = 5
     auto_phase2_lr_scale: float = 0.33
-    auto_phase2_tversky_weight: float = 0.1
+    auto_phase2_tversky_weight: float = 0.5
     auto_phase2_monitor: str = "f1"
     metric_threshold: float = 0.5
     optimize_threshold: bool = True
@@ -292,7 +292,7 @@ def build_default_components() -> tuple[HybridNGIMLConfig, MultiStageLossConfig,
         stage_weights=[0.05, 0.1, 0.2, 1.0],
         smooth=1e-6,
         hybrid_mode="dice_bce",
-        tversky_weight=0.0,
+        tversky_weight=0.2,
         tversky_alpha=0.3,
         tversky_beta=0.8,
         lovasz_weight=0.0,
@@ -352,7 +352,7 @@ def build_training_config(
         bce_weight=float(getattr(loss_cfg, "bce_weight", 1.0)),
         focal_gamma=float(getattr(loss_cfg, "focal_gamma", 2.0)),
         focal_alpha=float(getattr(loss_cfg, "focal_alpha", 0.25)),
-        tversky_weight=float(getattr(loss_cfg, "tversky_weight", 0.0)),
+        tversky_weight=float(getattr(loss_cfg, "tversky_weight", 0.2)),
         tversky_alpha=float(getattr(loss_cfg, "tversky_alpha", 0.3)),
         tversky_beta=float(getattr(loss_cfg, "tversky_beta", 0.8)),
         lovasz_weight=float(getattr(loss_cfg, "lovasz_weight", 0.0)),
@@ -1165,7 +1165,8 @@ def _build_phase2_config(cfg: TrainConfig, best_iou_path: Path) -> TrainConfig:
         warmup_epochs=0,
         early_stopping_monitor=phase2_metric,
         threshold_metric=phase2_metric,
-        tversky_weight=float(cfg.auto_phase2_tversky_weight),
+        # Treat `auto_phase2_tversky_weight` as a multiplier of the phase-1 tversky weight
+        tversky_weight=float(getattr(cfg, "tversky_weight", 0.0)) * float(cfg.auto_phase2_tversky_weight),
         lovasz_weight=0.0,
         hard_mining_enabled=False,
         model_config=phase2_model_cfg,

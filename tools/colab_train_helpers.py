@@ -145,7 +145,7 @@ def apply_phase2_resume_preset(
     training_config: dict,
     resume_checkpoint: str,
     lr_scale: float = 0.33,
-    tversky_weight: float = 0.1,
+    tversky_weight: float = 0.5,
     monitor_metric: str = "iou",
 ) -> dict:
     """Apply phase-2 fine-tuning settings after a phase-1 plateau.
