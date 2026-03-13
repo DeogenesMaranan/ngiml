@@ -1,8 +1,10 @@
-
 import os
 import shutil
 from pathlib import Path
 from tools.manifest_utils import find_or_resolve_manifest
+from src.model.hybrid_ngiml import HybridNGIMLConfig
+from src.model.losses import MultiStageLossConfig
+from src.data.config import AugmentationConfig
 
 def apply_phase2_resume_preset(
     training_config: dict,
