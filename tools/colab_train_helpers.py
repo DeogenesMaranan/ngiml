@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Tuple
 
 from src.data.dataloaders import AugmentationConfig, load_manifest
+from tools.train_ngiml import (
+    build_default_components as _build_default_components_top_level,
+    build_training_config as _build_training_config_top_level,
+)
 
 if TYPE_CHECKING:
     from src.model.hybrid_ngiml import HybridNGIMLConfig
@@ -239,72 +243,7 @@ def find_or_resolve_manifest(data_root: Path, manifest_names: Tuple[str, ...] = 
 
 
 def build_default_components():
-    # Import model config classes lazily to avoid importing heavy ML libraries at module import time
-    from src.model.backbones.efficientnet_backbone import EfficientNetBackboneConfig
-    from src.model.backbones.residual_noise_branch import ResidualNoiseConfig
-    from src.model.backbones.swin_backbone import SwinBackboneConfig
-    from src.model.feature_fusion import FeatureFusionConfig
-    from src.model.hybrid_ngiml import HybridNGIMLConfig, HybridNGIMLOptimizerConfig, OptimizerGroupConfig
-    from src.model.losses import MultiStageLossConfig
-    from src.model.unet_decoder import UNetDecoderConfig
-
-    model_cfg = HybridNGIMLConfig(
-        efficientnet=EfficientNetBackboneConfig(pretrained=True),
-        swin=SwinBackboneConfig(model_name="swin_tiny_patch4_window7_224", pretrained=True, input_size=384),
-        residual=ResidualNoiseConfig(num_kernels=3, base_channels=32, num_stages=4),
-        fusion=FeatureFusionConfig(fusion_channels=(64, 128, 192, 256)),
-        decoder=UNetDecoderConfig(decoder_channels=None, out_channels=1, per_stage_heads=True),
-        optimizer=HybridNGIMLOptimizerConfig(
-            efficientnet=OptimizerGroupConfig(lr=1e-5, weight_decay=1.5e-4),
-            swin=OptimizerGroupConfig(lr=5e-6, weight_decay=1e-4),
-            residual=OptimizerGroupConfig(lr=2.5e-4, weight_decay=2e-4),
-            fusion=OptimizerGroupConfig(lr=1.2e-4, weight_decay=2e-4),
-            decoder=OptimizerGroupConfig(lr=1.8e-4, weight_decay=2e-4),
-        ),
-        use_low_level=True,
-        use_context=True,
-        use_residual=True,
-    )
-
-    loss_cfg = MultiStageLossConfig(
-        dice_weight=1.0,
-        bce_weight=1.0,
-        pos_weight=1.0,
-        stage_weights=[0.05, 0.1, 0.2, 1.0],
-        smooth=1e-6,
-        hybrid_mode="dice_bce",
-        tversky_weight=0.0,
-        tversky_alpha=0.3,
-        tversky_beta=0.8,
-        lovasz_weight=0.0,
-        use_boundary_loss=True,
-        boundary_weight=0.03,
-    )
-
-    default_aug = AugmentationConfig(
-        enable=True,
-        views_per_sample=3,
-        enable_flips=True,
-        enable_rotations=True,
-        max_rotation_degrees=6.0,
-        enable_random_crop=True,
-        crop_scale_range=(0.75, 1.0),
-        object_crop_bias_prob=0.85,
-        min_fg_pixels_for_object_crop=8,
-        enable_elastic=False,
-        elastic_prob=0.0,
-        elastic_alpha=8.0,
-        elastic_sigma=5.0,
-        enable_color_jitter=True,
-        brightness_jitter_factors=(0.9, 1.1),
-        contrast_jitter_factors=(0.9, 1.1),
-        enable_noise=True,
-        noise_std_range=(0.0, 0.012),
-    )
-
-    per_dataset_aug = {}
-
-    return model_cfg, loss_cfg, default_aug, per_dataset_aug
+    return _build_default_components_top_level()
 
 
 def build_training_config(
@@ -315,89 +254,14 @@ def build_training_config(
     default_aug: AugmentationConfig,
     per_dataset_aug: dict[str, AugmentationConfig],
 ) -> dict:
-    effective_hybrid_mode = str(getattr(loss_cfg, "hybrid_mode", "dice_bce"))
-    effective_dice_weight = float(getattr(loss_cfg, "dice_weight", 1.0))
-    effective_bce_weight = float(getattr(loss_cfg, "bce_weight", 1.0))
-    effective_focal_gamma = float(getattr(loss_cfg, "focal_gamma", 2.0))
-    effective_focal_alpha = float(getattr(loss_cfg, "focal_alpha", 0.25))
-    effective_tversky_weight = float(getattr(loss_cfg, "tversky_weight", 0.0))
-    effective_tversky_alpha = float(getattr(loss_cfg, "tversky_alpha", 0.3))
-    effective_tversky_beta = float(getattr(loss_cfg, "tversky_beta", 0.8))
-    effective_lovasz_weight = float(getattr(loss_cfg, "lovasz_weight", 0.0))
-    effective_use_boundary_loss = bool(getattr(loss_cfg, "use_boundary_loss", False))
-    effective_boundary_weight = float(getattr(loss_cfg, "boundary_weight", 0.05))
-
-    return {
-        "manifest": str(manifest_path),
-        "output_dir": output_dir,
-        "batch_size": 20,
-        "grad_accum_steps": 1,
-        "epochs": 50,
-        "num_workers": 0,
-        "amp": True,
-        "grad_clip": 1.0,
-        "val_every": 1,
-        "checkpoint_every": 1,
-        "resume": None,
-        "auto_resume": True,
-        "round_robin_seed": 42,
-        "balance_real_fake": True,
-        "balanced_positive_ratio": 0.6,
-        "prefetch_factor": 2,
-        "persistent_workers": False,
-        "drop_last": True,
-        "views_per_sample": 3,
-        "max_rotation_degrees": 6.0,
-        "noise_std_max": 0.012,
-        "disable_aug": False,
-        "max_short_side": 480,
-        "device": "cuda",
-        "aug_seed": 42,
-        "seed": 42,
-        "warmup_epochs": 3,
-        "early_stopping_patience": 12,
-        "early_stopping_min_delta": 1e-4,
-        "training_phase": "phase1",
-        "auto_phase2_enabled": True,
-        "auto_phase2_patience": 5,
-        "auto_phase2_lr_scale": 0.33,
-        "auto_phase2_tversky_weight": 0.1,
-        "auto_phase2_monitor": "iou",
-        "metric_threshold": 0.5,
-        "optimize_threshold": True,
-        "threshold_metric": "f1",
-        "threshold_start": 0.2,
-        "threshold_end": 0.8,
-        "threshold_step": 0.02,
-        "compute_foreground_ratio": True,
-        "foreground_ratio_max_batches": 20,
-        "short_side_probe_samples": 0,
-        "auto_pos_weight": True,
-        "pos_weight_min": 0.5,
-        "pos_weight_max": 10.0,
-        "balanced_pos_weight_cap": 3.0,
-        "loss_hybrid_mode": effective_hybrid_mode,
-        "dice_weight": effective_dice_weight,
-        "bce_weight": effective_bce_weight,
-        "focal_gamma": effective_focal_gamma,
-        "focal_alpha": effective_focal_alpha,
-        "tversky_weight": effective_tversky_weight,
-        "tversky_alpha": effective_tversky_alpha,
-        "tversky_beta": effective_tversky_beta,
-        "lovasz_weight": effective_lovasz_weight,
-        "use_boundary_loss": effective_use_boundary_loss,
-        "boundary_weight": effective_boundary_weight,
-        "ema_enabled": True,
-        "ema_decay": 0.999,
-        "hard_mining_enabled": False,
-        "hard_mining_start_epoch": 5,
-        "hard_mining_weight": 0.03,
-        "hard_mining_gamma": 2.0,
-        "default_aug": default_aug,
-        "per_dataset_aug": per_dataset_aug,
-        "model_config": model_cfg,
-        "loss_config": loss_cfg,
-    }
+    return _build_training_config_top_level(
+        manifest_path=manifest_path,
+        output_dir=output_dir,
+        model_cfg=model_cfg,
+        loss_cfg=loss_cfg,
+        default_aug=default_aug,
+        per_dataset_aug=per_dataset_aug,
+    )
 
 
 def apply_phase2_resume_preset(
@@ -526,45 +390,6 @@ def apply_colab_runtime_settings(
     return training_config
 
 
-def apply_high_throughput_settings(training_config: dict, target_batch_size: int = 32) -> dict:
-    """Adjust a training_config dict for high-throughput GPU runs.
-
-    This function updates worker counts, prefetching, memory format and
-    precision defaults to better saturate modern accelerators.
-    """
-    recommended_workers = max(4, min(16, (os.cpu_count() or 4)))
-    training_config.update(
-        {
-            "batch_size": int(target_batch_size),
-            "num_workers": recommended_workers,
-            "pin_memory": True,
-            "prefetch_factor": 4,
-            "persistent_workers": True,
-            "compile_model": True,
-            "compile_mode": "default",
-            "channels_last": True,
-            "use_tf32": True,
-            "precision": "bf16",
-        }
-    )
-
-    model_cfg = training_config.get("model_config")
-    if model_cfg is not None and hasattr(model_cfg, "optimizer"):
-        optimizer_cfg = model_cfg.optimizer
-        batch_size = int(training_config.get("batch_size", 12))
-        grad_accum_steps = int(training_config.get("grad_accum_steps", 1))
-        effective_batch = max(1, batch_size * grad_accum_steps)
-        ratio = float(effective_batch) / float(12)
-        lr_scale = float(min(max(math.sqrt(ratio), 0.75), 1.8))
-        wd_scale = float(min(max(pow(ratio, 0.25), 0.9), 1.35))
-        for group_name in ("efficientnet", "swin", "residual", "fusion", "decoder"):
-            group = getattr(optimizer_cfg, group_name, None)
-            if group is None:
-                continue
-            group.lr = float(group.lr) * lr_scale
-            group.weight_decay = float(group.weight_decay) * wd_scale
-
-    return training_config
 
 
 def stage_persistent_cache_to_runtime(

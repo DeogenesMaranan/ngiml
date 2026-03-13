@@ -258,6 +258,114 @@ class Checkpoint:
     train_config: dict
 
 
+def build_default_components() -> tuple[HybridNGIMLConfig, MultiStageLossConfig, AugmentationConfig, dict[str, AugmentationConfig]]:
+    """Build default model/loss/augmentation configs from a single top-level source."""
+    from src.model.backbones.efficientnet_backbone import EfficientNetBackboneConfig
+    from src.model.backbones.residual_noise_branch import ResidualNoiseConfig
+    from src.model.backbones.swin_backbone import SwinBackboneConfig
+    from src.model.feature_fusion import FeatureFusionConfig
+    from src.model.hybrid_ngiml import HybridNGIMLOptimizerConfig, OptimizerGroupConfig
+    from src.model.unet_decoder import UNetDecoderConfig
+
+    model_cfg = HybridNGIMLConfig(
+        efficientnet=EfficientNetBackboneConfig(pretrained=True),
+        swin=SwinBackboneConfig(model_name="swin_tiny_patch4_window7_224", pretrained=True, input_size=384),
+        residual=ResidualNoiseConfig(num_kernels=3, base_channels=32, num_stages=4),
+        fusion=FeatureFusionConfig(fusion_channels=(64, 128, 192, 256)),
+        decoder=UNetDecoderConfig(decoder_channels=None, out_channels=1, per_stage_heads=True),
+        optimizer=HybridNGIMLOptimizerConfig(
+            efficientnet=OptimizerGroupConfig(lr=1e-5, weight_decay=1.5e-4),
+            swin=OptimizerGroupConfig(lr=5e-6, weight_decay=1e-4),
+            residual=OptimizerGroupConfig(lr=2.5e-4, weight_decay=2e-4),
+            fusion=OptimizerGroupConfig(lr=1.2e-4, weight_decay=2e-4),
+            decoder=OptimizerGroupConfig(lr=1.8e-4, weight_decay=2e-4),
+        ),
+        use_low_level=True,
+        use_context=True,
+        use_residual=True,
+    )
+
+    loss_cfg = MultiStageLossConfig(
+        dice_weight=1.0,
+        bce_weight=1.0,
+        pos_weight=1.0,
+        stage_weights=[0.05, 0.1, 0.2, 1.0],
+        smooth=1e-6,
+        hybrid_mode="dice_bce",
+        tversky_weight=0.0,
+        tversky_alpha=0.3,
+        tversky_beta=0.8,
+        lovasz_weight=0.0,
+        use_boundary_loss=True,
+        boundary_weight=0.03,
+    )
+
+    default_aug = AugmentationConfig(
+        enable=True,
+        views_per_sample=3,
+        enable_flips=True,
+        enable_rotations=True,
+        max_rotation_degrees=6.0,
+        enable_random_crop=True,
+        crop_scale_range=(0.75, 1.0),
+        object_crop_bias_prob=0.85,
+        min_fg_pixels_for_object_crop=8,
+        enable_elastic=False,
+        elastic_prob=0.0,
+        elastic_alpha=8.0,
+        elastic_sigma=5.0,
+        enable_color_jitter=True,
+        brightness_jitter_factors=(0.9, 1.1),
+        contrast_jitter_factors=(0.9, 1.1),
+        enable_noise=True,
+        noise_std_range=(0.0, 0.012),
+    )
+
+    per_dataset_aug: dict[str, AugmentationConfig] = {}
+    return model_cfg, loss_cfg, default_aug, per_dataset_aug
+
+
+def build_training_config(
+    manifest_path: Path | str,
+    output_dir: str,
+    model_cfg: HybridNGIMLConfig,
+    loss_cfg: MultiStageLossConfig,
+    default_aug: AugmentationConfig,
+    per_dataset_aug: dict[str, AugmentationConfig],
+) -> dict:
+    """Build notebook-friendly training config dict from top-level defaults."""
+    cfg = TrainConfig(
+        manifest=str(manifest_path),
+        output_dir=output_dir,
+        batch_size=20,
+        num_workers=0,
+        prefetch_factor=2,
+        max_short_side=480,
+        max_rotation_degrees=6.0,
+        noise_std_max=0.012,
+        warmup_epochs=3,
+        auto_phase2_enabled=True,
+        foreground_ratio_max_batches=20,
+        short_side_probe_samples=0,
+        loss_hybrid_mode=str(getattr(loss_cfg, "hybrid_mode", "dice_bce")),
+        dice_weight=float(getattr(loss_cfg, "dice_weight", 1.0)),
+        bce_weight=float(getattr(loss_cfg, "bce_weight", 1.0)),
+        focal_gamma=float(getattr(loss_cfg, "focal_gamma", 2.0)),
+        focal_alpha=float(getattr(loss_cfg, "focal_alpha", 0.25)),
+        tversky_weight=float(getattr(loss_cfg, "tversky_weight", 0.0)),
+        tversky_alpha=float(getattr(loss_cfg, "tversky_alpha", 0.3)),
+        tversky_beta=float(getattr(loss_cfg, "tversky_beta", 0.8)),
+        lovasz_weight=float(getattr(loss_cfg, "lovasz_weight", 0.0)),
+        use_boundary_loss=bool(getattr(loss_cfg, "use_boundary_loss", False)),
+        boundary_weight=float(getattr(loss_cfg, "boundary_weight", 0.05)),
+        default_aug=default_aug,
+        per_dataset_aug=per_dataset_aug,
+        model_config=model_cfg,
+        loss_config=loss_cfg,
+    )
+    return dict(cfg.__dict__)
+
+
 def parse_args() -> TrainConfig:
     # Use a higher default worker count to better saturate fast GPUs (e.g. A100).
     # Keep a sensible floor to avoid tiny values on CI/low-core systems.

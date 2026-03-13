@@ -20,7 +20,7 @@ from src.data.dataloaders import (
 )
 from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
-from tools.colab_train_helpers import build_default_components
+from tools.train_ngiml import build_default_components
 from tools.local_train_helpers import build_manifest_from_prepared
 
 
