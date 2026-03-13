@@ -117,7 +117,7 @@ class MultiStageLossConfig:
     tversky_beta: float = 0.7
     lovasz_weight: float = 0.0  # Weight for Lovasz Hinge Loss
     use_boundary_loss: bool = False
-    boundary_weight: float = 0.05
+    boundary_weight: float = 0.03
     hard_pixel_mining: bool = False  # Disable hard pixel mining by default to stabilize training
     
 
