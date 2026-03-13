@@ -2143,6 +2143,8 @@ def run_training(cfg: TrainConfig) -> None:
 
     device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
+    # Force precision to bfloat16 at runtime per user request
+    cfg = replace(cfg, precision="bf16")
     cfg = _resolve_cuda_runtime_stability(cfg, device)
 
     if device.type == "cuda":
