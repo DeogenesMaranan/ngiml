@@ -409,6 +409,11 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare datasets and emit manifest.parquet")
     parser.add_argument("--manifest", type=str, default=None, help="Output manifest path. Defaults to <prepared_root>/manifest.parquet")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Name of a single dataset to process (e.g., CASIA2, IMD2020, Columbia, COVERAGE). If omitted, processes all.")
     return parser.parse_args()
 
 
@@ -416,8 +421,22 @@ def main() -> None:
     args = parse_args()
     datasets, per_dataset_splits, prep_cfg = build_default_configs()
 
+    # Filter datasets if --dataset is specified
+    if args.dataset:
+        selected = args.dataset.strip().lower()
+        datasets = [d for d in datasets if d.dataset_name.lower() == selected]
+        if not datasets:
+            raise ValueError(f"Dataset '{args.dataset}' not found in config. Available: {[d.dataset_name for d in build_default_configs()[0]]}")
+        print(f"Processing only dataset: {datasets[0].dataset_name}")
+
     prepared_root = Path(datasets[0].prepared_root)
-    manifest_out = Path(args.manifest) if args.manifest else prepared_root / "manifest.parquet"
+    # If only one dataset, default manifest name includes dataset name
+    if args.manifest:
+        manifest_out = Path(args.manifest)
+    elif len(datasets) == 1:
+        manifest_out = prepared_root / datasets[0].dataset_name / "manifest.parquet"
+    else:
+        manifest_out = prepared_root / "manifest.parquet"
 
     manifest = prepare_all(datasets, per_dataset_splits, prep_cfg, manifest_out)
     print(f"Wrote manifest with {len(manifest.samples)} samples to {manifest_out}")
