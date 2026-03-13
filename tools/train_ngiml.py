@@ -199,13 +199,13 @@ class TrainConfig:
     seed: int = 42
     early_stopping_patience: int = 7
     early_stopping_min_delta: float = 1e-4
-    early_stopping_monitor: str = "iou"
+    early_stopping_monitor: str = "f1"
     training_phase: str = "phase1"
     auto_phase2_enabled: bool = True
     auto_phase2_patience: int = 5
     auto_phase2_lr_scale: float = 0.33
     auto_phase2_tversky_weight: float = 0.1
-    auto_phase2_monitor: str = "iou"
+    auto_phase2_monitor: str = "f1"
     metric_threshold: float = 0.5
     optimize_threshold: bool = True
     threshold_metric: str = "f1"
@@ -484,13 +484,13 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducibility")
     parser.add_argument("--early-stopping-patience", type=int, default=5, help="Stop after N validations without improvement; <=0 disables")
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4, help="Minimum monitored-metric improvement to reset early stopping")
-    parser.add_argument("--early-stopping-monitor", type=str, default="loss", choices=["iou", "dice", "f1", "recall", "precision", "accuracy", "loss"], help="Validation metric used for early stopping and best checkpoint")
+    parser.add_argument("--early-stopping-monitor", type=str, default="f1", choices=["iou", "dice", "f1", "recall", "precision", "accuracy"], help="Validation metric used for early stopping and best checkpoint")
     parser.add_argument("--training-phase", type=str, default="phase1", choices=["phase1", "phase2"], help="Training phase label stored in checkpoints and logs")
     parser.add_argument("--auto-phase2-enabled", action=argparse.BooleanOptionalAction, default=True, help="Automatically switch to phase 2 from the best IoU checkpoint after a phase-1 plateau")
     parser.add_argument("--auto-phase2-patience", type=int, default=5, help="Validations without improvement before auto phase-2 triggers during phase 1")
     parser.add_argument("--auto-phase2-lr-scale", type=float, default=0.33, help="LR multiplier applied when auto phase-2 activates")
     parser.add_argument("--auto-phase2-tversky-weight", type=float, default=0.1, help="Tversky loss weight applied during auto phase-2")
-    parser.add_argument("--auto-phase2-monitor", type=str, default="iou", choices=["iou", "f1", "dice"], help="Validation metric used for auto phase-2 monitoring and threshold selection")
+    parser.add_argument("--auto-phase2-monitor", type=str, default="f1", choices=["iou", "f1", "dice"], help="Validation metric used for auto phase-2 monitoring and threshold selection")
     parser.add_argument("--metric-threshold", type=float, default=0.5, help="Fixed threshold for sigmoid outputs when threshold optimization is disabled")
     parser.add_argument("--optimize-threshold", action=argparse.BooleanOptionalAction, default=True, help="Search validation thresholds and use the best for metric reporting")
     parser.add_argument("--threshold-metric", type=str, default="f1", choices=["iou", "dice", "f1"], help="Metric used to select best threshold")
@@ -1117,8 +1117,6 @@ def compute_foreground_pixel_ratio(loader, max_batches: int | None = 200) -> flo
 
 def _metric_for_monitor(metrics: dict, monitor: str) -> float:
     key = str(monitor).strip().lower()
-    if key == "loss":
-        return -float(metrics["loss"])
     if key not in metrics:
         raise KeyError(f"Unsupported monitor metric: {monitor}")
     return float(metrics[key])
@@ -2332,6 +2330,8 @@ def run_training(cfg: TrainConfig) -> None:
     best_val_f1 = float("-inf")
     best_val_loss = float("inf")
     no_improve_epochs = 0
+    # Track IoU-specific non-improvement separately so auto-phase2 can consider IoU plateaus
+    no_improve_epochs_iou = 0
     early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
     best_threshold_path = checkpoint_dir / "best_threshold.json"
     auto_phase2_triggered = str(getattr(cfg, "training_phase", "phase1")).strip().lower() == "phase2"
@@ -2547,12 +2547,19 @@ def run_training(cfg: TrainConfig) -> None:
                     f"New best {cfg.early_stopping_monitor} {monitor_value:.4f}; "
                     f"saved to {best_alias_path} (threshold metadata: {best_threshold_path})"
                 )
-            elif early_stopping_enabled:
-                no_improve_epochs += 1
-                print(
-                    f"Early stopping patience: {no_improve_epochs}/{cfg.early_stopping_patience} "
-                    f"without {cfg.early_stopping_monitor} improvement"
-                )
+            else:
+                # Update monitor-based counter
+                if early_stopping_enabled:
+                    no_improve_epochs += 1
+                    print(
+                        f"Early stopping patience: {no_improve_epochs}/{cfg.early_stopping_patience} "
+                        f"without {cfg.early_stopping_monitor} improvement"
+                    )
+                # Update IoU-based counter independently
+                if not iou_improved:
+                    no_improve_epochs_iou += 1
+                else:
+                    no_improve_epochs_iou = 0
 
         should_checkpoint = ((epoch + 1) % cfg.checkpoint_every == 0) or (epoch + 1 == cfg.epochs)
         if should_checkpoint:
@@ -2593,6 +2600,22 @@ def run_training(cfg: TrainConfig) -> None:
 
         # Stricter patience for auto phase2: require both val_f1 and val_loss to improve for patience reset
         auto_phase2_patience = max(1, int(getattr(cfg, "auto_phase2_patience", 0)))
+        # Debug: report auto-phase2 decision variables
+        try:
+            best_iou_exists = (checkpoint_dir / "best_iou_checkpoint.pt").is_file()
+        except Exception:
+            best_iou_exists = False
+        print(
+            "[auto-phase2 debug]",
+            f"no_improve_epochs={no_improve_epochs}",
+            f"no_improve_epochs_iou={no_improve_epochs_iou}",
+            f"auto_phase2_patience={auto_phase2_patience}",
+            f"auto_phase2_enabled={bool(getattr(cfg, 'auto_phase2_enabled', False))}",
+            f"training_phase={str(getattr(cfg, 'training_phase', 'phase1')).strip().lower()}",
+            f"val_every={cfg.val_every}",
+            f"best_iou_exists={best_iou_exists}",
+        )
+
         auto_phase2_ready = (
             "val" in loaders
             and not auto_phase2_triggered
@@ -2600,6 +2623,7 @@ def run_training(cfg: TrainConfig) -> None:
             and str(getattr(cfg, "training_phase", "phase1")).strip().lower() == "phase1"
             and (epoch + 1) % cfg.val_every == 0
             and no_improve_epochs >= auto_phase2_patience
+            and no_improve_epochs_iou >= auto_phase2_patience
         )
         if auto_phase2_ready:
             best_iou_path = checkpoint_dir / "best_iou_checkpoint.pt"
