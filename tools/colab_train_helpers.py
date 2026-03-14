@@ -7,6 +7,10 @@ from tools.manifest_utils import find_or_resolve_manifest
 from src.model.hybrid_ngiml import HybridNGIMLConfig
 from src.model.losses import MultiStageLossConfig
 from src.data.config import AugmentationConfig
+from tools.train_ngiml import (
+    build_default_components as _build_default_components_top_level,
+    build_training_config as _build_training_config_top_level,
+)
 
 
 def _cfg_get(config, key: str, default=None):
