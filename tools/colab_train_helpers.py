@@ -8,6 +8,20 @@ from src.model.hybrid_ngiml import HybridNGIMLConfig
 from src.model.losses import MultiStageLossConfig
 from src.data.config import AugmentationConfig
 
+
+def _cfg_get(config, key: str, default=None):
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _cfg_update(config, values: dict) -> None:
+    if isinstance(config, dict):
+        config.update(values)
+        return
+    for key, value in values.items():
+        setattr(config, key, value)
+
 def _recommended_cuda_precision(default="bf16"):
     """Return recommended CUDA precision for Colab runtime. Extend as needed."""
     return default
@@ -166,7 +180,8 @@ def apply_phase2_resume_preset(
     if metric not in {"iou", "f1", "dice"}:
         raise ValueError("monitor_metric must be one of: iou, f1, dice")
 
-    training_config.update(
+    _cfg_update(
+        training_config,
         {
             "resume": str(resume_checkpoint),
             "auto_resume": False,
@@ -178,10 +193,10 @@ def apply_phase2_resume_preset(
             "tversky_weight": float(tversky_weight),
             "lovasz_weight": 0.0,
             "hard_mining_enabled": False,
-        }
+        },
     )
 
-    model_cfg = training_config.get("model_config")
+    model_cfg = _cfg_get(training_config, "model_config")
     optimizer_cfg = getattr(model_cfg, "optimizer", None) if model_cfg is not None else None
     if optimizer_cfg is not None:
         for group_name in ("efficientnet", "swin", "residual", "fusion", "decoder"):
@@ -200,13 +215,13 @@ def apply_colab_runtime_settings(
     tune_for_large_batch: bool = False,
 ) -> dict:
     def _apply_effective_batch_optimizer_scaling(config: dict, base_effective_batch: int = 12) -> None:
-        model_cfg = config.get("model_config")
+        model_cfg = _cfg_get(config, "model_config")
         if model_cfg is None or not hasattr(model_cfg, "optimizer"):
             return
 
         optimizer_cfg = model_cfg.optimizer
-        batch_size = int(config.get("batch_size", 12))
-        grad_accum_steps = int(config.get("grad_accum_steps", 1))
+        batch_size = int(_cfg_get(config, "batch_size", 12))
+        grad_accum_steps = int(_cfg_get(config, "grad_accum_steps", 1))
         effective_batch = max(1, batch_size * grad_accum_steps)
 
         ratio = float(effective_batch) / float(max(1, base_effective_batch))
@@ -224,9 +239,10 @@ def apply_colab_runtime_settings(
     cache_dir = local_cache_dir or "/content/cache"
     if tune_for_large_batch:
         runtime_precision = _recommended_cuda_precision(default="bf16")
-        training_config.update(
+        _cfg_update(
+            training_config,
             {
-                "batch_size": int(max(20, int(training_config.get("batch_size", 20)))),
+                "batch_size": int(max(20, int(_cfg_get(training_config, "batch_size", 20)))),
                 "num_workers": recommended_workers,
                 "persistent_workers": False,
                 "prefetch_factor": 2,
@@ -239,15 +255,16 @@ def apply_colab_runtime_settings(
                 "channels_last": True,
                 "use_tf32": True,
                 "precision": runtime_precision,
-                "max_short_side": int(max(480, int(training_config.get("max_short_side", 480)))),
-                "foreground_ratio_max_batches": int(training_config.get("foreground_ratio_max_batches", 20)),
-                "short_side_probe_samples": int(training_config.get("short_side_probe_samples", 0)),
+                "max_short_side": int(max(480, int(_cfg_get(training_config, "max_short_side", 480)))),
+                "foreground_ratio_max_batches": int(_cfg_get(training_config, "foreground_ratio_max_batches", 20)),
+                "short_side_probe_samples": int(_cfg_get(training_config, "short_side_probe_samples", 0)),
                 "balance_sampling": bool(balance_sampling),
-            }
+            },
         )
         _apply_effective_batch_optimizer_scaling(training_config, base_effective_batch=12)
     else:
-        training_config.update(
+        _cfg_update(
+            training_config,
             {
                 "num_workers": recommended_workers,
                 "persistent_workers": False,
@@ -260,7 +277,7 @@ def apply_colab_runtime_settings(
                 "channels_last": True,
                 "use_tf32": True,
                 "balance_sampling": bool(balance_sampling),
-            }
+            },
         )
         _apply_effective_batch_optimizer_scaling(training_config, base_effective_batch=12)
 
