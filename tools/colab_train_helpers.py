@@ -190,8 +190,8 @@ def apply_phase2_resume_preset(
     metric = str(monitor_metric).strip().lower()
     if metric in {"val_loss", "valloss"}:
         metric = "loss"
-    if metric not in {"loss", "iou", "f1", "dice"}:
-        raise ValueError("monitor_metric must be one of: loss, iou, f1, dice")
+    if metric not in {"loss", "iou", "f1"}:
+        raise ValueError("monitor_metric must be one of: loss, iou, f1")
 
     _cfg_update(
         training_config,

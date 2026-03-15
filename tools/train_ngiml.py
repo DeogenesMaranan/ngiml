@@ -486,7 +486,7 @@ def parse_args() -> TrainConfig:
         "--early-stopping-monitor",
         type=str,
         default="loss",
-        choices=["loss", "iou", "dice", "f1", "recall", "precision", "accuracy"],
+        choices=["loss", "iou", "f1", "recall", "precision", "accuracy"],
         help="Validation metric used for early stopping and best checkpoint",
     )
     parser.add_argument("--training-phase", type=str, default="phase1", choices=["phase1", "phase2"], help="Training phase label stored in checkpoints and logs")
@@ -508,12 +508,12 @@ def parse_args() -> TrainConfig:
         "--auto-phase2-monitor",
         type=str,
         default="loss",
-        choices=["loss", "iou", "f1", "dice"],
+        choices=["loss", "iou", "f1"],
         help="Metric used to select the checkpoint that phase 2 resumes from",
     )
     parser.add_argument("--metric-threshold", type=float, default=0.5, help="Fixed threshold for sigmoid outputs when threshold optimization is disabled")
     parser.add_argument("--optimize-threshold", action=argparse.BooleanOptionalAction, default=True, help="Search validation thresholds and use the best for metric reporting")
-    parser.add_argument("--threshold-metric", type=str, default="f1", choices=["iou", "dice", "f1"], help="Metric used to select best threshold")
+    parser.add_argument("--threshold-metric", type=str, default="f1", choices=["iou", "f1"], help="Metric used to select best threshold")
     parser.add_argument("--threshold-start", type=float, default=0.2, help="Threshold search range start")
     parser.add_argument("--threshold-end", type=float, default=0.8, help="Threshold search range end")
     parser.add_argument("--threshold-step", type=float, default=0.02, help="Threshold search step size")
@@ -934,14 +934,12 @@ def _segmentation_counts(logits: torch.Tensor, target: torch.Tensor, threshold: 
 
 def _metrics_from_counts(tp: float, tn: float, fp: float, fn: float, eps: float = 1e-6) -> Dict[str, float]:
     iou = (tp + eps) / (tp + fp + fn + eps)
-    dice = (2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)
     precision = (tp + eps) / (tp + fp + eps)
     recall = (tp + eps) / (tp + fn + eps)
     f1 = (2.0 * precision * recall) / (precision + recall + eps)
     accuracy = (tp + tn + eps) / (tp + tn + fp + fn + eps)
 
     return {
-        "dice": float(dice),
         "iou": float(iou),
         "precision": float(precision),
         "recall": float(recall),
@@ -983,7 +981,7 @@ def _select_threshold_with_precision_guard(
     if not scored_thresholds:
         raise ValueError("No scored thresholds provided")
 
-    metric_key = optimize_key if optimize_key in {"iou", "dice", "f1"} else "f1"
+    metric_key = optimize_key if optimize_key in {"iou", "f1"} else "f1"
     baseline_threshold, baseline_metrics = max(scored_thresholds, key=lambda item: item[1][metric_key])
     baseline_metric = float(baseline_metrics[metric_key])
 
@@ -1266,7 +1264,7 @@ def _scale_optimizer_and_scheduler_for_phase2(
 
 def _build_phase2_config(cfg: TrainConfig, best_iou_path: Path) -> TrainConfig:
     phase2_metric = str(cfg.auto_phase2_monitor).strip().lower()
-    if phase2_metric not in {"iou", "f1", "dice"}:
+    if phase2_metric not in {"iou", "f1"}:
         phase2_metric = "iou"
 
     phase2_model_cfg = deepcopy(cfg.model_config) if cfg.model_config is not None else None
@@ -1580,7 +1578,6 @@ def _write_best_threshold_metadata(
         "monitor": str(monitor),
         "monitor_value": float(monitor_value),
         "val_iou": float(metrics.get("iou")) if metrics.get("iou") is not None else None,
-        "val_dice": float(metrics.get("dice")) if metrics.get("dice") is not None else None,
         "val_f1": float(metrics.get("f1")) if metrics.get("f1") is not None else None,
         "val_precision": float(metrics.get("precision")) if metrics.get("precision") is not None else None,
         "val_recall": float(metrics.get("recall")) if metrics.get("recall") is not None else None,
@@ -1660,10 +1657,10 @@ def _finalize_bin_stats(bin_stats: Dict[str, Dict[str, float]]) -> Dict[str, Dic
         metrics = _metrics_from_counts(stats["tp"], stats["tn"], stats["fp"], stats["fn"])
         out[name] = {
             "count": float(stats["count"]),
-            "dice": float(metrics["dice"]),
             "iou": float(metrics["iou"]),
             "precision": float(metrics["precision"]),
             "recall": float(metrics["recall"]),
+            "f1": float(metrics["f1"]),
             "accuracy": float(metrics["accuracy"]),
         }
     return out
@@ -2101,7 +2098,7 @@ def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: T
             threshold_stats[float(threshold)]["fn"] += counts["fn"]
 
     optimize_key = cfg.threshold_metric.lower()
-    if optimize_key not in {"iou", "dice", "f1"}:
+    if optimize_key not in {"iou", "f1"}:
         optimize_key = "f1"
 
     scored_thresholds: list[tuple[float, dict]] = []
@@ -2119,7 +2116,6 @@ def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: T
     return {
         "threshold": float(best_threshold),
         "threshold_metric": optimize_key,
-        "dice": float(best_metrics["dice"]),
         "iou": float(best_metrics["iou"]),
         "precision": float(best_metrics["precision"]),
         "recall": float(best_metrics["recall"]),
@@ -2221,7 +2217,7 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         progress.set_postfix(loss=f"{(total_loss / max(1, batches)):.4f}", step=f"{batches:05d}")
 
     optimize_key = cfg.threshold_metric.lower()
-    if optimize_key not in {"iou", "dice", "f1"}:
+    if optimize_key not in {"iou", "f1"}:
         optimize_key = "f1"
 
     scored_thresholds: list[tuple[float, dict]] = []
@@ -2247,7 +2243,6 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
     normalizer = max(1, batches)
     return {
         "loss": total_loss / normalizer,
-        "dice": float(best_metrics["dice"]),
         "iou": float(best_metrics["iou"]),
         "precision": float(best_metrics["precision"]),
         "recall": float(best_metrics["recall"]),
@@ -2551,7 +2546,6 @@ def run_training(cfg: TrainConfig) -> None:
             )
 
         val_loss = None
-        val_dice = None
         val_iou = None
         val_f1 = None
         val_precision = None
@@ -2563,7 +2557,6 @@ def run_training(cfg: TrainConfig) -> None:
             eval_model = ema_model if ema_model is not None else model
             metrics = evaluate(eval_model, loaders["val"], loss_fn, device, cfg, normalization_mode=normalization_mode)
             val_loss = float(metrics["loss"])
-            val_dice = float(metrics["dice"])
             val_iou = float(metrics["iou"])
             val_f1 = float(metrics["f1"])
             val_precision = float(metrics["precision"])
@@ -2572,8 +2565,8 @@ def run_training(cfg: TrainConfig) -> None:
             val_threshold = float(metrics["threshold"])
             val_size_bins = metrics.get("size_bins")
             print(
-                f"Val | loss {val_loss:.4f} | dice {val_dice:.4f} | iou {val_iou:.4f} "
-                f"| f1 {val_f1:.4f} | precision {val_precision:.4f} | recall {val_recall:.4f} | accuracy {val_accuracy:.4f} "
+                f"Val | loss {val_loss:.4f} | iou {val_iou:.4f} | f1 {val_f1:.4f} "
+                f"| precision {val_precision:.4f} | recall {val_recall:.4f} | accuracy {val_accuracy:.4f} "
                 f"| threshold {val_threshold:.2f}"
             )
             if isinstance(val_size_bins, dict):
@@ -2718,7 +2711,6 @@ def run_training(cfg: TrainConfig) -> None:
                     "train_loss": float(train_loss),
                     "train_positive_ratio": float(train_positive_ratio),
                     "val_loss": val_loss,
-                    "val_dice": val_dice,
                     "val_iou": val_iou,
                     "val_f1": val_f1,
                     "val_precision": val_precision,
