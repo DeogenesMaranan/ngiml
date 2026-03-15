@@ -43,11 +43,11 @@ def test_overlap_focused_threshold_and_mining_defaults(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train_ngiml.py", "--manifest", "dummy_manifest.json"])
     cfg = parse_args()
     assert cfg.training_phase == "phase1"
-    assert cfg.auto_phase2_enabled is False
-    assert cfg.auto_phase2_patience == 5
+    assert cfg.auto_phase2_enabled is True
+    assert cfg.auto_phase2_patience == 1
     assert cfg.auto_phase2_lr_scale == 0.33
     assert cfg.auto_phase2_tversky_weight == 0.1
-    assert cfg.auto_phase2_monitor == "iou"
+    assert cfg.auto_phase2_monitor == "loss"
     assert cfg.threshold_metric == "f1"
     assert cfg.threshold_start == 0.2
     assert cfg.threshold_end == 0.8
