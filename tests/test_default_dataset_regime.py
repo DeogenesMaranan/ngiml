@@ -5,13 +5,36 @@ from tools.prepare_datasets import build_default_configs
 def test_prepare_default_configs_use_casia2_for_training_and_casia1_coverage_columbia_for_test():
     datasets, per_dataset_splits, prep_cfg = build_default_configs()
 
-    assert [dataset.dataset_name for dataset in datasets] == ["CASIA2", "CASIA1", "COVERAGE", "Columbia"]
+    assert [dataset.dataset_name for dataset in datasets] == [
+        "CASIA2",
+        "TampCOCO",
+        "NIST",
+        "IMD2020",
+        "CASIA1",
+        "COVERAGE",
+        "Columbia",
+    ]
     assert prep_cfg.target_sizes == (384,)
 
     casia2_split = per_dataset_splits["CASIA2"]
     assert casia2_split.train == 0.8
     assert casia2_split.val == 0.2
     assert casia2_split.test == 0.0
+
+    tampcoco_split = per_dataset_splits["TampCOCO"]
+    assert tampcoco_split.train == 0.8
+    assert tampcoco_split.val == 0.2
+    assert tampcoco_split.test == 0.0
+
+    nist_split = per_dataset_splits["NIST"]
+    assert nist_split.train == 0.8
+    assert nist_split.val == 0.2
+    assert nist_split.test == 0.0
+
+    imd_split = per_dataset_splits["IMD2020"]
+    assert imd_split.train == 0.8
+    assert imd_split.val == 0.2
+    assert imd_split.test == 0.0
 
     casia1_split = per_dataset_splits["CASIA1"]
     assert casia1_split.train == 0.0

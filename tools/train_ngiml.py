@@ -177,8 +177,8 @@ class TrainConfig:
     auto_resume: bool = True
     round_robin_seed: Optional[int] = 42
     balance_sampling: bool = False
-    balance_real_fake: bool = False
-    balanced_positive_ratio: float = 0.5
+    balance_real_fake: bool = True
+    balanced_positive_ratio: float = 0.6
     balanced_sampler_seed: int = 42
     balanced_sampler_num_samples: Optional[int] = None
     prefetch_factor: Optional[int] = 2
@@ -195,11 +195,11 @@ class TrainConfig:
     device: Optional[str] = "cuda"
     aug_seed: Optional[int] = 42
     seed: int = 42
-    early_stopping_patience: int = 12
-    early_stopping_min_delta: float = 0.0001
-    early_stopping_monitor: str = "f1"
+    early_stopping_patience: int = 1
+    early_stopping_min_delta: float = 5e-4
+    early_stopping_monitor: str = "loss"
     training_phase: str = "phase1"
-    auto_phase2_enabled: bool = True
+    auto_phase2_enabled: bool = False
     auto_phase2_patience: int = 5
     auto_phase2_lr_scale: float = 0.33
     auto_phase2_tversky_weight: float = 0.1
@@ -427,7 +427,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument(
         "--balanced-positive-ratio",
         type=float,
-        default=0.5,
+        default=0.6,
         help="Target fake-positive sampling ratio when --balance-real-fake is enabled",
     )
     parser.add_argument(
@@ -480,11 +480,22 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--disable-aug", action="store_true", help="Disable GPU augmentations")
     parser.add_argument("--device", type=str, default=None, help="Override device (e.g., cuda:0 or cpu)")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducibility")
-    parser.add_argument("--early-stopping-patience", type=int, default=5, help="Stop after N validations without improvement; <=0 disables")
-    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4, help="Minimum monitored-metric improvement to reset early stopping")
-    parser.add_argument("--early-stopping-monitor", type=str, default="f1", choices=["iou", "dice", "f1", "recall", "precision", "accuracy"], help="Validation metric used for early stopping and best checkpoint")
+    parser.add_argument("--early-stopping-patience", type=int, default=1, help="Stop after N validations without improvement; <=0 disables")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=5e-4, help="Minimum monitored-metric improvement to reset early stopping")
+    parser.add_argument(
+        "--early-stopping-monitor",
+        type=str,
+        default="loss",
+        choices=["loss", "iou", "dice", "f1", "recall", "precision", "accuracy"],
+        help="Validation metric used for early stopping and best checkpoint",
+    )
     parser.add_argument("--training-phase", type=str, default="phase1", choices=["phase1", "phase2"], help="Training phase label stored in checkpoints and logs")
-    parser.add_argument("--auto-phase2-enabled", action=argparse.BooleanOptionalAction, default=True, help="Automatically switch to phase 2 from the best IoU checkpoint after a phase-1 plateau")
+    parser.add_argument(
+        "--auto-phase2-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Automatically switch to phase 2 from the best IoU checkpoint after a phase-1 plateau",
+    )
     parser.add_argument("--auto-phase2-patience", type=int, default=5, help="Validations without improvement before auto phase-2 triggers during phase 1")
     parser.add_argument("--auto-phase2-lr-scale", type=float, default=0.33, help="LR multiplier applied when auto phase-2 activates")
     parser.add_argument("--auto-phase2-tversky-weight", type=float, default=0.1, help="Tversky loss weight applied during auto phase-2")
@@ -1204,6 +1215,21 @@ def _metric_for_monitor(metrics: dict, monitor: str) -> float:
     if key not in metrics:
         raise KeyError(f"Unsupported monitor metric: {monitor}")
     return float(metrics[key])
+
+
+def _monitor_improved(monitor: str, current: float, best: float, min_delta: float) -> bool:
+    key = str(monitor).strip().lower()
+    delta = float(min_delta)
+    if key == "loss":
+        return float(current) < (float(best) - delta)
+    return float(current) > (float(best) + delta)
+
+
+def _initial_best_for_monitor(monitor: str) -> float:
+    key = str(monitor).strip().lower()
+    if key == "loss":
+        return float("inf")
+    return float("-inf")
 
 
 def _scale_optimizer_and_scheduler_for_phase2(
@@ -2417,7 +2443,7 @@ def run_training(cfg: TrainConfig) -> None:
         chosen_threshold=None,
     )
 
-    best_monitor_value = float("-inf")
+    best_monitor_value = _initial_best_for_monitor(cfg.early_stopping_monitor)
     best_val_iou = float("-inf")
     best_val_f1 = float("-inf")
     best_val_loss = float("inf")
@@ -2593,7 +2619,12 @@ def run_training(cfg: TrainConfig) -> None:
 
             # Use the configured early-stopping monitor to determine when to reset patience
             monitor_value = _metric_for_monitor(metrics, cfg.early_stopping_monitor)
-            monitor_improved = monitor_value > (best_monitor_value + cfg.early_stopping_min_delta)
+            monitor_improved = _monitor_improved(
+                cfg.early_stopping_monitor,
+                monitor_value,
+                best_monitor_value,
+                cfg.early_stopping_min_delta,
+            )
 
             if monitor_improved:
                 # Update recorded bests and reset patience
@@ -2743,7 +2774,7 @@ def run_training(cfg: TrainConfig) -> None:
                 if cfg.early_stopping_monitor == "iou":
                     best_monitor_value = best_val_iou
                 else:
-                    best_monitor_value = float("-inf")
+                    best_monitor_value = _initial_best_for_monitor(cfg.early_stopping_monitor)
                 early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
                 print(
                     "Auto phase-2 triggered | "
