@@ -2640,12 +2640,11 @@ def run_training(cfg: TrainConfig) -> None:
                 and val_loss > best_non_phase2_val_loss
             )
 
-            if monitor_improved and not phase2_loss_gate_blocked:
-                # Update recorded bests and reset patience
-                best_monitor_value = monitor_value
-                best_val_f1 = val_f1
+            if loss_improved and not phase2_loss_gate_blocked:
                 best_val_loss = val_loss
-                no_improve_epochs = 0
+                configured_monitor = str(getattr(cfg, "early_stopping_monitor", "loss")).strip().lower()
+                monitor_for_metadata = configured_monitor if configured_monitor in metrics else "loss"
+                monitor_value_for_metadata = _metric_for_monitor(metrics, monitor_for_metadata)
                 best_alias_path = checkpoint_dir / "best_checkpoint.pt"
                 save_checkpoint(
                     best_alias_path,
@@ -2664,8 +2663,8 @@ def run_training(cfg: TrainConfig) -> None:
                     epoch=epoch + 1,
                     threshold=val_threshold,
                     threshold_metric=str(metrics.get("threshold_metric", cfg.threshold_metric)),
-                    monitor=cfg.early_stopping_monitor,
-                    monitor_value=monitor_value,
+                    monitor=monitor_for_metadata,
+                    monitor_value=monitor_value_for_metadata,
                     metrics=metrics,
                     checkpoint_path=best_alias_path,
                 )
@@ -2681,16 +2680,23 @@ def run_training(cfg: TrainConfig) -> None:
                     },
                 )
                 print(
-                    f"New best {cfg.early_stopping_monitor} {monitor_value:.4f}; "
+                    f"New best val loss {val_loss:.4f}; "
                     f"saved to {best_alias_path} (threshold metadata: {best_threshold_path})"
                 )
+            elif loss_improved and phase2_loss_gate_blocked:
+                print(
+                    "Phase-2 best checkpoint blocked: "
+                    f"val_loss {val_loss:.4f} is higher than best non-phase-2 loss "
+                    f"{best_non_phase2_val_loss:.4f}"
+                )
+
+            if monitor_improved:
+                # Update recorded bests and reset patience
+                best_monitor_value = monitor_value
+                best_val_f1 = val_f1
+                no_improve_epochs = 0
+                print(f"New best {cfg.early_stopping_monitor} {monitor_value:.4f}")
             else:
-                if monitor_improved and phase2_loss_gate_blocked:
-                    print(
-                        "Phase-2 best checkpoint blocked: "
-                        f"val_loss {val_loss:.4f} is higher than best non-phase-2 loss "
-                        f"{best_non_phase2_val_loss:.4f}"
-                    )
                 # Update monitor-based counter
                 if early_stopping_enabled:
                     no_improve_epochs += 1
