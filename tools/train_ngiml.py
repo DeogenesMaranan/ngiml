@@ -2453,6 +2453,7 @@ def run_training(cfg: TrainConfig) -> None:
     best_val_iou = float("-inf")
     best_val_f1 = float("-inf")
     best_val_loss = float("inf")
+    best_non_phase2_val_loss = float("inf")
     no_improve_epochs = 0
     # Track IoU-specific non-improvement separately so auto-phase2 can consider IoU plateaus
     no_improve_epochs_iou = 0
@@ -2581,6 +2582,9 @@ def run_training(cfg: TrainConfig) -> None:
             iou_improved = val_iou > (best_val_iou + cfg.early_stopping_min_delta)
             f1_improved = val_f1 > (best_val_f1 + cfg.early_stopping_min_delta)
             loss_improved = val_loss < (best_val_loss - cfg.early_stopping_min_delta)
+            current_phase = str(getattr(cfg, "training_phase", "phase1")).strip().lower()
+            if current_phase != "phase2":
+                best_non_phase2_val_loss = min(best_non_phase2_val_loss, val_loss)
             # Save best iou checkpoint as before
             if iou_improved:
                 best_val_iou = val_iou
@@ -2630,7 +2634,13 @@ def run_training(cfg: TrainConfig) -> None:
                 cfg.early_stopping_min_delta,
             )
 
-            if monitor_improved:
+            phase2_loss_gate_blocked = (
+                current_phase == "phase2"
+                and math.isfinite(best_non_phase2_val_loss)
+                and val_loss > best_non_phase2_val_loss
+            )
+
+            if monitor_improved and not phase2_loss_gate_blocked:
                 # Update recorded bests and reset patience
                 best_monitor_value = monitor_value
                 best_val_f1 = val_f1
@@ -2675,6 +2685,12 @@ def run_training(cfg: TrainConfig) -> None:
                     f"saved to {best_alias_path} (threshold metadata: {best_threshold_path})"
                 )
             else:
+                if monitor_improved and phase2_loss_gate_blocked:
+                    print(
+                        "Phase-2 best checkpoint blocked: "
+                        f"val_loss {val_loss:.4f} is higher than best non-phase-2 loss "
+                        f"{best_non_phase2_val_loss:.4f}"
+                    )
                 # Update monitor-based counter
                 if early_stopping_enabled:
                     no_improve_epochs += 1
