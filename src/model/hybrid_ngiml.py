@@ -89,20 +89,29 @@ class HybridNGIML(nn.Module):
     def __init__(self, config: HybridNGIMLConfig | None = None) -> None:
         super().__init__()
         self.cfg = config or HybridNGIMLConfig()
-        self.efficientnet = EfficientNetBackbone(self.cfg.efficientnet)
-        # Pass flash_attention and xformers flags if present in config
-        swin_kwargs = {}
-        if hasattr(self.cfg, 'flash_attention'):
-            swin_kwargs['flash_attention'] = getattr(self.cfg, 'flash_attention', False)
-        if hasattr(self.cfg, 'xformers'):
-            swin_kwargs['xformers'] = getattr(self.cfg, 'xformers', False)
-        self.swin = SwinBackbone(self.cfg.swin, **swin_kwargs)
-        self.noise = ResidualNoiseBranch(self.cfg.residual)
+        self.efficientnet: Optional[EfficientNetBackbone] = None
+        self.swin: Optional[SwinBackbone] = None
+        self.noise: Optional[ResidualNoiseBranch] = None
+
+        if self.cfg.use_low_level:
+            self.efficientnet = EfficientNetBackbone(self.cfg.efficientnet)
+
+        if self.cfg.use_context:
+            # Pass flash_attention and xformers flags if present in config
+            swin_kwargs = {}
+            if hasattr(self.cfg, 'flash_attention'):
+                swin_kwargs['flash_attention'] = getattr(self.cfg, 'flash_attention', False)
+            if hasattr(self.cfg, 'xformers'):
+                swin_kwargs['xformers'] = getattr(self.cfg, 'xformers', False)
+            self.swin = SwinBackbone(self.cfg.swin, **swin_kwargs)
+
+        if self.cfg.use_residual:
+            self.noise = ResidualNoiseBranch(self.cfg.residual)
 
         layout = {
-            "low_level": self.efficientnet.out_channels,
-            "context": self.swin.out_channels,
-            "residual": self.noise.out_channels,
+            "low_level": self.efficientnet.out_channels if self.efficientnet is not None else [],
+            "context": self.swin.out_channels if self.swin is not None else [],
+            "residual": self.noise.out_channels if self.noise is not None else [],
         }
         self.num_stages = len(self.cfg.fusion.fusion_channels)
         branch_channels: Dict[str, List[int]] = {}
@@ -124,7 +133,12 @@ class HybridNGIML(nn.Module):
         self.decoder = UNetDecoder(self.cfg.fusion.fusion_channels, self.cfg.decoder)
 
         # Residual-guided attention module (optional)
-        self.enable_residual_attention = getattr(self.cfg, 'enable_residual_attention', False)
+        self.enable_residual_attention = (
+            getattr(self.cfg, 'enable_residual_attention', False)
+            and self.cfg.use_residual
+            and self.cfg.use_low_level
+            and self.noise is not None
+        )
         if self.enable_residual_attention:
             # Project residual features to attention map (per stage)
             res_channels = branch_channels.get("residual", [0])
@@ -137,10 +151,10 @@ class HybridNGIML(nn.Module):
             if self.residual_attention_proj.bias is not None:
                 nn.init.zeros_(self.residual_attention_proj.bias)
 
-    def _extract_features(self, x: Tensor, high_pass: Tensor | None = None) -> Dict[str, List[Tensor] | Tensor]:
-        low_level = self.efficientnet(x)
-        context = self.swin(x)
-        residual = self.noise(x, high_pass=high_pass)
+    def _extract_features(self, x: Tensor, high_pass: Tensor | None = None) -> Dict[str, Optional[List[Tensor] | Tensor]]:
+        low_level = self.efficientnet(x) if self.efficientnet is not None else None
+        context = self.swin(x) if self.swin is not None else None
+        residual = self.noise(x, high_pass=high_pass) if self.noise is not None else None
 
         # Residual-guided attention (modulate semantic features before fusion)
         if self.enable_residual_attention and isinstance(low_level, list) and isinstance(residual, list):
@@ -174,11 +188,11 @@ class HybridNGIML(nn.Module):
     ) -> List[Tensor]:
         backbone_feats = self._extract_features(x, high_pass=high_pass)
         fusion_inputs = {}
-        if self.cfg.use_low_level:
+        if self.cfg.use_low_level and backbone_feats["low_level"] is not None:
             fusion_inputs["low_level"] = backbone_feats["low_level"]
-        if self.cfg.use_context:
+        if self.cfg.use_context and backbone_feats["context"] is not None:
             fusion_inputs["context"] = backbone_feats["context"]
-        if self.cfg.use_residual:
+        if self.cfg.use_residual and backbone_feats["residual"] is not None:
             fusion_inputs["residual"] = backbone_feats["residual"]
         return self.fusion(fusion_inputs, target_size=None)
 
@@ -214,11 +228,11 @@ class HybridNGIML(nn.Module):
                 "weight_decay": group_cfg.weight_decay,
             })
 
-        if self.cfg.use_low_level:
+        if self.cfg.use_low_level and self.efficientnet is not None:
             _append(self.efficientnet.parameters(), self.cfg.optimizer.efficientnet)
-        if self.cfg.use_context:
+        if self.cfg.use_context and self.swin is not None:
             _append(self.swin.parameters(), self.cfg.optimizer.swin)
-        if self.cfg.use_residual:
+        if self.cfg.use_residual and self.noise is not None:
             _append(self.noise.parameters(), self.cfg.optimizer.residual)
 
         _append(self.fusion.parameters(), self.cfg.optimizer.fusion)
