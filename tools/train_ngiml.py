@@ -2639,6 +2639,8 @@ def run_training(cfg: TrainConfig) -> None:
                 and math.isfinite(best_non_phase2_val_loss)
                 and val_loss > best_non_phase2_val_loss
             )
+            monitor_key = str(getattr(cfg, "early_stopping_monitor", "loss")).strip().lower()
+            monitor_improvement_blocked = phase2_loss_gate_blocked and monitor_key == "loss"
 
             if loss_improved and not phase2_loss_gate_blocked:
                 best_val_loss = val_loss
@@ -2690,13 +2692,19 @@ def run_training(cfg: TrainConfig) -> None:
                     f"{best_non_phase2_val_loss:.4f}"
                 )
 
-            if monitor_improved:
+            if monitor_improved and not monitor_improvement_blocked:
                 # Update recorded bests and reset patience
                 best_monitor_value = monitor_value
                 best_val_f1 = val_f1
                 no_improve_epochs = 0
                 print(f"New best {cfg.early_stopping_monitor} {monitor_value:.4f}")
             else:
+                if monitor_improved and monitor_improvement_blocked:
+                    print(
+                        "Phase-2 loss monitor improvement ignored: "
+                        f"val_loss {val_loss:.4f} is higher than best non-phase-2 loss "
+                        f"{best_non_phase2_val_loss:.4f}"
+                    )
                 # Update monitor-based counter
                 if early_stopping_enabled:
                     no_improve_epochs += 1
