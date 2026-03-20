@@ -561,12 +561,26 @@ def get_model_complexity_stats(
     sample_device = next(model.parameters()).device
     sample = torch.randn(*input_size, device=sample_device)
 
+    class _ProfileWrapper(torch.nn.Module):
+        def __init__(self, base_model: HybridNGIML):
+            super().__init__()
+            self.base_model = base_model
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            out = self.base_model(x, target_size=x.shape[-2:], high_pass=None)
+            if isinstance(out, (list, tuple)):
+                return out[-1]
+            return out
+
+    profile_model = _ProfileWrapper(model).to(sample_device)
+
     was_training = model.training
     model.eval()
+    profile_model.eval()
     try:
         try:
             with torch.no_grad():
-                analysis = _build_flop_analysis(model, sample)
+                analysis = _build_flop_analysis(profile_model, sample)
                 total_flops = float(analysis.total())
                 unsupported_ops = {str(name): int(count) for name, count in analysis.unsupported_ops().items()}
             stats["flops"] = total_flops
@@ -583,7 +597,7 @@ def get_model_complexity_stats(
                 from thop import profile as thop_profile
 
                 with torch.no_grad():
-                    macs, _ = thop_profile(model, inputs=(sample,), verbose=False)
+                    macs, _ = thop_profile(profile_model, inputs=(sample,), verbose=False)
                 macs = float(macs)
                 stats["macs"] = macs
                 stats["flops"] = macs * 2.0
