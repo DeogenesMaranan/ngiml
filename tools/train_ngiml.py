@@ -1868,6 +1868,11 @@ def train_one_epoch(
                 total = (sample_count // batch_size) if drop_last else ((sample_count + batch_size - 1) // batch_size)
 
     progress = tqdm(loader, desc=f"Epoch {epoch:03d}", leave=False, dynamic_ncols=True, total=total)
+    imagenet_mean = None
+    imagenet_std = None
+    if device.type == "cuda" and normalization_mode == "imagenet":
+        imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
+        imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
     optimizer.zero_grad(set_to_none=True)
     for step, batch in enumerate(progress):
         batch_start = time.perf_counter()
@@ -1905,9 +1910,6 @@ def train_one_epoch(
                 gen.manual_seed(seed_base + int(global_step))
             except Exception:
                 gen.manual_seed(seed_base)
-
-            imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
-            imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
 
             datasets_list = batch.get("datasets", None)
             if datasets_list is not None:
@@ -2138,6 +2140,11 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         float(th): _empty_bin_stats()
         for th in thresholds
     }
+    imagenet_mean = None
+    imagenet_std = None
+    if device.type == "cuda" and normalization_mode == "imagenet":
+        imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
+        imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
 
     progress = tqdm(loader, desc="Validation", leave=False, dynamic_ncols=True)
     for batch in progress:
@@ -2161,8 +2168,6 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         # If collate left normalization to be done on-device (collate used zero_one),
         # perform normalization here on the GPU for evaluation.
         if device.type == "cuda" and normalization_mode is not None:
-            imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
-            imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
             bsz = images.shape[0]
             for i in range(bsz):
                 images[i] = _normalize(images[i], normalization_mode, imagenet_mean=imagenet_mean, imagenet_std=imagenet_std)
