@@ -56,3 +56,17 @@ def test_overlap_focused_threshold_and_mining_defaults(monkeypatch):
     assert cfg.hard_mining_enabled is False
     assert cfg.hard_mining_start_epoch == 5
     assert cfg.hard_mining_weight == 0.03
+
+
+def test_final_pred_stage_ablation_cli_defaults(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["train_ngiml.py", "--manifest", "dummy_manifest.json"])
+    cfg = parse_args()
+    assert cfg.final_pred_stage == -1
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train_ngiml.py", "--manifest", "dummy_manifest.json", "--final-pred-stage", "0"],
+    )
+    cfg_stage0 = parse_args()
+    assert cfg_stage0.final_pred_stage == 0

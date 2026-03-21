@@ -243,6 +243,22 @@ def _build_model_config_from_checkpoint(checkpoint: dict) -> tuple[object, str]:
     return model_cfg, "defaults"
 
 
+def _select_output_head(outputs: Sequence[torch.Tensor], stage_index: int) -> torch.Tensor:
+    if not outputs:
+        raise ValueError("Model returned empty predictions list")
+
+    num_stages = len(outputs)
+    idx = int(stage_index)
+    if idx < 0:
+        idx = num_stages + idx
+
+    if idx < 0 or idx >= num_stages:
+        raise ValueError(
+            f"final_pred_stage {stage_index} is out of range for {num_stages} prediction stages"
+        )
+    return outputs[idx]
+
+
 def _load_state_dict_with_fallback(model: HybridNGIML, model_state: dict) -> tuple[list[str], list[str], int]:
     try:
         missing, unexpected = model.load_state_dict(model_state, strict=False)
@@ -276,6 +292,8 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
         fallback=0.5,
     )
 
+    train_config = checkpoint.get("train_config") or {}
+
     info = {
         "epoch": checkpoint_epoch,
         "missing_keys": len(missing),
@@ -285,9 +303,11 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
         "fusion_channels": tuple(int(value) for value in model.cfg.fusion.fusion_channels),
         "default_threshold": float(resolved_threshold),
         "threshold_source": str(threshold_source),
-        "max_short_side": int((checkpoint.get("train_config") or {}).get("max_short_side", 0) or 0),
+        "max_short_side": int(train_config.get("max_short_side", 0) or 0),
+        "final_pred_stage": int(train_config.get("final_pred_stage", -1)),
     }
     setattr(model, "default_threshold", float(info["default_threshold"]))
+    setattr(model, "final_pred_stage", int(info["final_pred_stage"]))
     return model, device, info
 
 
@@ -498,6 +518,7 @@ def predict_probability_map(
     device: torch.device,
     normalization_mode: str = "zero_one",
     high_pass: torch.Tensor | None = None,
+    final_pred_stage: int | None = None,
 ) -> torch.Tensor:
     normalized = normalize_image_for_inference(image, normalization_mode=normalization_mode)
     x = normalized.unsqueeze(0).to(device)
@@ -507,8 +528,10 @@ def predict_probability_map(
         if hp.max() > 1.0:
             hp = hp / 255.0
         hp = hp.unsqueeze(0).to(device)
+    stage_index = int(getattr(model, "final_pred_stage", -1) if final_pred_stage is None else final_pred_stage)
     with torch.no_grad():
-        logits = model(x, target_size=image.shape[-2:], high_pass=hp)[-1]
+        outputs = model(x, target_size=image.shape[-2:], high_pass=hp)
+        logits = _select_output_head(outputs, stage_index)
         prob = torch.sigmoid(logits)[0, 0].detach().cpu()
     return prob
 
@@ -520,8 +543,16 @@ def predict_binary_map(
     threshold: float | None = None,
     normalization_mode: str = "zero_one",
     high_pass: torch.Tensor | None = None,
+    final_pred_stage: int | None = None,
 ) -> torch.Tensor:
-    prob = predict_probability_map(model, image, device, normalization_mode=normalization_mode, high_pass=high_pass)
+    prob = predict_probability_map(
+        model,
+        image,
+        device,
+        normalization_mode=normalization_mode,
+        high_pass=high_pass,
+        final_pred_stage=final_pred_stage,
+    )
     if threshold is None:
         threshold = float(getattr(model, "default_threshold", 0.5))
     return (prob >= float(threshold)).float()
@@ -569,7 +600,8 @@ def get_model_complexity_stats(
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             out = self.base_model(x, target_size=x.shape[-2:], high_pass=None)
             if isinstance(out, (list, tuple)):
-                return out[-1]
+                stage_index = int(getattr(self.base_model, "final_pred_stage", -1))
+                return _select_output_head(out, stage_index)
             return out
 
     profile_model = _ProfileWrapper(model).to(sample_device)

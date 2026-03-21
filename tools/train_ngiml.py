@@ -204,6 +204,7 @@ class TrainConfig:
     auto_phase2_lr_scale: float = 0.33
     auto_phase2_tversky_weight: float = 0.1
     auto_phase2_monitor: str = "loss"
+    final_pred_stage: int = -1
     metric_threshold: float = 0.5
     optimize_threshold: bool = True
     threshold_metric: str = "f1"
@@ -511,6 +512,12 @@ def parse_args() -> TrainConfig:
         choices=["loss", "iou", "f1"],
         help="Metric used to select the checkpoint that phase 2 resumes from",
     )
+    parser.add_argument(
+        "--final-pred-stage",
+        type=int,
+        default=-1,
+        help="Prediction stage used as final output for metrics and scoring (0=highest resolution, -1=last stage)",
+    )
     parser.add_argument("--metric-threshold", type=float, default=0.5, help="Fixed threshold for sigmoid outputs when threshold optimization is disabled")
     parser.add_argument("--optimize-threshold", action=argparse.BooleanOptionalAction, default=True, help="Search validation thresholds and use the best for metric reporting")
     parser.add_argument("--threshold-metric", type=str, default="f1", choices=["iou", "f1"], help="Metric used to select best threshold")
@@ -610,6 +617,7 @@ def parse_args() -> TrainConfig:
         auto_phase2_lr_scale=float(args.auto_phase2_lr_scale),
         auto_phase2_tversky_weight=float(args.auto_phase2_tversky_weight),
         auto_phase2_monitor=args.auto_phase2_monitor,
+        final_pred_stage=int(args.final_pred_stage),
         metric_threshold=args.metric_threshold,
         optimize_threshold=args.optimize_threshold,
         threshold_metric=args.threshold_metric,
@@ -930,6 +938,23 @@ def _segmentation_counts(logits: torch.Tensor, target: torch.Tensor, threshold: 
     fp = torch.sum(pred * (1.0 - target)).item()
     fn = torch.sum((1.0 - pred) * target).item()
     return {"tp": float(tp), "tn": float(tn), "fp": float(fp), "fn": float(fn)}
+
+
+def _select_pred_head(preds: Sequence[torch.Tensor], stage_index: int) -> torch.Tensor:
+    if not preds:
+        raise ValueError("Model returned empty predictions list")
+
+    num_stages = len(preds)
+    idx = int(stage_index)
+    if idx < 0:
+        idx = num_stages + idx
+
+    if idx < 0 or idx >= num_stages:
+        raise ValueError(
+            f"final_pred_stage {stage_index} is out of range for {num_stages} prediction stages"
+        )
+
+    return preds[idx]
 
 
 def _metrics_from_counts(tp: float, tn: float, fp: float, fn: float, eps: float = 1e-6) -> Dict[str, float]:
@@ -1992,7 +2017,7 @@ def train_one_epoch(
             forward_end = time.perf_counter()
 
         if cfg.hard_mining_enabled and epoch >= int(max(0, cfg.hard_mining_start_epoch)):
-            final_logits = preds[-1]
+            final_logits = _select_pred_head(preds, cfg.final_pred_stage)
             if final_logits.shape[-2:] != masks.shape[-2:]:
                 final_logits = torch.nn.functional.interpolate(
                     final_logits,
@@ -2090,7 +2115,7 @@ def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: T
                 preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
         else:
             preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
-        logits = preds[-1]
+        logits = _select_pred_head(preds, cfg.final_pred_stage)
 
         for threshold in thresholds:
             counts = _segmentation_counts(logits, masks, threshold=threshold)
@@ -2185,7 +2210,7 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         else:
             preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
             loss = loss_fn(preds, masks, edge_target=edge_masks, edge_target_present=edge_mask_present)
-        logits = preds[-1]
+        logits = _select_pred_head(preds, cfg.final_pred_stage)
 
         with torch.no_grad():
             fg_ratio = masks.float().mean(dim=(1, 2, 3))
