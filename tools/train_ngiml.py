@@ -194,7 +194,7 @@ class TrainConfig:
     device: Optional[str] = "cuda"
     aug_seed: Optional[int] = 42
     seed: int = 42
-    early_stopping_patience: int = 1
+    early_stopping_patience: int = 3
     early_stopping_min_delta: float = 5e-4
     early_stopping_monitor: str = "loss"
     final_pred_stage: int = -1
