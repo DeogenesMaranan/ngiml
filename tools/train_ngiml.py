@@ -9,7 +9,6 @@ save checkpoints plus a copy of the training arguments inside the output dir.
 from __future__ import annotations
 
 import argparse
-from copy import deepcopy
 import io
 import json
 import random
@@ -198,12 +197,6 @@ class TrainConfig:
     early_stopping_patience: int = 1
     early_stopping_min_delta: float = 5e-4
     early_stopping_monitor: str = "loss"
-    training_phase: str = "phase1"
-    auto_phase2_enabled: bool = True
-    auto_phase2_patience: int = 1
-    auto_phase2_lr_scale: float = 0.33
-    auto_phase2_tversky_weight: float = 0.1
-    auto_phase2_monitor: str = "loss"
     final_pred_stage: int = -1
     metric_threshold: float = 0.5
     optimize_threshold: bool = True
@@ -343,7 +336,6 @@ def build_training_config(
         max_rotation_degrees=6.0,
         noise_std_max=0.012,
         warmup_epochs=3,
-        auto_phase2_enabled=True,
         foreground_ratio_max_batches=20,
         short_side_probe_samples=0,
         loss_hybrid_mode=str(getattr(loss_cfg, "hybrid_mode", "dice_bce")),
@@ -490,28 +482,6 @@ def parse_args() -> TrainConfig:
         choices=["loss", "iou", "f1", "recall", "precision", "accuracy"],
         help="Validation metric used for early stopping and best checkpoint",
     )
-    parser.add_argument("--training-phase", type=str, default="phase1", choices=["phase1", "phase2"], help="Training phase label stored in checkpoints and logs")
-    parser.add_argument(
-        "--auto-phase2-enabled",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Automatically switch to phase 2 from the best checkpoint after a phase-1 plateau",
-    )
-    parser.add_argument(
-        "--auto-phase2-patience",
-        type=int,
-        default=1,
-        help="Validations without improvement before auto phase-2 triggers during phase 1",
-    )
-    parser.add_argument("--auto-phase2-lr-scale", type=float, default=0.33, help="LR multiplier applied when auto phase-2 activates")
-    parser.add_argument("--auto-phase2-tversky-weight", type=float, default=0.1, help="Tversky loss weight applied during auto phase-2")
-    parser.add_argument(
-        "--auto-phase2-monitor",
-        type=str,
-        default="loss",
-        choices=["loss", "iou", "f1"],
-        help="Metric used to select the checkpoint that phase 2 resumes from",
-    )
     parser.add_argument(
         "--final-pred-stage",
         type=int,
@@ -611,12 +581,6 @@ def parse_args() -> TrainConfig:
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
         early_stopping_monitor=args.early_stopping_monitor,
-        training_phase=args.training_phase,
-        auto_phase2_enabled=args.auto_phase2_enabled,
-        auto_phase2_patience=max(1, int(args.auto_phase2_patience)),
-        auto_phase2_lr_scale=float(args.auto_phase2_lr_scale),
-        auto_phase2_tversky_weight=float(args.auto_phase2_tversky_weight),
-        auto_phase2_monitor=args.auto_phase2_monitor,
         final_pred_stage=int(args.final_pred_stage),
         metric_threshold=args.metric_threshold,
         optimize_threshold=args.optimize_threshold,
@@ -1266,57 +1230,6 @@ def _initial_best_for_monitor(monitor: str) -> float:
     return float("-inf")
 
 
-def _scale_optimizer_and_scheduler_for_phase2(
-    optimizer: torch.optim.Optimizer,
-    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
-    lr_scale: float,
-) -> None:
-    scale = float(lr_scale)
-    if scale <= 0.0:
-        raise ValueError("phase-2 lr_scale must be > 0")
-
-    for group in optimizer.param_groups:
-        group["lr"] = float(group["lr"]) * scale
-        if "initial_lr" in group:
-            group["initial_lr"] = float(group["initial_lr"]) * scale
-
-    if scheduler is not None:
-        if hasattr(scheduler, "base_lrs"):
-            scheduler.base_lrs = [float(lr) * scale for lr in scheduler.base_lrs]
-        if hasattr(scheduler, "_last_lr") and getattr(scheduler, "_last_lr") is not None:
-            scheduler._last_lr = [float(lr) * scale for lr in scheduler._last_lr]
-
-
-def _build_phase2_config(cfg: TrainConfig, best_iou_path: Path) -> TrainConfig:
-    phase2_metric = str(cfg.auto_phase2_monitor).strip().lower()
-    if phase2_metric not in {"iou", "f1"}:
-        phase2_metric = "iou"
-
-    phase2_model_cfg = deepcopy(cfg.model_config) if cfg.model_config is not None else None
-    optimizer_cfg = getattr(phase2_model_cfg, "optimizer", None) if phase2_model_cfg is not None else None
-    if optimizer_cfg is not None:
-        for group_name in ("efficientnet", "swin", "residual", "fusion", "decoder"):
-            group = getattr(optimizer_cfg, group_name, None)
-            if group is None:
-                continue
-            group.lr = float(group.lr) * float(cfg.auto_phase2_lr_scale)
-
-    return replace(
-        cfg,
-        training_phase="phase2",
-        resume=str(best_iou_path),
-        auto_resume=False,
-        warmup_epochs=0,
-        early_stopping_monitor="loss",
-        threshold_metric=str(getattr(cfg, "threshold_metric", "f1")),
-        # Treat `auto_phase2_tversky_weight` as a multiplier of the phase-1 tversky weight
-        tversky_weight=float(getattr(cfg, "tversky_weight", 0.0)) * float(cfg.auto_phase2_tversky_weight),
-        lovasz_weight=0.0,
-        hard_mining_enabled=False,
-        model_config=phase2_model_cfg,
-    )
-
-
 def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
     for module_name in ("efficientnet", "swin"):
         module = getattr(model, module_name, None)
@@ -1789,13 +1702,8 @@ def train_one_epoch(
     normalization_mode: Optional[str] = None,
 ):
     model.train()
-    # --- Staged freezing/unfreezing for fine-tuning ONLY ---
-    # Only apply if in fine-tuning mode (resume checkpoint set or training_phase == 'phase2')
-    is_finetune = False
-    if hasattr(cfg, 'training_phase') and str(getattr(cfg, 'training_phase', '')).lower() == 'phase2':
-        is_finetune = True
-    elif hasattr(cfg, 'resume') and cfg.resume:
-        is_finetune = True
+    # --- Staged freezing/unfreezing for resume-based fine-tuning ---
+    is_finetune = bool(getattr(cfg, "resume", None))
 
     if is_finetune:
         freeze_backbone_epochs = getattr(getattr(cfg, 'model_config', None), 'optimizer', None)
@@ -2483,13 +2391,9 @@ def run_training(cfg: TrainConfig) -> None:
     best_val_iou = float("-inf")
     best_val_f1 = float("-inf")
     best_val_loss = float("inf")
-    best_non_phase2_val_loss = float("inf")
     no_improve_epochs = 0
-    # Track IoU-specific non-improvement separately so auto-phase2 can consider IoU plateaus
-    no_improve_epochs_iou = 0
     early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
     best_threshold_path = checkpoint_dir / "best_threshold.json"
-    auto_phase2_triggered = str(getattr(cfg, "training_phase", "phase1")).strip().lower() == "phase2"
 
     freeze_backbone_epochs = int(max(0, getattr(model_cfg.optimizer, "freeze_backbone_epochs", 0)))
     backbone_was_frozen = False
@@ -2612,9 +2516,6 @@ def run_training(cfg: TrainConfig) -> None:
             iou_improved = val_iou > (best_val_iou + cfg.early_stopping_min_delta)
             f1_improved = val_f1 > (best_val_f1 + cfg.early_stopping_min_delta)
             loss_improved = val_loss < (best_val_loss - cfg.early_stopping_min_delta)
-            current_phase = str(getattr(cfg, "training_phase", "phase1")).strip().lower()
-            if current_phase != "phase2":
-                best_non_phase2_val_loss = min(best_non_phase2_val_loss, val_loss)
             # Save best iou checkpoint as before
             if iou_improved:
                 best_val_iou = val_iou
@@ -2664,15 +2565,7 @@ def run_training(cfg: TrainConfig) -> None:
                 cfg.early_stopping_min_delta,
             )
 
-            phase2_loss_gate_blocked = (
-                current_phase == "phase2"
-                and math.isfinite(best_non_phase2_val_loss)
-                and val_loss > best_non_phase2_val_loss
-            )
-            monitor_key = str(getattr(cfg, "early_stopping_monitor", "loss")).strip().lower()
-            monitor_improvement_blocked = phase2_loss_gate_blocked and monitor_key == "loss"
-
-            if loss_improved and not phase2_loss_gate_blocked:
+            if loss_improved:
                 best_val_loss = val_loss
                 configured_monitor = str(getattr(cfg, "early_stopping_monitor", "loss")).strip().lower()
                 monitor_for_metadata = configured_monitor if configured_monitor in metrics else "loss"
@@ -2715,26 +2608,14 @@ def run_training(cfg: TrainConfig) -> None:
                     f"New best val loss {val_loss:.4f}; "
                     f"saved to {best_alias_path} (threshold metadata: {best_threshold_path})"
                 )
-            elif loss_improved and phase2_loss_gate_blocked:
-                print(
-                    "Phase-2 best checkpoint blocked: "
-                    f"val_loss {val_loss:.4f} is higher than best non-phase-2 loss "
-                    f"{best_non_phase2_val_loss:.4f}"
-                )
 
-            if monitor_improved and not monitor_improvement_blocked:
+            if monitor_improved:
                 # Update recorded bests and reset patience
                 best_monitor_value = monitor_value
                 best_val_f1 = val_f1
                 no_improve_epochs = 0
                 print(f"New best {cfg.early_stopping_monitor} {monitor_value:.4f}")
             else:
-                if monitor_improved and monitor_improvement_blocked:
-                    print(
-                        "Phase-2 loss monitor improvement ignored: "
-                        f"val_loss {val_loss:.4f} is higher than best non-phase-2 loss "
-                        f"{best_non_phase2_val_loss:.4f}"
-                    )
                 # Update monitor-based counter
                 if early_stopping_enabled:
                     no_improve_epochs += 1
@@ -2742,11 +2623,6 @@ def run_training(cfg: TrainConfig) -> None:
                         f"Early stopping patience: {no_improve_epochs}/{cfg.early_stopping_patience} "
                         f"without {cfg.early_stopping_monitor} improvement"
                     )
-                # Update IoU-based counter independently
-                if not iou_improved:
-                    no_improve_epochs_iou += 1
-                else:
-                    no_improve_epochs_iou = 0
 
         should_checkpoint = ((epoch + 1) % cfg.checkpoint_every == 0) or (epoch + 1 == cfg.epochs)
         if should_checkpoint:
@@ -2783,81 +2659,6 @@ def run_training(cfg: TrainConfig) -> None:
                 },
             )
             print(f"Saved checkpoint to {ckpt_path}")
-
-        # Auto phase-2 uses the same plateau counter as early stopping (no_improve_epochs),
-        # so phase 1 can hand off to phase 2 instead of stopping when patience is small.
-        auto_phase2_patience = max(1, int(getattr(cfg, "auto_phase2_patience", 0)))
-        # Debug: report auto-phase2 decision variables
-        try:
-            best_iou_exists = (checkpoint_dir / "best_iou_checkpoint.pt").is_file()
-        except Exception:
-            best_iou_exists = False
-        print(
-            "[auto-phase2 debug]",
-            f"no_improve_epochs={no_improve_epochs}",
-            f"no_improve_epochs_iou={no_improve_epochs_iou}",
-            f"auto_phase2_patience={auto_phase2_patience}",
-            f"auto_phase2_enabled={bool(getattr(cfg, 'auto_phase2_enabled', False))}",
-            f"training_phase={str(getattr(cfg, 'training_phase', 'phase1')).strip().lower()}",
-            f"val_every={cfg.val_every}",
-            f"best_iou_exists={best_iou_exists}",
-        )
-
-        auto_phase2_ready = (
-            "val" in loaders
-            and not auto_phase2_triggered
-            and bool(getattr(cfg, "auto_phase2_enabled", False))
-            and str(getattr(cfg, "training_phase", "phase1")).strip().lower() == "phase1"
-            and (epoch + 1) % cfg.val_every == 0
-            and no_improve_epochs >= auto_phase2_patience
-        )
-        if auto_phase2_ready:
-            best_iou_path = checkpoint_dir / "best_iou_checkpoint.pt"
-            best_alias_path = checkpoint_dir / "best_checkpoint.pt"
-            phase2_source = str(getattr(cfg, "auto_phase2_monitor", "loss")).strip().lower()
-            preferred_path = best_alias_path
-            if phase2_source == "iou":
-                preferred_path = best_iou_path
-            resume_path = preferred_path
-            if not resume_path.is_file():
-                resume_path = best_alias_path if best_alias_path.is_file() else best_iou_path
-            if resume_path.is_file():
-                auto_phase2_triggered = True
-                cfg = _build_phase2_config(cfg, resume_path)
-                load_checkpoint(
-                    resume_path,
-                    model,
-                    optimizer,
-                    scaler,
-                    device,
-                    scheduler=scheduler,
-                    ema_model=ema_model,
-                )
-                _scale_optimizer_and_scheduler_for_phase2(
-                    optimizer,
-                    scheduler,
-                    cfg.auto_phase2_lr_scale,
-                )
-                # Reset best values for phase 2
-                best_val_f1 = float("-inf")
-                best_val_loss = float("inf")
-                no_improve_epochs = 0
-                if cfg.early_stopping_monitor == "iou":
-                    best_monitor_value = best_val_iou
-                else:
-                    best_monitor_value = _initial_best_for_monitor(cfg.early_stopping_monitor)
-                early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
-                print(
-                    "Auto phase-2 triggered | "
-                    f"resume={resume_path} | monitor={cfg.early_stopping_monitor} | "
-                    f"threshold_metric={cfg.threshold_metric} | lr_scale={cfg.auto_phase2_lr_scale:.3f} | "
-                    f"tversky_weight={cfg.tversky_weight:.3f}"
-                )
-                continue
-            print(
-                "Auto phase-2 wanted to trigger, but no best checkpoint was found; "
-                "continuing with normal early stopping"
-            )
 
         if early_stopping_enabled and "val" in loaders and (epoch + 1) % cfg.val_every == 0:
             if no_improve_epochs >= cfg.early_stopping_patience:
