@@ -8,10 +8,28 @@ import numpy as np
 import torch
 from PIL import Image
 
-from tools.infer_helpers import infer_from_image_path, load_model_from_checkpoint
+from tools.infer_helpers import infer_from_image_path, load_model_from_checkpoint, multiscale_infer_from_image_path
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def _parse_scales_arg(text: str) -> list[float]:
+    parts = [p.strip() for p in str(text).split(",")]
+    scales: list[float] = []
+    for part in parts:
+        if not part:
+            continue
+        try:
+            value = float(part)
+        except ValueError as err:
+            raise argparse.ArgumentTypeError(f"invalid scale value '{part}'") from err
+        if value <= 0 or value > 1.0:
+            raise argparse.ArgumentTypeError("scale values must be in (0, 1]")
+        scales.append(value)
+    if not scales:
+        scales = [1.0]
+    return scales
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,7 +53,41 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional device override, e.g. cuda, cuda:0, or cpu. Defaults to cuda when available.",
     )
+    parser.add_argument(
+        "--max-short-side",
+        type=int,
+        default=None,
+        help="Override max_short_side resize cap. Use 0 to disable downscaling. Defaults to checkpoint setting when omitted.",
+    )
+    parser.add_argument(
+        "--full-res",
+        action="store_true",
+        help="Shortcut for --max-short-side 0 to disable any downscaling before inference.",
+    )
+    parser.add_argument(
+        "--ms-scales",
+        type=_parse_scales_arg,
+        default=[1.0],
+        help="Comma-separated multi-scale factors <=1.0, e.g. 0.75,1.0. Default is 1.0 (single scale).",
+    )
+    parser.add_argument(
+        "--ms-merge",
+        type=str,
+        choices=("mean", "max"),
+        default="mean",
+        help="Merge mode for multi-scale predictions: mean or max.",
+    )
+    parser.add_argument(
+        "--ms-no-merge",
+        action="store_true",
+        help="Disable merged multi-scale output; save each scale separately only.",
+    )
     return parser.parse_args()
+
+
+def _format_scale_tag(value: float) -> str:
+    # Safe tag for filenames, e.g., 0.75 -> s0p75
+    return f"s{value:.4f}".rstrip("0").rstrip(".").replace(".", "p")
 
 
 def discover_checkpoints(checkpoints_dir: Path) -> list[Path]:
@@ -107,6 +159,10 @@ def _save_overlay_png(
 def run() -> None:
     args = parse_args()
 
+    scales = list(args.ms_scales)
+    merge_mode = None if args.ms_no_merge else str(args.ms_merge).lower()
+    use_multiscale = len(scales) > 1 or abs(scales[0] - 1.0) > 1e-6 or args.ms_no_merge
+
     checkpoints_dir = args.checkpoints_dir.resolve()
     samples_dir = args.samples_dir.resolve()
     output_dir = args.output_dir.resolve()
@@ -134,6 +190,14 @@ def run() -> None:
 
         threshold = float(info.get("default_threshold", 0.5))
         max_short_side = int(info.get("max_short_side", 0) or 0)
+        max_short_side_source = str(info.get("max_short_side_source", "checkpoint"))
+
+        if args.full_res:
+            max_short_side = 0
+            max_short_side_source = "cli_full_res"
+        elif args.max_short_side is not None:
+            max_short_side = int(args.max_short_side)
+            max_short_side_source = "cli_override"
 
         checkpoint_output_dir = output_dir / ckpt_path.stem
         checkpoint_output_dir.mkdir(parents=True, exist_ok=True)
@@ -145,42 +209,94 @@ def run() -> None:
             "threshold": threshold,
             "threshold_source": str(info.get("threshold_source", "unknown")),
             "max_short_side": max_short_side,
+            "max_short_side_source": max_short_side_source,
             "final_pred_stage": int(info.get("final_pred_stage", -1)),
             "normalization_mode": normalization_mode,
+            "multi_scale_enabled": use_multiscale,
+            "multi_scale_scales": scales,
+            "multi_scale_merge": merge_mode,
             "images": [],
         }
 
         for image_path in sample_images:
-            image_tensor, prob_map = infer_from_image_path(
-                model,
-                image_path=image_path,
-                device=device,
-                normalization_mode=normalization_mode,
-                max_short_side=max_short_side,
-            )
-            prob_np = prob_map.numpy().astype(np.float32)
-            bin_np = (prob_np >= threshold).astype(np.uint8)
-
+            if use_multiscale:
+                image_tensor, prob_map, scale_maps = multiscale_infer_from_image_path(
+                    model,
+                    image_path=image_path,
+                    device=device,
+                    normalization_mode=normalization_mode,
+                    max_short_side=max_short_side,
+                    scales=scales,
+                    merge_mode=merge_mode,
+                )
+            else:
+                image_tensor, prob_map = infer_from_image_path(
+                    model,
+                    image_path=image_path,
+                    device=device,
+                    normalization_mode=normalization_mode,
+                    max_short_side=max_short_side,
+                )
+                scale_maps = [(1.0, prob_map)]
             rel_parent = image_path.parent.relative_to(samples_dir)
             base_name = image_path.stem
 
-            prob_out = checkpoint_output_dir / rel_parent / f"{base_name}_prob.png"
-            bin_out = checkpoint_output_dir / rel_parent / f"{base_name}_bin.png"
-            overlay_out = checkpoint_output_dir / rel_parent / f"{base_name}_overlay.png"
+            per_scale_outputs = []
+            merged_paths: dict[str, str] | None = None
 
-            prob_img = np.clip(np.round(prob_np * 255.0), 0, 255).astype(np.uint8)
-            bin_img = (bin_np * 255).astype(np.uint8)
+            if merge_mode is not None and prob_map is not None:
+                # Save merged output (existing behavior)
+                prob_np = prob_map.numpy().astype(np.float32)
+                bin_np = (prob_np >= threshold).astype(np.uint8)
 
-            _save_mask_png(prob_img, prob_out)
-            _save_mask_png(bin_img, bin_out)
-            _save_overlay_png(image_tensor, bin_np, overlay_out)
+                prob_out = checkpoint_output_dir / rel_parent / f"{base_name}_prob.png"
+                bin_out = checkpoint_output_dir / rel_parent / f"{base_name}_bin.png"
+                overlay_out = checkpoint_output_dir / rel_parent / f"{base_name}_overlay.png"
+
+                prob_img = np.clip(np.round(prob_np * 255.0), 0, 255).astype(np.uint8)
+                bin_img = (bin_np * 255).astype(np.uint8)
+
+                _save_mask_png(prob_img, prob_out)
+                _save_mask_png(bin_img, bin_out)
+                _save_overlay_png(image_tensor, bin_np, overlay_out)
+
+                merged_paths = {
+                    "probability_map": str(prob_out),
+                    "binary_map": str(bin_out),
+                    "overlay_map": str(overlay_out),
+                }
+            for scale_val, scale_prob in scale_maps:
+                tag = _format_scale_tag(scale_val)
+                scale_np = scale_prob.numpy().astype(np.float32)
+                scale_bin = (scale_np >= threshold).astype(np.uint8)
+
+                s_prob_out = checkpoint_output_dir / rel_parent / f"{base_name}_prob_{tag}.png"
+                s_bin_out = checkpoint_output_dir / rel_parent / f"{base_name}_bin_{tag}.png"
+                s_overlay_out = checkpoint_output_dir / rel_parent / f"{base_name}_overlay_{tag}.png"
+
+                s_prob_img = np.clip(np.round(scale_np * 255.0), 0, 255).astype(np.uint8)
+                s_bin_img = (scale_bin * 255).astype(np.uint8)
+
+                _save_mask_png(s_prob_img, s_prob_out)
+                _save_mask_png(s_bin_img, s_bin_out)
+                _save_overlay_png(image_tensor, scale_bin, s_overlay_out)
+
+                per_scale_outputs.append(
+                    {
+                        "scale": float(scale_val),
+                        "probability_map": str(s_prob_out),
+                        "binary_map": str(s_bin_out),
+                        "overlay_map": str(s_overlay_out),
+                    }
+                )
 
             metadata["images"].append(
                 {
                     "input": str(image_path),
-                    "probability_map": str(prob_out),
-                    "binary_map": str(bin_out),
-                    "overlay_map": str(overlay_out),
+                    "probability_map": None if merged_paths is None else merged_paths["probability_map"],
+                    "binary_map": None if merged_paths is None else merged_paths["binary_map"],
+                    "overlay_map": None if merged_paths is None else merged_paths["overlay_map"],
+                    "per_scale": per_scale_outputs,
                 }
             )
             print(f"  inferred {image_path.relative_to(samples_dir)}")

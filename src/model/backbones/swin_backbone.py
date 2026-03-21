@@ -23,6 +23,7 @@ class SwinBackboneConfig:
     pretrained: bool = True
     out_indices: Sequence[int] = (0, 1, 2, 3)
     input_size: Union[int, Tuple[int, int], None] = 384
+    allow_variable_input: bool = True
 
 
 class SwinBackbone(nn.Module):
@@ -65,6 +66,10 @@ class SwinBackbone(nn.Module):
             self.patch_size: Tuple[int, int] = self.patch_embed.patch_size
         else:
             self.patch_size = (self.patch_embed.patch_size, self.patch_embed.patch_size)
+        self.allow_variable_input = bool(cfg.allow_variable_input)
+        if hasattr(self.patch_embed, "strict_img_size"):
+            # Disable timm's strict size assertions when variable input is desired.
+            self.patch_embed.strict_img_size = not self.allow_variable_input
         self.stages: List[nn.Module] = [
             module
             for name, module in self.model.named_children()
@@ -73,6 +78,10 @@ class SwinBackbone(nn.Module):
         if not self.stages:
             raise ValueError("Swin backbone structure unexpected; layers_* modules not found")
         self._last_spatial_size: Tuple[int, int] | None = None
+
+        # Cache a conservative multiple to pad inputs for stable window/patch layouts.
+        # Use window size * 2^(num_stages-1) to keep patch merging even, and align with patch size.
+        self._pad_multiple = self._compute_pad_multiple()
 
         # Flash attention and xformers hooks
         self.flash_attention = flash_attention
@@ -103,6 +112,28 @@ class SwinBackbone(nn.Module):
             if len(value) >= 3:
                 return (int(value[-2]), int(value[-1]))
         return None
+
+    def _compute_pad_multiple(self) -> int:
+        # Pad to a multiple that keeps patch embedding, window partitioning, and patch merging stable.
+        win = None
+        try:
+            first_stage = self.stages[0]
+            first_block = getattr(first_stage, "blocks", [None])[0]
+            if first_block is not None and hasattr(first_block, "attn"):
+                wsize = getattr(first_block.attn, "window_size", None)
+                if isinstance(wsize, (tuple, list)) and len(wsize) >= 2:
+                    win = int(max(wsize[-2], wsize[-1]))
+                elif isinstance(wsize, int):
+                    win = int(wsize)
+        except Exception:
+            win = None
+
+        num_stages = max(1, len(self.stages))
+        downsample_factor = 2 ** (num_stages - 1)
+
+        patch_mult = max(1, self.patch_size[0], self.patch_size[1])
+        window_mult = patch_mult if win is None else max(patch_mult, win * downsample_factor)
+        return max(patch_mult, window_mult)
 
     def _expected_input_size(self) -> Tuple[int, int] | None:
         candidates = [
@@ -148,7 +179,11 @@ class SwinBackbone(nn.Module):
 
         for stage_idx, stage in enumerate(self.stages):
             scale = 2 ** stage_idx
-            stage_res = (grid_h // scale, grid_w // scale)
+            # Use ceil to stay consistent with potential padding inside timm patch merging.
+            stage_res = (
+                (grid_h + scale - 1) // scale,
+                (grid_w + scale - 1) // scale,
+            )
             stage.input_resolution = stage_res
             blocks = getattr(stage, "blocks", [])
             for block in blocks:
@@ -208,20 +243,33 @@ class SwinBackbone(nn.Module):
         # Pad input so spatial dimensions are multiples of the Swin patch size
         _, _, h, w = x.shape
         ph, pw = self.patch_size
-        pad_h = (ph - (h % ph)) % ph
-        pad_w = (pw - (w % pw)) % pw
+        multiple = self._pad_multiple if self.allow_variable_input else max(ph, pw)
+        pad_h = (multiple - (h % multiple)) % multiple
+        pad_w = (multiple - (w % multiple)) % multiple
         if pad_h or pad_w:
             _LOG.warning(
                 "SwinBackbone internal pad to patch multiple: (%d,%d) -> (%d,%d)",
                 h, w, h + pad_h, w + pad_w,
             )
             x = NN_F.pad(x, (0, pad_w, 0, pad_h), value=0)
+            h, w = x.shape[-2:]
+
+        # When variable input is allowed, keep patch_embed metadata in sync with padded spatial dims
+        if self.allow_variable_input:
+            grid_h = h // ph
+            grid_w = w // pw
+            if hasattr(self.patch_embed, "img_size"):
+                self.patch_embed.img_size = (h, w)
+            if hasattr(self.patch_embed, "grid_size"):
+                self.patch_embed.grid_size = (grid_h, grid_w)
+            if hasattr(self.patch_embed, "num_patches"):
+                self.patch_embed.num_patches = grid_h * grid_w
 
         # Prefer preserving the incoming resolution after patch-multiple padding.
         # If the underlying patch embed is configured for strict image sizes,
         # proactively resize to the model's actual configured size. Otherwise,
         # only fall back after an assertion from timm.
-        expected_size = self._expected_input_size()
+        expected_size = None if self.allow_variable_input else self._expected_input_size()
         strict_img_size = bool(getattr(self.patch_embed, "strict_img_size", False))
         if expected_size is not None:
             exp_h, exp_w = expected_size

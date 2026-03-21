@@ -294,6 +294,7 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
 
     train_config = checkpoint.get("train_config") or {}
 
+    has_train_max_short = "max_short_side" in train_config
     info = {
         "epoch": checkpoint_epoch,
         "missing_keys": len(missing),
@@ -304,6 +305,7 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
         "default_threshold": float(resolved_threshold),
         "threshold_source": str(threshold_source),
         "max_short_side": int(train_config.get("max_short_side", 0) or 0),
+        "max_short_side_source": "train_config" if has_train_max_short else "default",
         "final_pred_stage": int(train_config.get("final_pred_stage", -1)),
     }
     setattr(model, "default_threshold", float(info["default_threshold"]))
@@ -572,6 +574,79 @@ def infer_from_image_path(
     image, _, high_pass = resize_for_inference(image, mask=None, high_pass=high_pass, max_short_side=max_short_side)
     pred = predict_probability_map(model, image, device, normalization_mode=normalization_mode, high_pass=high_pass)
     return image, pred
+
+
+def multiscale_infer_from_image_path(
+    model: HybridNGIML,
+    image_path: Path,
+    device: torch.device,
+    normalization_mode: str = "zero_one",
+    max_short_side: int | None = None,
+    scales: Sequence[float] = (1.0,),
+    merge_mode: str = "mean",
+) -> tuple[torch.Tensor, torch.Tensor | None, list[tuple[float, torch.Tensor]]]:
+    image = _load_image(str(Path(image_path).as_posix())).float()
+    if image.max() > 1.0:
+        image = image / 255.0
+    high_pass = _compute_high_pass_fallback(image)
+    image, _, high_pass = resize_for_inference(image, mask=None, high_pass=high_pass, max_short_side=max_short_side)
+
+    base_h, base_w = image.shape[-2:]
+    merge = None if merge_mode is None else ("max" if str(merge_mode).lower() == "max" else "mean")
+
+    cleaned_scales: list[float] = []
+    for scale in scales or (1.0,):
+        value = float(scale)
+        if value <= 0:
+            continue
+        cleaned_scales.append(value)
+    if not cleaned_scales:
+        cleaned_scales = [1.0]
+
+    merged: torch.Tensor | None = None
+    count = 0
+    scale_outputs: list[tuple[float, torch.Tensor]] = []
+
+    for scale in cleaned_scales:
+        if abs(scale - 1.0) < 1e-6:
+            scaled_img = image
+            scaled_hp = high_pass
+        else:
+            new_h = max(1, int(round(base_h * scale)))
+            new_w = max(1, int(round(base_w * scale)))
+            scaled_img = TVF.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+            scaled_hp = None if high_pass is None else TVF.resize(high_pass, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+
+        prob = predict_probability_map(
+            model,
+            scaled_img,
+            device,
+            normalization_mode=normalization_mode,
+            high_pass=scaled_hp,
+        )
+
+        if prob.shape[-2:] != (base_h, base_w):
+            prob = F.interpolate(prob.unsqueeze(0).unsqueeze(0), size=(base_h, base_w), mode="bilinear", align_corners=False)[0, 0]
+
+        scale_outputs.append((scale, prob))
+
+        # Accumulate merged map only when caller wants a merge (len(cleaned_scales) > 1 handled upstream)
+        if merge is not None:
+            if merge == "max":
+                merged = prob if merged is None else torch.maximum(merged, prob)
+            else:
+                merged = prob if merged is None else merged + prob
+                count += 1
+
+    if merge is None:
+        merged = None
+    else:
+        if merged is None:
+            merged = torch.empty((base_h, base_w))
+        elif merge != "max":
+            merged = merged / float(count or len(cleaned_scales))
+
+    return image, merged, scale_outputs
 
 
 def get_model_complexity_stats(
