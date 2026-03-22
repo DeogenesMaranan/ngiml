@@ -853,6 +853,101 @@ def run_multi_strategy_inference(
     }
 
 
+def _epoch_from_checkpoint_name(checkpoint_path: Path) -> int | None:
+    match = re.search(r"checkpoint_epoch_(\d+)", checkpoint_path.name)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def list_epoch_checkpoints(checkpoint_dir: str | Path) -> list[Path]:
+    checkpoint_root = Path(checkpoint_dir)
+    checkpoints = list(checkpoint_root.glob("checkpoint_epoch_*.pt"))
+    if not checkpoints:
+        return []
+
+    def _sort_key(path: Path) -> tuple[int, float, str]:
+        epoch = _epoch_from_checkpoint_name(path)
+        epoch_key = int(epoch) if epoch is not None else -1
+        try:
+            mtime = float(path.stat().st_mtime)
+        except OSError:
+            mtime = 0.0
+        return (epoch_key, mtime, path.name)
+
+    return sorted(checkpoints, key=_sort_key)
+
+
+def sweep_checkpoint_inference_for_image(
+    checkpoint_dir: str | Path,
+    image: torch.Tensor,
+    normalization_mode: str = "imagenet",
+    strategy: str = "direct",
+    threshold: float | None = None,
+    infer_size: int = 448,
+    tile_size: int = 448,
+    tile_overlap: float = 0.5,
+    tile_batch_size: int = 16,
+) -> dict[str, object]:
+    """Run one strategy for one image across all epoch checkpoints in a directory."""
+    checkpoint_paths = list_epoch_checkpoints(checkpoint_dir)
+    if not checkpoint_paths:
+        raise FileNotFoundError(f"No checkpoint_epoch_*.pt files found in {checkpoint_dir}")
+
+    image = image.float()
+    if image.max() > 1.0:
+        image = image / 255.0
+    image = image.clamp(0.0, 1.0)
+
+    records: list[dict[str, object]] = []
+    strategy_key = str(strategy).strip().lower()
+
+    for checkpoint_path in checkpoint_paths:
+        model, device, ckpt_info = load_model_from_checkpoint(checkpoint_path)
+        run = run_multi_strategy_inference(
+            model=model,
+            image=image,
+            device=device,
+            normalization_mode=normalization_mode,
+            threshold=threshold,
+            infer_size=infer_size,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            tile_batch_size=tile_batch_size,
+            strategies=[strategy_key],
+            show_plot=False,
+        )
+
+        summary = run["summary"][strategy_key]
+        records.append(
+            {
+                "checkpoint_path": str(checkpoint_path),
+                "checkpoint_epoch_from_name": _epoch_from_checkpoint_name(checkpoint_path),
+                "checkpoint_epoch_from_state": ckpt_info.get("epoch"),
+                "strategy": strategy_key,
+                "normalization_mode": normalization_mode,
+                "threshold_used": float(run["threshold"]),
+                "mean_probability": float(summary["mean_probability"]),
+                "max_probability": float(summary["max_probability"]),
+                "predicted_positive_ratio": float(summary["predicted_positive_ratio"]),
+            }
+        )
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    best_by_max_probability = max(records, key=lambda row: float(row["max_probability"]))
+
+    return {
+        "strategy": strategy_key,
+        "normalization_mode": normalization_mode,
+        "num_checkpoints": len(records),
+        "records": records,
+        "best_by_max_probability": best_by_max_probability,
+    }
+
+
 def plot_multi_strategy_inference(
     image: torch.Tensor,
     strategy_probs: dict[str, torch.Tensor],
