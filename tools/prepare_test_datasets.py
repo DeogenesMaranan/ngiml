@@ -409,7 +409,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="JSONL row log path (default: <output-root>/manifest_rows.jsonl)",
     )
-    parser.add_argument("--size", type=int, default=384, help="Square resize size")
+    parser.add_argument("--size", type=int, default=448, help="Square resize size")
     parser.add_argument("--split", type=str, default="test", help="Split name to assign in manifest")
     parser.add_argument(
         "--dataset",
