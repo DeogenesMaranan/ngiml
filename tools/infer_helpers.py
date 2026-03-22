@@ -11,7 +11,7 @@ from torchvision.transforms import functional as TVF
 from torchvision.transforms.functional import InterpolationMode
 
 from src.data.dataloaders import (
-    _compute_residual_noise_fallback,
+    _compute_residual_noise,
     _load_from_npz,
     _load_from_tar_npz,
     _load_image,
@@ -253,6 +253,12 @@ def _select_output_head(outputs: Sequence[torch.Tensor]) -> torch.Tensor:
     return outputs[0]
 
 
+def _model_uses_residual_noise(model: HybridNGIML) -> bool:
+    cfg = getattr(model, "cfg", None)
+    cfg_flag = bool(getattr(cfg, "use_residual", True))
+    return cfg_flag and (getattr(model, "noise", None) is not None)
+
+
 def _dtype_name(value: torch.dtype | None) -> str:
     return str(value).replace("torch.", "") if isinstance(value, torch.dtype) else "none"
 
@@ -410,89 +416,6 @@ def resize_for_inference(
     return image, mask, residual_noise
 
 
-def should_use_residual_noise_for_records(records: Sequence[SampleRecord]) -> bool:
-    """Mirror dataloader behavior: if any non-NPZ sample lacks high-pass, disable high-pass for the whole split."""
-    for record in records:
-        image_path = str(record.image_path)
-        is_npz_like = image_path.endswith(".npz")
-        if is_npz_like:
-            # NPZ/tar::NPZ samples synthesize high-pass fallback at load time.
-            continue
-        if record.residual_noise_path is None:
-            return False
-    return True
-
-
-def collate_eval_batch_like_training(
-    records: Sequence[SampleRecord],
-    max_short_side: int | None = None,
-    use_residual_noise: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, list[str]]:
-    """Load and collate a batch using the same median-short-side resize + padding policy as training eval."""
-    images: list[torch.Tensor] = []
-    masks: list[torch.Tensor] = []
-    residual_noisees: list[torch.Tensor] = []
-    datasets: list[str] = []
-
-    for record in records:
-        image, mask, residual_noise = load_image_mask_from_record(record, max_short_side=max_short_side)
-        images.append(image)
-        masks.append(mask)
-        datasets.append(str(record.dataset))
-        if use_residual_noise and residual_noise is not None:
-            residual_noisees.append(residual_noise)
-
-    shorts = [min(int(img.shape[-2]), int(img.shape[-1])) for img in images]
-    target_short = int(round(float(torch.tensor(shorts, dtype=torch.float32).median().item()))) if shorts else 0
-
-    if target_short > 0:
-        for idx, image in enumerate(images):
-            h, w = image.shape[-2:]
-            short_side = min(h, w)
-            if short_side > 0 and short_side != target_short:
-                scale = float(target_short) / float(short_side)
-                new_h = max(1, int(round(h * scale)))
-                new_w = max(1, int(round(w * scale)))
-                images[idx] = TVF.resize(images[idx], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-                masks[idx] = TVF.resize(masks[idx], [new_h, new_w], interpolation=InterpolationMode.NEAREST)
-                if use_residual_noise and idx < len(residual_noisees):
-                    residual_noisees[idx] = TVF.resize(residual_noisees[idx], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-
-    max_h = max(int(img.shape[-2]) for img in images)
-    max_w = max(int(img.shape[-1]) for img in images)
-
-    padded_images: list[torch.Tensor] = []
-    padded_masks: list[torch.Tensor] = []
-    padded_residual_noisees: list[torch.Tensor] = []
-
-    for idx, (image, mask) in enumerate(zip(images, masks)):
-        h, w = image.shape[-2:]
-        pad_h = max_h - h
-        pad_w = max_w - w
-        if pad_h > 0 or pad_w > 0:
-            image = F.pad(image.unsqueeze(0), (0, pad_w, 0, pad_h), mode="constant", value=0.0).squeeze(0)
-            mask = F.pad(mask.unsqueeze(0), (0, pad_w, 0, pad_h), mode="constant", value=0.0).squeeze(0)
-        padded_images.append(image)
-        padded_masks.append(mask)
-
-        if use_residual_noise and idx < len(residual_noisees):
-            hp = residual_noisees[idx]
-            hh, hw = hp.shape[-2:]
-            hp_pad_h = max_h - hh
-            hp_pad_w = max_w - hw
-            if hp_pad_h > 0 or hp_pad_w > 0:
-                hp = F.pad(hp.unsqueeze(0), (0, hp_pad_w, 0, hp_pad_h), mode="constant", value=0.0).squeeze(0)
-            padded_residual_noisees.append(hp)
-
-    image_batch = torch.stack(padded_images, dim=0)
-    mask_batch = torch.stack(padded_masks, dim=0)
-
-    residual_noise_batch = None
-    if use_residual_noise and len(padded_residual_noisees) == len(padded_images):
-        residual_noise_batch = torch.stack(padded_residual_noisees, dim=0)
-
-    return image_batch, mask_batch, residual_noise_batch, datasets
-
 
 def load_image_mask_from_record(
     record: SampleRecord,
@@ -510,9 +433,6 @@ def load_image_mask_from_record(
         if record.mask_path is not None:
             loaded = _load_image(_resolve_possible_local_path(record.mask_path))
             mask = loaded[:1] if loaded.shape[0] > 1 else loaded
-        if record.residual_noise_path is not None:
-            loaded_high = _load_image(_resolve_possible_local_path(record.residual_noise_path))
-            residual_noise = loaded_high if loaded_high.shape[0] in (1, 3) else loaded_high[:3]
 
     image = image.float()
     if image.max() > 1.0:
@@ -531,20 +451,9 @@ def load_image_mask_from_record(
         if tuple(mask.shape[-2:]) != tuple(image.shape[-2:]):
             mask = F.interpolate(mask.unsqueeze(0), size=image.shape[-2:], mode="nearest").squeeze(0)
 
-    if residual_noise is not None:
-        residual_noise = residual_noise.float()
-        if residual_noise.ndim == 2:
-            residual_noise = residual_noise.unsqueeze(0)
-        if residual_noise.shape[0] == 1:
-            residual_noise = residual_noise.repeat(3, 1, 1)
-        elif residual_noise.shape[0] > 3:
-            residual_noise = residual_noise[:3]
-        if residual_noise.max() > 1.0:
-            residual_noise = residual_noise / 255.0
-        if tuple(residual_noise.shape[-2:]) != tuple(image.shape[-2:]):
-            residual_noise = F.interpolate(residual_noise.unsqueeze(0), size=image.shape[-2:], mode="bilinear", align_corners=False).squeeze(0)
-    else:
-        residual_noise = _compute_residual_noise_fallback(image)
+    # Residual noise is always derived on-the-fly from RGB, independent of
+    # whether a legacy manifest still contains residual_noise_path fields.
+    residual_noise = _compute_residual_noise(image)
 
     image, mask, residual_noise = resize_for_inference(image, mask=mask, residual_noise=residual_noise, max_short_side=max_short_side)
     return image, mask, residual_noise
@@ -567,11 +476,9 @@ def predict_probability_map(
     normalized = normalize_image_for_inference(image, normalization_mode=normalization_mode)
     x = normalized.unsqueeze(0).to(device)
     hp = None
-    if residual_noise is not None:
-        hp = residual_noise.float()
-        if hp.max() > 1.0:
-            hp = hp / 255.0
-        hp = hp.unsqueeze(0).to(device)
+    if _model_uses_residual_noise(model):
+        hp_src = residual_noise if residual_noise is not None else _compute_residual_noise(image)
+        hp = hp_src.unsqueeze(0).to(device)
     autocast_dtype = get_inference_autocast_dtype(model, device)
     use_amp = device.type == "cuda" and autocast_dtype is not None
     with torch.no_grad():
@@ -682,6 +589,7 @@ def predict_probability_map_sliding_window(
     tile_batch_size: int = 4,
 ) -> torch.Tensor:
     """Run overlap-weighted tiled inference and return full-resolution probability map."""
+    model_uses_residual = _model_uses_residual_noise(model)
     if image.ndim != 3 or image.shape[0] != 3:
         raise ValueError(f"Expected RGB CHW image tensor, got shape={tuple(image.shape)}")
 
@@ -690,25 +598,10 @@ def predict_probability_map_sliding_window(
         image = image / 255.0
     image = image.clamp(0.0, 1.0)
 
-    if residual_noise is None:
-        residual_noise = _compute_residual_noise_fallback(image)
+    if model_uses_residual:
+        residual_noise = residual_noise if residual_noise is not None else _compute_residual_noise(image)
     else:
-        residual_noise = residual_noise.float()
-        if residual_noise.ndim == 2:
-            residual_noise = residual_noise.unsqueeze(0)
-        if residual_noise.shape[0] == 1:
-            residual_noise = residual_noise.repeat(3, 1, 1)
-        elif residual_noise.shape[0] > 3:
-            residual_noise = residual_noise[:3]
-        if residual_noise.max() > 1.0:
-            residual_noise = residual_noise / 255.0
-        if tuple(residual_noise.shape[-2:]) != tuple(image.shape[-2:]):
-            residual_noise = F.interpolate(
-                residual_noise.unsqueeze(0),
-                size=image.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(0)
+        residual_noise = None
 
     _, h, w = image.shape
     tile = max(64, int(tile_size))
@@ -719,7 +612,8 @@ def predict_probability_map_sliding_window(
     pad_w = max(0, tile - w)
     if pad_h > 0 or pad_w > 0:
         image = F.pad(image.unsqueeze(0), (0, pad_w, 0, pad_h), mode="reflect").squeeze(0)
-        residual_noise = F.pad(residual_noise.unsqueeze(0), (0, pad_w, 0, pad_h), mode="reflect").squeeze(0)
+        if residual_noise is not None:
+            residual_noise = F.pad(residual_noise.unsqueeze(0), (0, pad_w, 0, pad_h), mode="reflect").squeeze(0)
 
     _, hp, wp = image.shape
     ys = _tile_starts(hp, tile, stride)
@@ -737,7 +631,7 @@ def predict_probability_map_sliding_window(
         if not rgb_tiles:
             return
         xb = torch.stack(rgb_tiles, dim=0).to(device, non_blocking=True)
-        hb = torch.stack(residual_tiles, dim=0).to(device, non_blocking=True)
+        hb = torch.stack(residual_tiles, dim=0).to(device, non_blocking=True) if residual_tiles else None
 
         autocast_dtype = get_inference_autocast_dtype(model, device)
         use_amp = device.type == "cuda" and autocast_dtype is not None
@@ -758,10 +652,11 @@ def predict_probability_map_sliding_window(
     for y0 in ys:
         for x0 in xs:
             rgb_tile = image[:, y0 : y0 + tile, x0 : x0 + tile]
-            hp_tile = residual_noise[:, y0 : y0 + tile, x0 : x0 + tile]
+            hp_tile = residual_noise[:, y0 : y0 + tile, x0 : x0 + tile] if residual_noise is not None else None
 
             tile_images.append(normalize_image_for_inference(rgb_tile, normalization_mode=normalization_mode))
-            tile_residuals.append(hp_tile.float())
+            if hp_tile is not None:
+                tile_residuals.append(hp_tile.float())
             tile_coords.append((y0, x0))
 
             if len(tile_images) >= tile_batch:
@@ -773,126 +668,6 @@ def predict_probability_map_sliding_window(
     _flush(tile_images, tile_residuals, tile_coords)
     prob = accum / accum_w.clamp_min(1e-6)
     return prob[:h, :w]
-
-
-def _center_square_crop(tensor: torch.Tensor) -> torch.Tensor:
-    h, w = tensor.shape[-2:]
-    if h == w:
-        return tensor
-    side = min(h, w)
-    top = (h - side) // 2
-    left = (w - side) // 2
-    return tensor[..., top : top + side, left : left + side]
-
-
-def infer_from_image_path(
-    model: HybridNGIML,
-    image_path: Path,
-    device: torch.device,
-    normalization_mode: str = "zero_one",
-    max_short_side: int | None = None,
-    crop_square: bool = False,
-    prep_target_size: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    orig_image = _load_image(str(Path(image_path).as_posix())).float()
-    if orig_image.max() > 1.0:
-        orig_image = orig_image / 255.0
-
-    image = orig_image
-    if crop_square:
-        image = _center_square_crop(image)
-
-    residual_noise = _compute_residual_noise_fallback(image)
-    if prep_target_size is not None and prep_target_size > 0:
-        image = TVF.resize(image, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
-        residual_noise = TVF.resize(residual_noise, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
-    else:
-        image, _, residual_noise = resize_for_inference(image, mask=None, residual_noise=residual_noise, max_short_side=max_short_side)
-    pred = predict_probability_map(model, image, device, normalization_mode=normalization_mode, residual_noise=residual_noise)
-    return image, pred, orig_image
-
-
-def multiscale_infer_from_image_path(
-    model: HybridNGIML,
-    image_path: Path,
-    device: torch.device,
-    normalization_mode: str = "zero_one",
-    max_short_side: int | None = None,
-    scales: Sequence[float] = (1.0,),
-    merge_mode: str = "mean",
-    crop_square: bool = False,
-    prep_target_size: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None, list[tuple[float, torch.Tensor]], torch.Tensor]:
-    orig_image = _load_image(str(Path(image_path).as_posix())).float()
-    if orig_image.max() > 1.0:
-        orig_image = orig_image / 255.0
-
-    image = orig_image
-    if crop_square:
-        image = _center_square_crop(image)
-    residual_noise = _compute_residual_noise_fallback(image)
-    if prep_target_size is not None and prep_target_size > 0:
-        image = TVF.resize(image, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
-        residual_noise = TVF.resize(residual_noise, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
-    else:
-        image, _, residual_noise = resize_for_inference(image, mask=None, residual_noise=residual_noise, max_short_side=max_short_side)
-
-    base_h, base_w = image.shape[-2:]
-    merge = None if merge_mode is None else ("max" if str(merge_mode).lower() == "max" else "mean")
-
-    cleaned_scales: list[float] = []
-    for scale in scales or (1.0,):
-        value = float(scale)
-        if value <= 0:
-            continue
-        cleaned_scales.append(value)
-    if not cleaned_scales:
-        cleaned_scales = [1.0]
-
-    merged: torch.Tensor | None = None
-    count = 0
-    scale_outputs: list[tuple[float, torch.Tensor]] = []
-
-    for scale in cleaned_scales:
-        if abs(scale - 1.0) < 1e-6:
-            scaled_img = image
-            scaled_hp = residual_noise
-        else:
-            new_h = max(1, int(round(base_h * scale)))
-            new_w = max(1, int(round(base_w * scale)))
-            scaled_img = TVF.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-            scaled_hp = None if residual_noise is None else TVF.resize(residual_noise, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-
-        prob = predict_probability_map(
-            model,
-            scaled_img,
-            device,
-            normalization_mode=normalization_mode,
-            residual_noise=scaled_hp,
-        )
-
-        if prob.shape[-2:] != (base_h, base_w):
-            prob = F.interpolate(prob.unsqueeze(0).unsqueeze(0), size=(base_h, base_w), mode="bilinear", align_corners=False)[0, 0]
-
-        scale_outputs.append((scale, prob))
-
-        # Accumulate merged map only when caller wants a merge (len(cleaned_scales) > 1 handled upstream)
-        if merge is not None:
-            if merge == "max":
-                merged = prob if merged is None else torch.maximum(merged, prob)
-            else:
-                merged = prob if merged is None else merged + prob
-                count += 1
-
-    if merge is None:
-        merged = None
-    else:
-        if merged is None:
-            merged = torch.empty((base_h, base_w))
-        elif merge != "max":
-            merged = merged / float(count or len(cleaned_scales))
-
-    return image, merged, scale_outputs, orig_image
 
 
 def get_model_complexity_stats(

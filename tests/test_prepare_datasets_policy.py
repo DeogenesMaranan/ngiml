@@ -60,20 +60,16 @@ def test_build_npz_bytes_uses_mask_aware_crop_and_binary_mask(tmp_path: Path):
         crop_size=384,
         resize_max_side=1024,
         rng=random.Random(7),
-        include_residual_noise=True,
     )
 
     with np.load(io.BytesIO(payload), allow_pickle=False) as data:
         out_image = data["image"]
         out_mask = data["mask"]
-        out_residual = data["residual_noise"]
+        payload_keys = set(data.files)
 
     assert out_image.shape == (384, 384, 3)
     assert out_mask.shape == (384, 384)
-    assert out_residual.shape == (384, 384, 3)
-    assert out_residual.dtype == np.float32
-    assert float(out_residual.min()) < -1e-4
-    assert float(out_residual.max()) > 1e-4
+    assert "residual_noise" not in payload_keys
     assert int(out_mask.sum()) > 0
     assert set(np.unique(out_mask).tolist()).issubset({0, 1})
 

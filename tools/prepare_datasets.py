@@ -30,48 +30,6 @@ from src.data.config import DatasetStructureConfig, Manifest, PreparationConfig,
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
-def _gaussian_kernel1d(sigma: float = 1.0) -> np.ndarray:
-    sigma = max(0.5, float(sigma))
-    radius = max(1, int(round(3.0 * sigma)))
-    x = np.arange(-radius, radius + 1, dtype=np.float32)
-    kernel = np.exp(-(x ** 2) / (2.0 * sigma * sigma))
-    kernel /= np.sum(kernel)
-    return kernel.astype(np.float32)
-
-
-def _gaussian_blur_rgb(image_f: np.ndarray, sigma: float = 1.0) -> np.ndarray:
-    if image_f.ndim != 3 or image_f.shape[2] != 3:
-        raise ValueError(f"Expected float RGB image HxWx3, got shape {image_f.shape}")
-
-    kernel = _gaussian_kernel1d(sigma=sigma)
-    radius = kernel.shape[0] // 2
-    h, w, _ = image_f.shape
-
-    tmp = np.empty_like(image_f, dtype=np.float32)
-    out = np.empty_like(image_f, dtype=np.float32)
-
-    for channel in range(3):
-        padded_w = np.pad(image_f[:, :, channel], ((0, 0), (radius, radius)), mode="reflect")
-        for y in range(h):
-            tmp[y, :, channel] = np.convolve(padded_w[y, :], kernel, mode="valid")
-
-        padded_h = np.pad(tmp[:, :, channel], ((radius, radius), (0, 0)), mode="reflect")
-        for x in range(w):
-            out[:, x, channel] = np.convolve(padded_h[:, x], kernel, mode="valid")
-
-    return out
-
-
-def _compute_residual_noise(image_np: np.ndarray) -> np.ndarray:
-    """Compute residual noise as image_f - gaussian_blur(image_f), float32 HWC."""
-    if image_np.ndim != 3 or image_np.shape[2] != 3:
-        raise ValueError(f"Expected RGB image HxWx3, got shape {image_np.shape}")
-
-    image_f = image_np.astype(np.float32) / 255.0
-    blur_f = _gaussian_blur_rgb(image_f, sigma=1.0)
-    return (image_f - blur_f).astype(np.float32)
-
-
 class TarShardWriter:
     """Utility to write NPZ payloads into sequential tar shards."""
 
@@ -233,7 +191,6 @@ def _build_npz_bytes(
     crop_size: int,
     resize_max_side: int,
     rng: random.Random,
-    include_residual_noise: bool = True,
 ) -> bytes:
     image = Image.open(image_path).convert("RGB")
     mask_img = Image.open(mask_path).convert("L") if mask_path is not None else None
@@ -319,8 +276,6 @@ def _build_npz_bytes(
     payload = {"image": image_np}
     if mask_np is not None:
         payload["mask"] = (mask_np > 127).astype(np.uint8)
-    if include_residual_noise:
-        payload["residual_noise"] = _compute_residual_noise(image_np)
 
     buf = io.BytesIO()
     # np.savez (not compressed) to avoid CPU overhead from compression.
@@ -404,7 +359,6 @@ def prepare_single_dataset(
                 crop_size=crop_size,
                 resize_max_side=prep_cfg.resize_max_side,
                 rng=split_rng,
-                include_residual_noise=prep_cfg.enable_residual_noise,
             )
 
             stem = f"{cfg.dataset_name}_{split_name}_{'fake' if rec.label else 'real'}_{idx:06d}"
@@ -434,7 +388,7 @@ def prepare_single_dataset(
                         "original_image_path": rec.image_path,
                         "original_mask_path": rec.mask_path,
                         "storage": "npz",
-                        "residual_noise": bool(prep_cfg.enable_residual_noise),
+                        "residual_noise_mode": "on_the_fly",
                     },
                 )
             )

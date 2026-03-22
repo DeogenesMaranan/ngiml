@@ -5,7 +5,6 @@ import io
 import json
 import tarfile
 import atexit
-import warnings
 from collections import OrderedDict
 import pandas as pd
 from bisect import bisect_right
@@ -30,7 +29,6 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".npz"}
 # Per-process LRU cache of open tar archives to avoid reopening on every sample.
 _TAR_CACHE_LIMIT = 8
 _TAR_CACHE: "OrderedDict[str, tarfile.TarFile]" = OrderedDict()
-_MISSING_RESIDUAL_WARNED = False
 
 
 def _close_all_tars() -> None:
@@ -98,22 +96,30 @@ def _safe_scale_to_unit_float32(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to(dtype=torch.float32)
 
 
-def _compute_residual_noise_fallback(image: torch.Tensor) -> torch.Tensor:
+
+def _compute_residual_noise(image: torch.Tensor) -> torch.Tensor:
     if image.ndim != 3 or image.shape[0] != 3:
         raise ValueError(f"Expected CHW image with 3 channels, got shape {tuple(image.shape)}")
-    blurred = NN_F.avg_pool2d(image.unsqueeze(0), kernel_size=5, stride=1, padding=2).squeeze(0)
-    return (image - blurred).to(dtype=torch.float32)
 
+    if not image.is_floating_point():
+        image = image.float()
 
-def _compute_residual_noise_fallback(image: torch.Tensor) -> torch.Tensor:
-    """Backwards-compatible alias; now returns residual-noise style signal."""
-    return _compute_residual_noise_fallback(image)
+    x = image.unsqueeze(0)
+    x_pad = NN_F.pad(x, (2, 2, 2, 2), mode="reflect")
+    blurred = NN_F.avg_pool2d(x_pad, kernel_size=5, stride=1)
+    residual = x - blurred
+    residual = residual.squeeze(0)
+
+    mean = residual.mean(dim=(1, 2), keepdim=True)
+    std = residual.std(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+    residual = (residual - mean) / std
+
+    return residual.to(torch.float32)
 
 
 def _load_from_npz(
     path: str | io.BytesIO,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    global _MISSING_RESIDUAL_WARNED
     with np.load(path, allow_pickle=False) as data:
         image_np = data["image"]
         image = torch.from_numpy(image_np)
@@ -147,33 +153,7 @@ def _load_from_npz(
                 mask = mask / 255.0
             mask = mask.float()
 
-        residual_noise = None
-        residual_key = "residual_noise" if "residual_noise" in data else ("residual_noise" if "residual_noise" in data else None)
-        if residual_key is not None:
-            residual_np = data[residual_key]
-            if residual_np.size > 0:
-                residual_noise = torch.from_numpy(residual_np)
-                if residual_noise.ndim == 2:
-                    residual_noise = residual_noise.unsqueeze(0)
-                elif residual_noise.ndim == 3 and residual_noise.shape[-1] in (1, 3):
-                    residual_noise = residual_noise.permute(2, 0, 1)
-                elif residual_noise.ndim == 3 and residual_noise.shape[0] in (1, 3):
-                    pass
-                else:
-                    raise ValueError(f"Unexpected residual/residual_noise shape in NPZ: {residual_noise.shape}")
-                if residual_noise.shape[0] == 1:
-                    residual_noise = residual_noise.repeat(3, 1, 1)
-                residual_noise = _safe_scale_to_unit_float32(residual_noise)
-
-        if residual_noise is None:
-            if not _MISSING_RESIDUAL_WARNED:
-                warnings.warn(
-                    "NPZ sample missing residual_noise/residual_noise; computing residual fallback from image.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                _MISSING_RESIDUAL_WARNED = True
-            residual_noise = _compute_residual_noise_fallback(image)
+        residual_noise = _compute_residual_noise(image)
 
     return image, mask, residual_noise
 
@@ -237,7 +217,10 @@ class PerDatasetDataset(Dataset):
         else:
             image = _load_image(record.image_path)
             mask = _load_mask(record.mask_path, image.shape[-2:])
-            residual_noise = None
+            residual_noise = _compute_residual_noise(image)
+
+        if residual_noise is None:
+            residual_noise = _compute_residual_noise(image)
 
         if mask is None:
             mask = torch.zeros((1, image.shape[-2], image.shape[-1]), dtype=torch.float32)

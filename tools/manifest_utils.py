@@ -108,8 +108,6 @@ def _sample_files_exist(sample) -> bool:
             return False
     if sample.mask_path is not None and not Path(sample.mask_path).exists():
         return False
-    if sample.residual_noise_path is not None and not Path(sample.residual_noise_path).exists():
-        return False
     return True
 
 def find_or_resolve_manifest(data_root: Path, manifest_names: Tuple[str, ...] = ("manifest.parquet", "manifest.json")) -> Path:
@@ -149,15 +147,14 @@ def find_or_resolve_manifest(data_root: Path, manifest_names: Tuple[str, ...] = 
     for sample in manifest_obj.samples:
         image_new = _resolve_path(sample.image_path, manifest_path, data_root, tar_by_name)
         mask_new = _resolve_path(sample.mask_path, manifest_path, data_root, tar_by_name) if sample.mask_path else None
-        hp_new = _resolve_path(sample.residual_noise_path, manifest_path, data_root, tar_by_name) if sample.residual_noise_path else None
         if image_new != sample.image_path:
             sample.image_path = image_new
             rewritten += 1
         if mask_new != sample.mask_path:
             sample.mask_path = mask_new
             rewritten += 1
-        if hp_new != sample.residual_noise_path:
-            sample.residual_noise_path = hp_new
+        if sample.residual_noise_path is not None:
+            sample.residual_noise_path = None
             rewritten += 1
     original_count = len(manifest_obj.samples)
     manifest_obj.samples = [s for s in manifest_obj.samples if _sample_files_exist(s)]

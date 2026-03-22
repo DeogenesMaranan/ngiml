@@ -1221,12 +1221,11 @@ def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
             param.requires_grad = bool(trainable)
 
 
-def _sample_has_mask_residual_noise(record) -> tuple[bool, bool]:
+def _sample_has_mask(record) -> bool:
     has_mask = bool(record.mask_path)
-    has_residual_noise = bool(record.residual_noise_path)
     image_path = str(record.image_path)
     if not image_path.endswith(".npz"):
-        return has_mask, has_residual_noise
+        return has_mask
 
     try:
         if "::" in image_path:
@@ -1237,15 +1236,13 @@ def _sample_has_mask_residual_noise(record) -> tuple[bool, bool]:
                     raise FileNotFoundError(f"Missing member {member_name} in {archive_path}")
                 with np.load(io.BytesIO(member.read()), allow_pickle=False) as npz_data:
                     has_mask = has_mask or ("mask" in npz_data and npz_data["mask"].size > 0)
-                    has_residual_noise = has_residual_noise or ("residual_noise" in npz_data and npz_data["residual_noise"].size > 0)
         else:
             with np.load(image_path, allow_pickle=False) as npz_data:
                 has_mask = has_mask or ("mask" in npz_data and npz_data["mask"].size > 0)
-                has_residual_noise = has_residual_noise or ("residual_noise" in npz_data and npz_data["residual_noise"].size > 0)
     except Exception as exc:
-        raise ValueError(f"Failed to inspect NPZ sample for mask/residual_noise fields: {image_path}") from exc
+        raise ValueError(f"Failed to inspect NPZ sample for mask field: {image_path}") from exc
 
-    return has_mask, has_residual_noise
+    return has_mask
 
 
 def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
@@ -1258,7 +1255,6 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
     real_count = 0
     fake_count = 0
     mask_count = 0
-    residual_noise_count = 0
 
     for sample in train_samples:
         per_dataset_counts[sample.dataset] = per_dataset_counts.get(sample.dataset, 0) + 1
@@ -1270,11 +1266,9 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
         else:
             raise ValueError(f"Unexpected train label {label} for sample: {sample.image_path}")
 
-        has_mask, has_residual_noise = _sample_has_mask_residual_noise(sample)
+        has_mask = _sample_has_mask(sample)
         if has_mask:
             mask_count += 1
-        if has_residual_noise:
-            residual_noise_count += 1
 
     total = len(train_samples)
     print("Train dataset integrity summary")
@@ -1291,8 +1285,7 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
     )
     print(
         "  Coverage: "
-        f"masks={100.0 * (mask_count / max(total, 1)):.1f}% "
-        f"residual_noise={100.0 * (residual_noise_count / max(total, 1)):.1f}%"
+        f"masks={100.0 * (mask_count / max(total, 1)):.1f}%"
     )
 
     if fake_count <= 0:

@@ -44,7 +44,6 @@ class PreparationConfig:
     target_sizes: Sequence[int] = (384,)
     normalization_mode: str = "imagenet"
     tar_shard_size: int = 0  # 0 disables tar sharding; otherwise samples per shard
-    enable_residual_noise: bool = True
     resize_max_side: int = 768
 
     def target_size_set(self) -> set[int]:

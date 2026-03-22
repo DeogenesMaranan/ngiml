@@ -2,7 +2,7 @@
 import torch
 
 from src.data.config import SampleRecord
-from src.data.dataloaders import _load_from_npz
+from src.data.dataloaders import _compute_residual_noise, _load_from_npz
 from tools.infer_helpers import load_image_mask_from_record
 
 
@@ -21,7 +21,8 @@ def test_npz_uint8_scaled_to_unit_float32(tmp_path):
     assert out_mask is not None
     assert out_mask.dtype == torch.float32
     assert torch.isclose(out_image.max(), torch.tensor(1.0), atol=1e-6)
-    assert torch.isclose(out_residual_noise.max(), torch.tensor(128.0 / 255.0), atol=1e-5)
+    expected_residual = _compute_residual_noise(out_image)
+    assert torch.allclose(out_residual_noise, expected_residual, atol=1e-6)
 
 
 def test_npz_float_unit_range_not_double_scaled(tmp_path):
@@ -39,7 +40,10 @@ def test_npz_float_unit_range_not_double_scaled(tmp_path):
     assert out_mask is not None
     assert out_mask.dtype == torch.float32
     assert torch.isclose(out_image.mean(), torch.tensor(0.5), atol=1e-6)
-    assert torch.isclose(out_residual_noise.mean(), torch.tensor(0.4), atol=1e-6)
+    expected_residual = _compute_residual_noise(out_image)
+    assert torch.allclose(out_residual_noise, expected_residual, atol=1e-6)
+
+
 def test_infer_helper_handles_npz_records(tmp_path):
     npz_path = tmp_path / "sample_record.npz"
     image = np.full((8, 8, 3), 255, dtype=np.uint8)
@@ -77,5 +81,6 @@ def test_npz_residual_noise_key_is_loaded(tmp_path):
     assert out_mask is not None
     assert out_residual_noise is not None
     assert out_residual_noise.dtype == torch.float32
-    assert torch.isclose(out_residual_noise.mean(), torch.tensor(-0.1), atol=1e-6)
+    expected_residual = _compute_residual_noise(out_image)
+    assert torch.allclose(out_residual_noise, expected_residual, atol=1e-6)
 
