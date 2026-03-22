@@ -251,7 +251,6 @@ def prepare_test_datasets(
     split_name: str,
     dataset_name: str | None,
     max_samples: int,
-    normalization_mode: str,
     clean_output: bool,
     fail_on_missing_mask: bool,
     tar_shard_size: int,
@@ -359,9 +358,8 @@ def prepare_test_datasets(
     for rec in records:
         _append_manifest_row(row_log_path, rec.to_dict())
 
-    manifest = Manifest(samples=records, normalization_mode=normalization_mode)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest.to_dataframe().to_parquet(manifest_path, index=False)
+    pd.DataFrame([rec.to_dict() for rec in records]).to_parquet(manifest_path, index=False)
 
     print(f"Wrote manifest: {manifest_path}")
     print(f"Wrote row log: {row_log_path}")
@@ -371,7 +369,7 @@ def prepare_test_datasets(
     if skipped_missing_mask:
         print(f"Skipped fake samples without masks: {skipped_missing_mask}")
 
-    return manifest
+    return Manifest(samples=list(records))
 
 
 def parse_args() -> argparse.Namespace:
@@ -408,12 +406,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Cap number of samples per dataset after discovery (0 = all)",
-    )
-    parser.add_argument(
-        "--normalization-mode",
-        type=str,
-        default="imagenet",
-        help="Manifest normalization mode",
     )
     parser.add_argument(
         "--clean",
@@ -457,7 +449,6 @@ def main() -> None:
         split_name=str(args.split),
         dataset_name=args.dataset,
         max_samples=int(args.max_samples),
-        normalization_mode=str(args.normalization_mode),
         clean_output=bool(args.clean),
         fail_on_missing_mask=bool(args.fail_on_missing_mask),
         tar_shard_size=int(args.tar_shard_size),
