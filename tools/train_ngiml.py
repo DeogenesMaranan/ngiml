@@ -26,6 +26,7 @@ import math
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
 from tqdm.auto import tqdm
@@ -1458,6 +1459,30 @@ def _resolve_cuda_runtime_stability(cfg: TrainConfig, device: torch.device) -> T
     return cfg
 
 
+def _disable_pretrained_backbones_for_checkpoint_load(model_cfg: HybridNGIMLConfig) -> HybridNGIMLConfig:
+    """Return a config that avoids external backbone downloads during checkpoint restore."""
+    cfg_out = model_cfg
+    try:
+        if hasattr(cfg_out.efficientnet, "pretrained"):
+            cfg_out = replace(cfg_out, efficientnet=replace(cfg_out.efficientnet, pretrained=False))
+    except Exception:
+        try:
+            cfg_out.efficientnet.pretrained = False
+        except Exception:
+            pass
+
+    try:
+        if hasattr(cfg_out.swin, "pretrained"):
+            cfg_out = replace(cfg_out, swin=replace(cfg_out.swin, pretrained=False))
+    except Exception:
+        try:
+            cfg_out.swin.pretrained = False
+        except Exception:
+            pass
+
+    return cfg_out
+
+
 def _is_cudnn_engine_error(exc: RuntimeError) -> bool:
     msg = str(exc).lower()
     return (
@@ -2211,7 +2236,19 @@ def run_training(cfg: TrainConfig) -> None:
         foreground_ratio = compute_foreground_pixel_ratio(loaders["train"], max_batches=sampled_batches)
         print(f"Foreground pixel ratio (train): {foreground_ratio:.6f}")
 
+    start_epoch = 0
+    global_step = 0
+    resume_path: Optional[Path] = None
+    if cfg.resume:
+        resume_path = Path(cfg.resume)
+    elif cfg.auto_resume:
+        resume_path = find_latest_checkpoint(out_dir)
+        if resume_path is not None:
+            print(f"Auto-resume selected latest checkpoint: {resume_path}")
+
     model_cfg = _coerce_model_config(cfg.model_config)
+    if resume_path is not None and resume_path.is_file():
+        model_cfg = _disable_pretrained_backbones_for_checkpoint_load(model_cfg)
     base_loss_cfg = _coerce_loss_config(cfg.loss_config)
     cfg = replace(cfg, model_config=model_cfg, loss_config=base_loss_cfg)
 
@@ -2281,16 +2318,6 @@ def run_training(cfg: TrainConfig) -> None:
 
     checkpoint_dir = out_dir / "checkpoints"
     checkpoint_log_path = checkpoint_dir / "checkpoint_metrics.json"
-
-    start_epoch = 0
-    global_step = 0
-    resume_path: Optional[Path] = None
-    if cfg.resume:
-        resume_path = Path(cfg.resume)
-    elif cfg.auto_resume:
-        resume_path = find_latest_checkpoint(out_dir)
-        if resume_path is not None:
-            print(f"Auto-resume selected latest checkpoint: {resume_path}")
 
     if resume_path:
         if resume_path.is_file():

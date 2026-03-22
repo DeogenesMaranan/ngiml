@@ -246,6 +246,21 @@ def _build_model_config_from_checkpoint(checkpoint: dict) -> tuple[object, str]:
     return model_cfg, "defaults"
 
 
+def _disable_pretrained_backbones(model_cfg: object) -> object:
+    """Prevent backbone weight downloads when instantiating from checkpoints."""
+    try:
+        if hasattr(model_cfg, "efficientnet") and hasattr(model_cfg.efficientnet, "pretrained"):
+            model_cfg.efficientnet.pretrained = False
+    except Exception:
+        pass
+    try:
+        if hasattr(model_cfg, "swin") and hasattr(model_cfg.swin, "pretrained"):
+            model_cfg.swin.pretrained = False
+    except Exception:
+        pass
+    return model_cfg
+
+
 def _select_output_head(outputs: Sequence[torch.Tensor]) -> torch.Tensor:
     if not outputs:
         raise ValueError("Model returned empty predictions list")
@@ -326,6 +341,7 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
     checkpoint = torch.load(checkpoint_path, map_location=device)
     checkpoint_epoch = int(checkpoint.get("epoch", -1))
     model_cfg, config_source = _build_model_config_from_checkpoint(checkpoint)
+    model_cfg = _disable_pretrained_backbones(model_cfg)
     model = HybridNGIML(model_cfg).to(device)
 
     missing, unexpected, skipped_mismatched = _load_state_dict_with_fallback(model, checkpoint["model_state"])
