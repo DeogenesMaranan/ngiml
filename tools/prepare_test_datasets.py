@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import shutil
 import sys
+import tarfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
@@ -120,9 +123,51 @@ def _black_mask(size: int) -> np.ndarray:
     return np.zeros((size, size), dtype=np.uint8)
 
 
-def _save_npz(npz_path: Path, image_np: np.ndarray, mask_np: np.ndarray) -> None:
+class TarShardWriter:
+    """Utility to write NPZ payloads into sequential tar shards."""
+
+    def __init__(self, out_root: Path, shard_size: int) -> None:
+        self.out_root = out_root
+        self.shard_size = max(1, shard_size)
+        self.shard_idx = 0
+        self.current: tarfile.TarFile | None = None
+        self.current_path: Path | None = None
+        self.count_in_shard = 0
+
+    def _start_new_shard(self) -> None:
+        self.out_root.mkdir(parents=True, exist_ok=True)
+        tar_path = self.out_root / f"shard_{self.shard_idx:05d}.tar"
+        self.shard_idx += 1
+        self.count_in_shard = 0
+        if self.current is not None:
+            self.current.close()
+        # mode="w" writes plain uncompressed tar archives.
+        self.current = tarfile.open(tar_path, mode="w")
+        self.current_path = tar_path
+
+    def add(self, payload_bytes: bytes, member_name: str) -> tuple[str, str]:
+        if self.current is None or self.count_in_shard >= self.shard_size:
+            self._start_new_shard()
+        assert self.current is not None and self.current_path is not None
+        info = tarfile.TarInfo(name=member_name)
+        info.size = len(payload_bytes)
+        info.mtime = time.time()
+        self.current.addfile(info, io.BytesIO(payload_bytes))
+        self.count_in_shard += 1
+        return str(self.current_path), member_name
+
+    def close(self) -> None:
+        if self.current is not None:
+            self.current.close()
+            self.current = None
+            self.current_path = None
+
+
+def _save_npz(npz_path: Path, image_np: np.ndarray, mask_np: np.ndarray, metadata: dict[str, object]) -> None:
     npz_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(npz_path, image=image_np, mask=mask_np)
+    metadata_json = json.dumps(metadata, ensure_ascii=True)
+    # np.savez keeps arrays uncompressed (ZIP_STORED); do not switch to savez_compressed.
+    np.savez(npz_path, image=image_np, mask=mask_np, metadata_json=np.asarray(metadata_json))
 
 
 def _save_metadata(metadata_path: Path, metadata: dict[str, object]) -> None:
@@ -148,6 +193,55 @@ def _iter_selected_specs(all_specs: Sequence[DatasetSpec], requested: str | None
     return selected
 
 
+def _shard_records(
+    records: Sequence[SampleRecord],
+    output_root: Path,
+    shard_size: int,
+    remove_unsharded_after_shard: bool,
+) -> tuple[list[SampleRecord], int]:
+    if shard_size <= 0 or not records:
+        return list(records), 0
+
+    split_names = sorted({rec.split for rec in records})
+    by_split: dict[str, list[SampleRecord]] = {split: [] for split in split_names}
+    for rec in records:
+        by_split[rec.split].append(rec)
+
+    sharded_records: list[SampleRecord] = []
+    tar_count = 0
+
+    for split_name in split_names:
+        split_records = by_split[split_name]
+        shard_root = output_root / "shards" / split_name
+        writer = TarShardWriter(shard_root, shard_size)
+        try:
+            for idx, rec in enumerate(tqdm(split_records, desc=f"Sharding {split_name}", leave=False)):
+                npz_path = Path(rec.image_path)
+                payload = npz_path.read_bytes()
+                member_name = f"{rec.dataset}/{idx:07d}_{npz_path.name}"
+                tar_path, member_name = writer.add(payload, member_name=member_name)
+                tar_spec = f"{tar_path}::{member_name}"
+
+                if rec.metadata is None:
+                    rec.metadata = {}
+                rec.metadata.setdefault("unsharded_sample_path", str(npz_path))
+                rec.metadata["sharded_sample_path"] = tar_spec
+                rec.metadata["processed_sample_path"] = tar_spec
+                rec.metadata["storage"] = "tar_npz"
+
+                rec.image_path = tar_spec
+                rec.mask_path = None
+                sharded_records.append(rec)
+
+                if remove_unsharded_after_shard and npz_path.exists():
+                    npz_path.unlink()
+        finally:
+            writer.close()
+            tar_count += writer.shard_idx
+
+    return sharded_records, tar_count
+
+
 def prepare_test_datasets(
     input_root: Path,
     output_root: Path,
@@ -160,6 +254,8 @@ def prepare_test_datasets(
     normalization_mode: str,
     clean_output: bool,
     fail_on_missing_mask: bool,
+    tar_shard_size: int,
+    remove_unsharded_after_shard: bool,
 ) -> Manifest:
     specs = _iter_selected_specs(default_specs(), dataset_name)
 
@@ -220,8 +316,6 @@ def prepare_test_datasets(
             else:
                 mask_np = _black_mask(size=size)
 
-            _save_npz(npz_path=npz_path, image_np=image_np, mask_np=mask_np)
-
             metadata = {
                 "dataset": spec.name,
                 "split": split_name,
@@ -234,7 +328,10 @@ def prepare_test_datasets(
                 "processed_size": [size, size],
                 "mask_is_generated_black": bool(mask_path is None),
                 "mask_foreground_pixels": int(mask_np.sum()),
+                "storage": "npz",
             }
+
+            _save_npz(npz_path=npz_path, image_np=image_np, mask_np=mask_np, metadata=metadata)
             _save_metadata(metadata_path=metadata_path, metadata=metadata)
 
             record = SampleRecord(
@@ -249,7 +346,18 @@ def prepare_test_datasets(
                 metadata=metadata,
             )
             records.append(record)
-            _append_manifest_row(row_log_path, record.to_dict())
+
+    records, tar_count = _shard_records(
+        records=records,
+        output_root=output_root,
+        shard_size=tar_shard_size,
+        remove_unsharded_after_shard=remove_unsharded_after_shard,
+    )
+
+    if row_log_path.exists():
+        row_log_path.unlink()
+    for rec in records:
+        _append_manifest_row(row_log_path, rec.to_dict())
 
     manifest = Manifest(samples=records, normalization_mode=normalization_mode)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -258,6 +366,8 @@ def prepare_test_datasets(
     print(f"Wrote manifest: {manifest_path}")
     print(f"Wrote row log: {row_log_path}")
     print(f"Total samples: {len(records)}")
+    if tar_shard_size > 0:
+        print(f"Tar shards written: {tar_count}")
     if skipped_missing_mask:
         print(f"Skipped fake samples without masks: {skipped_missing_mask}")
 
@@ -315,6 +425,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fail immediately when a fake sample has no matching mask",
     )
+    parser.add_argument(
+        "--tar-shard-size",
+        type=int,
+        default=1024,
+        help="Samples per tar shard (0 disables sharding)",
+    )
+    parser.add_argument(
+        "--remove-unsharded-after-shard",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Delete local NPZ files after they are packed into tar shards (default: true)",
+    )
     return parser.parse_args()
 
 
@@ -338,6 +460,8 @@ def main() -> None:
         normalization_mode=str(args.normalization_mode),
         clean_output=bool(args.clean),
         fail_on_missing_mask=bool(args.fail_on_missing_mask),
+        tar_shard_size=int(args.tar_shard_size),
+        remove_unsharded_after_shard=bool(args.remove_unsharded_after_shard),
     )
 
 
