@@ -520,7 +520,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--tversky-alpha", type=float, default=0.3, help="Tversky alpha (FP penalty)")
     parser.add_argument("--tversky-beta", type=float, default=0.8, help="Tversky beta (FN penalty)")
     parser.add_argument("--lovasz-weight", type=float, default=0.0, help="Lovasz Hinge Loss weight for IoU optimization")
-    parser.add_argument("--use-boundary-loss", action=argparse.BooleanOptionalAction, default=True, help="Enable Sobel boundary loss on final prediction")
+    parser.add_argument("--use-boundary-loss", action=argparse.BooleanOptionalAction, default=True, help="Enable Sobel boundary loss on stage-0 (highest-resolution) prediction")
     parser.add_argument("--boundary-weight", type=float, default=0.05, help="Boundary loss weight when --use-boundary-loss is enabled")
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=True, help="Use EMA weights for validation and best checkpoints")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay factor")
