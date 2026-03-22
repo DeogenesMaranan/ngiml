@@ -171,8 +171,11 @@ def _save_npz(npz_path: Path, image_np: np.ndarray, mask_np: np.ndarray, metadat
 
 
 def _save_metadata(metadata_path: Path, metadata: dict[str, object]) -> None:
+    # Saved as .npy (object array wrapping the metadata dict) for consistency
+    # with the numpy-native pipeline; use np.load(..., allow_pickle=True).item()
+    # to reload.
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path.write_text(json.dumps(metadata, ensure_ascii=True), encoding="utf-8")
+    np.save(metadata_path, np.asarray(metadata, dtype=object))
 
 
 def _append_manifest_row(jsonl_path: Path, row: dict[str, object]) -> None:
@@ -218,7 +221,8 @@ def _shard_records(
             for idx, rec in enumerate(tqdm(split_records, desc=f"Sharding {split_name}", leave=False)):
                 npz_path = Path(rec.image_path)
                 payload = npz_path.read_bytes()
-                member_name = f"{split_name}/{rec.dataset}/{idx:07d}_{npz_path.name}"
+                # Store directly under dataset/ with no split subdirectory.
+                member_name = f"{rec.dataset}/{idx:07d}_{npz_path.name}"
                 tar_path, member_name = writer.add(payload, member_name=member_name)
                 tar_spec = f"{tar_path}::{member_name}"
 
@@ -239,9 +243,16 @@ def _shard_records(
             tar_count += writer.shard_idx
 
     if remove_unsharded_after_shard:
-        # Safety cleanup in case prior runs were interrupted before per-sample unlink.
+        # Remove entire per-dataset subdirectories that held the unsharded NPZ
+        # files.  Only directories that are not shard tar files are removed so
+        # the freshly written shards are left untouched.
+        for child in sorted(output_root.iterdir()):
+            if child.is_dir() and not child.name.startswith("shard_"):
+                shutil.rmtree(child, ignore_errors=True)
+        # Safety sweep for any stray NPZ files that survived the directory
+        # removal (e.g. from an interrupted prior run).
         for leftover_npz in output_root.rglob("*.npz"):
-            leftover_npz.unlink()
+            leftover_npz.unlink(missing_ok=True)
 
     return sharded_records, tar_count
 
@@ -311,7 +322,8 @@ def prepare_test_datasets(
             sample_id = f"{spec.name.lower()}_{kind}_{idx:06d}_{stem}"
 
             npz_path = output_root / spec.name / split_name / kind / f"{sample_id}.npz"
-            metadata_path = output_root / spec.name / split_name / kind / "metadata" / f"{sample_id}.json"
+            # Metadata stored as .npy (pickled object array) instead of JSON.
+            metadata_path = output_root / spec.name / split_name / kind / "metadata" / f"{sample_id}.npy"
 
             image_np, original_size = _resize_image_rgb(image_path=image_path, size=size)
             if mask_path is not None:
