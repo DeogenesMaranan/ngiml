@@ -212,19 +212,18 @@ def _shard_records(
 
     for split_name in split_names:
         split_records = by_split[split_name]
-        shard_root = output_root / "shards" / split_name
+        shard_root = output_root
         writer = TarShardWriter(shard_root, shard_size)
         try:
             for idx, rec in enumerate(tqdm(split_records, desc=f"Sharding {split_name}", leave=False)):
                 npz_path = Path(rec.image_path)
                 payload = npz_path.read_bytes()
-                member_name = f"{rec.dataset}/{idx:07d}_{npz_path.name}"
+                member_name = f"{split_name}/{rec.dataset}/{idx:07d}_{npz_path.name}"
                 tar_path, member_name = writer.add(payload, member_name=member_name)
                 tar_spec = f"{tar_path}::{member_name}"
 
                 if rec.metadata is None:
                     rec.metadata = {}
-                rec.metadata.setdefault("unsharded_sample_path", str(npz_path))
                 rec.metadata["sharded_sample_path"] = tar_spec
                 rec.metadata["processed_sample_path"] = tar_spec
                 rec.metadata["storage"] = "tar_npz"
@@ -238,6 +237,11 @@ def _shard_records(
         finally:
             writer.close()
             tar_count += writer.shard_idx
+
+    if remove_unsharded_after_shard:
+        # Safety cleanup in case prior runs were interrupted before per-sample unlink.
+        for leftover_npz in output_root.rglob("*.npz"):
+            leftover_npz.unlink()
 
     return sharded_records, tar_count
 
