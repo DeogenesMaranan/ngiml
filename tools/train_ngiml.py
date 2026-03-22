@@ -31,11 +31,11 @@ from torch.nn.utils import clip_grad_norm_
 from tqdm.auto import tqdm
 try:
     import xformers
-except ImportError:
+except Exception:
     xformers = None
 try:
     import flash_attn
-except ImportError:
+except Exception:
     flash_attn = None
 
 ROOT = Path(__file__).resolve().parents[1]
