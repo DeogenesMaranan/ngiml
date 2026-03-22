@@ -102,10 +102,11 @@ def _resolve_mask(fake_path: Path, mask_index: dict[str, Path], candidates_fn: C
     return None
 
 
-def _resize_image_rgb(image_path: Path, size: int) -> np.ndarray:
+def _resize_image_rgb(image_path: Path, size: int) -> tuple[np.ndarray, list[int]]:
     image = Image.open(image_path).convert("RGB")
+    width, height = image.size
     image = image.resize((size, size), resample=Image.BILINEAR)
-    return np.asarray(image, dtype=np.uint8)
+    return np.asarray(image, dtype=np.uint8), [height, width]
 
 
 def _resize_mask(mask_path: Path, size: int) -> np.ndarray:
@@ -213,7 +214,7 @@ def prepare_test_datasets(
             npz_path = output_root / spec.name / split_name / kind / f"{sample_id}.npz"
             metadata_path = output_root / spec.name / split_name / kind / "metadata" / f"{sample_id}.json"
 
-            image_np = _resize_image_rgb(image_path=image_path, size=size)
+            image_np, original_size = _resize_image_rgb(image_path=image_path, size=size)
             if mask_path is not None:
                 mask_np = _resize_mask(mask_path=mask_path, size=size)
             else:
@@ -228,6 +229,7 @@ def prepare_test_datasets(
                 "label": label,
                 "original_image_path": str(image_path),
                 "original_mask_path": str(mask_path) if mask_path is not None else None,
+                "original_size": original_size,
                 "processed_sample_path": str(npz_path),
                 "processed_size": [size, size],
                 "mask_is_generated_black": bool(mask_path is None),
@@ -268,7 +270,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=str,
-        default="./prepared/test_benchmark",
+        default="./test_benchmark",
         help="Output root for standardized samples",
     )
     parser.add_argument(
