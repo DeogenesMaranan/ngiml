@@ -2345,7 +2345,6 @@ def run_training(cfg: TrainConfig) -> None:
     best_monitor_value = _initial_best_for_monitor(cfg.early_stopping_monitor)
     best_val_iou = float("-inf")
     best_val_f1 = float("-inf")
-    best_val_loss = float("inf")
     no_improve_epochs = 0
     early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
     best_threshold_path = checkpoint_dir / "best_threshold.json"
@@ -2470,7 +2469,6 @@ def run_training(cfg: TrainConfig) -> None:
 
             iou_improved = val_iou > (best_val_iou + cfg.early_stopping_min_delta)
             f1_improved = val_f1 > (best_val_f1 + cfg.early_stopping_min_delta)
-            loss_improved = val_loss < (best_val_loss - cfg.early_stopping_min_delta)
             if iou_improved:
                 best_val_iou = val_iou
             if f1_improved:
@@ -2504,9 +2502,6 @@ def run_training(cfg: TrainConfig) -> None:
                 best_monitor_value,
                 cfg.early_stopping_min_delta,
             )
-
-            if loss_improved:
-                best_val_loss = val_loss
 
             if monitor_improved:
                 monitor_for_metadata = str(getattr(cfg, "early_stopping_monitor", "loss")).strip().lower()

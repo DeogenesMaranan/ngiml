@@ -11,12 +11,6 @@ from tools.train_ngiml import (
 )
 
 
-def _cfg_get(config, key: str, default=None):
-    if isinstance(config, dict):
-        return config.get(key, default)
-    return getattr(config, key, default)
-
-
 def _cfg_update(config, values: dict) -> None:
     if isinstance(config, dict):
         config.update(values)
