@@ -799,6 +799,7 @@ def run_multi_strategy_inference(
     tile_batch_size: int = 16,
     strategies: Sequence[str] | None = None,
     show_plot: bool = True,
+    show_progress: bool = True,
 ) -> dict[str, object]:
     """Run configured inference strategies, optionally visualize, and return metrics/maps."""
     strategy_list = list(strategies) if strategies is not None else [
@@ -824,7 +825,17 @@ def run_multi_strategy_inference(
     strategy_bins: dict[str, torch.Tensor] = {}
     summary: dict[str, dict[str, float]] = {}
 
-    for strategy_name in strategy_list:
+    iterator = strategy_list
+    if show_progress:
+        try:
+            import importlib
+
+            tqdm_auto = importlib.import_module("tqdm.auto")
+            iterator = tqdm_auto.tqdm(strategy_list, desc="Inference strategies", leave=False)
+        except Exception:
+            iterator = strategy_list
+
+    for strategy_name in iterator:
         prob = predict_probability_map_by_strategy(
             model=model,
             image=image,
@@ -904,6 +915,7 @@ def sweep_checkpoint_inference_for_image(
     tile_size: int = 448,
     tile_overlap: float = 0.5,
     tile_batch_size: int = 16,
+    show_progress: bool = True,
 ) -> dict[str, object]:
     """Run one strategy for one image across all epoch checkpoints in a directory."""
     checkpoint_paths = list_epoch_checkpoints(checkpoint_dir)
@@ -918,7 +930,17 @@ def sweep_checkpoint_inference_for_image(
     records: list[dict[str, object]] = []
     strategy_key = str(strategy).strip().lower()
 
-    for checkpoint_path in checkpoint_paths:
+    iterator = checkpoint_paths
+    if show_progress:
+        try:
+            import importlib
+
+            tqdm_auto = importlib.import_module("tqdm.auto")
+            iterator = tqdm_auto.tqdm(checkpoint_paths, desc="Checkpoint sweep", leave=False)
+        except Exception:
+            iterator = checkpoint_paths
+
+    for checkpoint_path in iterator:
         model, device, ckpt_info = load_model_from_checkpoint(checkpoint_path)
         run = run_multi_strategy_inference(
             model=model,
@@ -932,6 +954,7 @@ def sweep_checkpoint_inference_for_image(
             tile_batch_size=tile_batch_size,
             strategies=[strategy_key],
             show_plot=False,
+            show_progress=False,
         )
 
         summary = run["summary"][strategy_key]
