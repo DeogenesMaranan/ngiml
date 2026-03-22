@@ -11,7 +11,8 @@ def test_prepare_default_configs_use_train_val_only_datasets_by_default():
         "NIST",
         "IMD2020",
     ]
-    assert prep_cfg.target_sizes == (384,)
+    assert prep_cfg.target_sizes == (448,)
+    assert prep_cfg.resize_max_side == 896
 
     casia2_split = per_dataset_splits["CASIA2"]
     assert casia2_split.train == 0.8

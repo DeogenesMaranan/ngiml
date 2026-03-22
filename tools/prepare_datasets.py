@@ -468,10 +468,10 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
     }
 
     prep_cfg = PreparationConfig(
-        target_sizes=(384,),
+        target_sizes=(448,),
         normalization_mode="imagenet",
         tar_shard_size=500,
-        resize_max_side=768,
+        resize_max_side=896,
     )
 
     return datasets, per_dataset_splits, prep_cfg

@@ -187,7 +187,7 @@ class TrainConfig:
     local_cache_dir: Optional[str] = "/cache"
     reuse_local_cache_manifest: bool = True
     views_per_sample: int = 3
-    max_short_side: int = 480
+    resize_max_side: int = 0
     max_rotation_degrees: float = 6.0
     noise_std_max: float = 0.012
     disable_aug: bool = False
@@ -331,7 +331,7 @@ def build_training_config(
         batch_size=20,
         num_workers=0,
         prefetch_factor=2,
-        max_short_side=480,
+        resize_max_side=896,
         max_rotation_degrees=6.0,
         noise_std_max=0.012,
         warmup_epochs=3,
@@ -466,7 +466,7 @@ def parse_args() -> TrainConfig:
         help="Reuse existing local cached manifest when available to shorten startup",
     )
     parser.add_argument("--views-per-sample", type=int, default=2, help="Number of augmented views per sample (on-the-fly)")
-    parser.add_argument("--max-short-side", type=int, default=384, help="Cap image short side before batching (lower is faster)")
+    parser.add_argument("--resize-max-side", type=int, default=384, help="Cap image short side before batching (lower is faster)")
     parser.add_argument("--max-rotation-degrees", type=float, default=0.0, help="Random rotation range (+/-)")
     parser.add_argument("--noise-std-max", type=float, default=0.01, help="Max Gaussian noise std")
     parser.add_argument("--disable-aug", action="store_true", help="Disable GPU augmentations")
@@ -529,6 +529,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--hard-mining-weight", type=float, default=0.03, help="Weight of hard-example auxiliary loss")
     parser.add_argument("--hard-mining-gamma", type=float, default=2.0, help="Scale for low-IoU hard-example weights")
     args = parser.parse_args()
+    resolved_resize_max_side = max(64, int(args.resize_max_side))
+
     return TrainConfig(
         manifest=args.manifest,
         output_dir=args.output_dir,
@@ -565,7 +567,7 @@ def parse_args() -> TrainConfig:
         local_cache_dir=args.local_cache_dir,
         reuse_local_cache_manifest=args.reuse_local_cache_manifest,
         views_per_sample=args.views_per_sample,
-        max_short_side=max(64, int(args.max_short_side)),
+        resize_max_side=resolved_resize_max_side,
         max_rotation_degrees=args.max_rotation_degrees,
         noise_std_max=args.noise_std_max,
         disable_aug=args.disable_aug,
@@ -795,7 +797,7 @@ def _prepare_dataloaders(cfg: TrainConfig, device: torch.device):
         aug_seed=cfg.aug_seed if cfg.aug_seed is not None else cfg.seed,
         prefetch_factor=cfg.prefetch_factor,
         persistent_workers=cfg.persistent_workers,
-        max_short_side=cfg.max_short_side,
+        resize_max_side=int(cfg.resize_max_side),
         short_side_probe_samples=cfg.short_side_probe_samples,
         normalization_mode_override=collate_norm_mode,
     )

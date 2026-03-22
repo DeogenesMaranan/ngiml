@@ -338,7 +338,7 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
 
     train_config = checkpoint.get("train_config") or {}
 
-    has_train_max_short = "max_short_side" in train_config
+    has_train_resize_max_side = "resize_max_side" in train_config
     autocast_dtype, autocast_source = _resolve_checkpoint_autocast_dtype(train_config, device)
     precision_raw = str(train_config.get("precision", "") or "").strip().lower() or "unset"
     info = {
@@ -350,8 +350,8 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
         "fusion_channels": tuple(int(value) for value in model.cfg.fusion.fusion_channels),
         "default_threshold": float(resolved_threshold),
         "threshold_source": str(threshold_source),
-        "max_short_side": int(train_config.get("max_short_side", 0) or 0),
-        "max_short_side_source": "train_config" if has_train_max_short else "default",
+        "resize_max_side": int(train_config.get("resize_max_side", 0) or 0),
+        "resize_max_side_source": "train_config" if has_train_resize_max_side else "default",
         "runtime_precision": precision_raw,
         "inference_autocast_dtype": _dtype_name(autocast_dtype),
         "inference_autocast_source": autocast_source,
@@ -395,9 +395,9 @@ def resize_for_inference(
     image: torch.Tensor,
     mask: torch.Tensor | None = None,
     residual_noise: torch.Tensor | None = None,
-    max_short_side: int | None = None,
+    resize_max_side: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    cap = int(max_short_side or 0)
+    cap = int(resize_max_side or 0)
     if cap <= 0:
         return image, mask, residual_noise
 
@@ -419,7 +419,7 @@ def resize_for_inference(
 
 def load_image_mask_from_record(
     record: SampleRecord,
-    max_short_side: int | None = None,
+    resize_max_side: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     image_path = str(record.image_path)
     if "::" in image_path and image_path.endswith(".npz"):
@@ -455,7 +455,7 @@ def load_image_mask_from_record(
     # whether a legacy manifest still contains residual_noise_path fields.
     residual_noise = _compute_residual_noise(image)
 
-    image, mask, residual_noise = resize_for_inference(image, mask=mask, residual_noise=residual_noise, max_short_side=max_short_side)
+    image, mask, residual_noise = resize_for_inference(image, mask=mask, residual_noise=residual_noise, resize_max_side=resize_max_side)
     return image, mask, residual_noise
 
 
@@ -584,7 +584,7 @@ def predict_probability_map_sliding_window(
     device: torch.device,
     normalization_mode: str = "zero_one",
     residual_noise: torch.Tensor | None = None,
-    tile_size: int = 768,
+    tile_size: int = 448,
     overlap: float = 0.25,
     tile_batch_size: int = 4,
 ) -> torch.Tensor:

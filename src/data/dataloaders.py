@@ -188,7 +188,7 @@ class PerDatasetDataset(Dataset):
         samples: Sequence[SampleRecord],
         aug_cfg: AugmentationConfig,
         training: bool,
-        max_short_side: int | None = None,
+        resize_max_side: int | None = None,
         aug_seed: int | None = None,
         apply_augmentations: bool = False,
     ) -> None:
@@ -199,7 +199,7 @@ class PerDatasetDataset(Dataset):
         # Optional cap on image short side to avoid extremely large dynamic inputs
         # (helps prevent oversized backbone inputs that trigger timm assertions
         # or excessive GPU memory usage). If None, no cap is applied.
-        self.max_short_side = int(max_short_side) if max_short_side is not None else None
+        self.resize_max_side = int(resize_max_side) if resize_max_side is not None else None
         # Per-worker augmentation seed and whether to perform augmentations inside workers
         self.aug_seed = aug_seed
         self.apply_augmentations = bool(apply_augmentations)
@@ -226,11 +226,11 @@ class PerDatasetDataset(Dataset):
             mask = torch.zeros((1, image.shape[-2], image.shape[-1]), dtype=torch.float32)
 
         # Enforce a maximum short side early to avoid very large dynamic sizes.
-        if self.max_short_side is not None:
+        if self.resize_max_side is not None:
             h, w = image.shape[-2:]
             short_side = min(h, w)
-            if short_side > self.max_short_side:
-                scale = float(self.max_short_side) / float(short_side)
+            if short_side > self.resize_max_side:
+                scale = float(self.resize_max_side) / float(short_side)
                 new_h, new_w = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
                 # Resize before any augmentations to keep sizes bounded
                 image = F.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
@@ -1055,7 +1055,7 @@ def create_dataloaders(
     balanced_positive_ratio: float = 0.5,
     balanced_sampler_seed: int | None = 42,
     balanced_sampler_num_samples: int | None = None,
-    max_short_side: int | None = None,
+    resize_max_side: int | None = None,
     size_bucketing: bool = True,
     short_side_probe_samples: int = 128,
     normalization_mode_override: str | None = None,
@@ -1091,7 +1091,7 @@ def create_dataloaders(
                     records,
                     aug_cfg=aug_cfg,
                     training=training,
-                    max_short_side=max_short_side,
+                    resize_max_side=resize_max_side,
                     aug_seed=aug_seed,
                     apply_augmentations=apply_in_worker,
                 )
@@ -1134,7 +1134,7 @@ def create_dataloaders(
                         ss = None
                     probed_count += 1
                 if ss is None:
-                    ss = int(max_short_side) if max_short_side is not None else 384
+                    ss = int(resize_max_side) if resize_max_side is not None else 384
                 combined_short_sides.append(int(ss))
 
         if not datasets:

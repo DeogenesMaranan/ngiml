@@ -57,8 +57,8 @@ def test_build_npz_bytes_uses_mask_aware_crop_and_binary_mask(tmp_path: Path):
         image_path=image_path,
         mask_path=mask_path,
         split_name="train",
-        crop_size=384,
-        resize_max_side=1024,
+        crop_size=448,
+        resize_max_side=896,
         rng=random.Random(7),
     )
 
