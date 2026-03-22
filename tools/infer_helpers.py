@@ -670,6 +670,243 @@ def predict_probability_map_sliding_window(
     return prob[:h, :w]
 
 
+def _resize_prob_to_original(prob: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
+    if tuple(prob.shape[-2:]) == (out_h, out_w):
+        return prob
+    return F.interpolate(
+        prob.unsqueeze(0).unsqueeze(0),
+        size=(out_h, out_w),
+        mode="bilinear",
+        align_corners=False,
+    )[0, 0]
+
+
+def predict_probability_map_by_strategy(
+    model: HybridNGIML,
+    image: torch.Tensor,
+    device: torch.device,
+    strategy: str,
+    normalization_mode: str = "imagenet",
+    infer_size: int = 448,
+    tile_size: int = 448,
+    tile_overlap: float = 0.5,
+    tile_batch_size: int = 16,
+) -> torch.Tensor:
+    """Run a single inference strategy and return probability map at original image resolution."""
+    if image.ndim != 3 or image.shape[0] != 3:
+        raise ValueError(f"Expected RGB CHW image tensor, got shape={tuple(image.shape)}")
+
+    image = image.float()
+    if image.max() > 1.0:
+        image = image / 255.0
+    image = image.clamp(0.0, 1.0)
+
+    orig_h, orig_w = int(image.shape[-2]), int(image.shape[-1])
+    strategy_key = str(strategy).strip().lower()
+
+    if strategy_key == "direct":
+        return predict_probability_map(
+            model=model,
+            image=image,
+            device=device,
+            normalization_mode=normalization_mode,
+        )
+
+    if strategy_key == "sliding_window":
+        return predict_probability_map_sliding_window(
+            model=model,
+            image=image,
+            device=device,
+            normalization_mode=normalization_mode,
+            tile_size=tile_size,
+            overlap=tile_overlap,
+            tile_batch_size=tile_batch_size,
+        )
+
+    if strategy_key == "resize_keep_aspect_center_crop":
+        h, w = image.shape[-2:]
+        scale = float(infer_size) / float(min(h, w))
+        new_h = max(1, int(round(h * scale)))
+        new_w = max(1, int(round(w * scale)))
+        resized = TVF.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+        top = max(0, (new_h - infer_size) // 2)
+        left = max(0, (new_w - infer_size) // 2)
+        cropped = TVF.crop(resized, top, left, infer_size, infer_size)
+        prob = predict_probability_map(
+            model=model,
+            image=cropped,
+            device=device,
+            normalization_mode=normalization_mode,
+        )
+        return _resize_prob_to_original(prob, orig_h, orig_w)
+
+    if strategy_key == "center_crop":
+        h, w = image.shape[-2:]
+        crop_side = min(h, w)
+        top = max(0, (h - crop_side) // 2)
+        left = max(0, (w - crop_side) // 2)
+        cropped = TVF.crop(image, top, left, crop_side, crop_side)
+        resized = TVF.resize(cropped, [infer_size, infer_size], interpolation=InterpolationMode.BILINEAR)
+        prob = predict_probability_map(
+            model=model,
+            image=resized,
+            device=device,
+            normalization_mode=normalization_mode,
+        )
+        return _resize_prob_to_original(prob, orig_h, orig_w)
+
+    if strategy_key == "resize":
+        resized = TVF.resize(image, [infer_size, infer_size], interpolation=InterpolationMode.BILINEAR)
+        prob = predict_probability_map(
+            model=model,
+            image=resized,
+            device=device,
+            normalization_mode=normalization_mode,
+        )
+        return _resize_prob_to_original(prob, orig_h, orig_w)
+
+    raise ValueError(
+        f"Unknown strategy: {strategy}. "
+        "Supported: direct, sliding_window, resize_keep_aspect_center_crop, center_crop, resize"
+    )
+
+
+def run_multi_strategy_inference(
+    model: HybridNGIML,
+    image: torch.Tensor,
+    device: torch.device,
+    normalization_mode: str = "imagenet",
+    threshold: float | None = None,
+    infer_size: int = 448,
+    tile_size: int = 448,
+    tile_overlap: float = 0.5,
+    tile_batch_size: int = 16,
+    strategies: Sequence[str] | None = None,
+    show_plot: bool = True,
+) -> dict[str, object]:
+    """Run configured inference strategies, optionally visualize, and return metrics/maps."""
+    strategy_list = list(strategies) if strategies is not None else [
+        "direct",
+        "sliding_window",
+        "resize_keep_aspect_center_crop",
+        "center_crop",
+        "resize",
+    ]
+    if not strategy_list:
+        raise ValueError("At least one strategy must be provided")
+
+    image = image.float()
+    if image.max() > 1.0:
+        image = image / 255.0
+    image = image.clamp(0.0, 1.0)
+
+    resolved_threshold = float(
+        threshold if threshold is not None else getattr(model, "default_threshold", 0.5)
+    )
+
+    strategy_probs: dict[str, torch.Tensor] = {}
+    strategy_bins: dict[str, torch.Tensor] = {}
+    summary: dict[str, dict[str, float]] = {}
+
+    for strategy_name in strategy_list:
+        prob = predict_probability_map_by_strategy(
+            model=model,
+            image=image,
+            device=device,
+            strategy=strategy_name,
+            normalization_mode=normalization_mode,
+            infer_size=infer_size,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            tile_batch_size=tile_batch_size,
+        ).clamp(0.0, 1.0)
+        binary = (prob >= resolved_threshold).float()
+
+        strategy_probs[strategy_name] = prob
+        strategy_bins[strategy_name] = binary
+        summary[strategy_name] = {
+            "mean_probability": float(prob.mean().item()),
+            "max_probability": float(prob.max().item()),
+            "predicted_positive_ratio": float(binary.mean().item()),
+        }
+
+    if show_plot:
+        plot_multi_strategy_inference(
+            image=image,
+            strategy_probs=strategy_probs,
+            strategy_bins=strategy_bins,
+            threshold=resolved_threshold,
+            strategy_order=strategy_list,
+        )
+
+    return {
+        "strategies": strategy_list,
+        "normalization_mode": normalization_mode,
+        "threshold": resolved_threshold,
+        "infer_size": int(infer_size),
+        "tile_size": int(tile_size),
+        "tile_overlap": float(tile_overlap),
+        "tile_batch_size": int(tile_batch_size),
+        "probabilities": strategy_probs,
+        "binaries": strategy_bins,
+        "summary": summary,
+    }
+
+
+def plot_multi_strategy_inference(
+    image: torch.Tensor,
+    strategy_probs: dict[str, torch.Tensor],
+    strategy_bins: dict[str, torch.Tensor],
+    threshold: float,
+    strategy_order: Sequence[str] | None = None,
+):
+    """Render probability, binary, and overlay grids for each strategy."""
+    import importlib
+
+    plt = importlib.import_module("matplotlib.pyplot")
+    np = importlib.import_module("numpy")
+
+    order = list(strategy_order) if strategy_order is not None else list(strategy_probs.keys())
+    if not order:
+        raise ValueError("No strategies provided for plotting")
+
+    img_np = image.float().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
+    n = len(order)
+    fig, axes = plt.subplots(3, n + 1, figsize=(4 * (n + 1), 12))
+
+    axes[0, 0].imshow(img_np)
+    axes[0, 0].set_title("Uploaded RGB")
+    axes[0, 0].axis("off")
+    axes[1, 0].axis("off")
+    axes[2, 0].axis("off")
+
+    for idx, strategy_name in enumerate(order, start=1):
+        prob_np = strategy_probs[strategy_name].detach().cpu().numpy()
+        bin_np = strategy_bins[strategy_name].detach().cpu().numpy()
+
+        overlay_color = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        alpha = 0.45 * prob_np[..., None]
+        overlay_np = np.clip(img_np * (1.0 - alpha) + overlay_color * alpha, 0.0, 1.0)
+
+        title_name = strategy_name.replace("_", " ").title()
+
+        axes[0, idx].imshow(prob_np, cmap="magma", vmin=0.0, vmax=1.0)
+        axes[0, idx].set_title(f"{title_name}\\nProbability")
+        axes[0, idx].axis("off")
+
+        axes[1, idx].imshow(bin_np, cmap="gray", vmin=0.0, vmax=1.0)
+        axes[1, idx].set_title(f"{title_name}\\nBinary (t={threshold:.2f})")
+        axes[1, idx].axis("off")
+
+        axes[2, idx].imshow(overlay_np)
+        axes[2, idx].set_title(f"{title_name}\\nOverlay")
+        axes[2, idx].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+    return fig, axes
+
+
 def get_model_complexity_stats(
     model: HybridNGIML,
     input_size: tuple[int, int, int, int] = (1, 3, 384, 384),
