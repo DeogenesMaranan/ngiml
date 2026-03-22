@@ -916,6 +916,8 @@ def sweep_checkpoint_inference_for_image(
     tile_overlap: float = 0.5,
     tile_batch_size: int = 16,
     show_progress: bool = True,
+    show_plot: bool = True,
+    plot_max_checkpoints: int | None = 8,
 ) -> dict[str, object]:
     """Run one strategy for one image across all epoch checkpoints in a directory."""
     checkpoint_paths = list_epoch_checkpoints(checkpoint_dir)
@@ -929,6 +931,9 @@ def sweep_checkpoint_inference_for_image(
 
     records: list[dict[str, object]] = []
     strategy_key = str(strategy).strip().lower()
+    checkpoint_probs: dict[str, torch.Tensor] = {}
+    checkpoint_bins: dict[str, torch.Tensor] = {}
+    checkpoint_thresholds: dict[str, float] = {}
 
     iterator = checkpoint_paths
     if show_progress:
@@ -972,11 +977,30 @@ def sweep_checkpoint_inference_for_image(
             }
         )
 
+        if show_plot:
+            checkpoint_label = f"ep{int(ckpt_info.get('epoch', -1))}"
+            checkpoint_probs[checkpoint_label] = run["probabilities"][strategy_key]
+            checkpoint_bins[checkpoint_label] = run["binaries"][strategy_key]
+            checkpoint_thresholds[checkpoint_label] = float(run["threshold"])
+
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     best_by_max_probability = max(records, key=lambda row: float(row["max_probability"]))
+
+    if show_plot and checkpoint_probs:
+        labels = list(checkpoint_probs.keys())
+        if isinstance(plot_max_checkpoints, int) and plot_max_checkpoints > 0 and len(labels) > plot_max_checkpoints:
+            labels = labels[-plot_max_checkpoints:]
+        plot_checkpoint_sweep_inference(
+            image=image,
+            checkpoint_probs={label: checkpoint_probs[label] for label in labels},
+            checkpoint_bins={label: checkpoint_bins[label] for label in labels},
+            checkpoint_thresholds={label: checkpoint_thresholds[label] for label in labels},
+            strategy_name=strategy_key,
+            checkpoint_order=labels,
+        )
 
     return {
         "strategy": strategy_key,
@@ -985,6 +1009,60 @@ def sweep_checkpoint_inference_for_image(
         "records": records,
         "best_by_max_probability": best_by_max_probability,
     }
+
+
+def plot_checkpoint_sweep_inference(
+    image: torch.Tensor,
+    checkpoint_probs: dict[str, torch.Tensor],
+    checkpoint_bins: dict[str, torch.Tensor],
+    checkpoint_thresholds: dict[str, float],
+    strategy_name: str,
+    checkpoint_order: Sequence[str] | None = None,
+):
+    """Render probability, binary, and overlay grids across checkpoints for one strategy."""
+    import importlib
+
+    plt = importlib.import_module("matplotlib.pyplot")
+    np = importlib.import_module("numpy")
+
+    order = list(checkpoint_order) if checkpoint_order is not None else list(checkpoint_probs.keys())
+    if not order:
+        raise ValueError("No checkpoints provided for sweep plotting")
+
+    img_np = image.float().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
+    n = len(order)
+    fig, axes = plt.subplots(3, n + 1, figsize=(4 * (n + 1), 12))
+
+    axes[0, 0].imshow(img_np)
+    axes[0, 0].set_title("Uploaded RGB")
+    axes[0, 0].axis("off")
+    axes[1, 0].axis("off")
+    axes[2, 0].axis("off")
+
+    for idx, checkpoint_label in enumerate(order, start=1):
+        prob_np = checkpoint_probs[checkpoint_label].detach().cpu().numpy()
+        bin_np = checkpoint_bins[checkpoint_label].detach().cpu().numpy()
+        threshold = float(checkpoint_thresholds.get(checkpoint_label, 0.5))
+
+        overlay_color = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        alpha = 0.45 * prob_np[..., None]
+        overlay_np = np.clip(img_np * (1.0 - alpha) + overlay_color * alpha, 0.0, 1.0)
+
+        axes[0, idx].imshow(prob_np, cmap="magma", vmin=0.0, vmax=1.0)
+        axes[0, idx].set_title(f"{checkpoint_label}\\n{strategy_name} Prob")
+        axes[0, idx].axis("off")
+
+        axes[1, idx].imshow(bin_np, cmap="gray", vmin=0.0, vmax=1.0)
+        axes[1, idx].set_title(f"{checkpoint_label}\\nBinary (t={threshold:.2f})")
+        axes[1, idx].axis("off")
+
+        axes[2, idx].imshow(overlay_np)
+        axes[2, idx].set_title(f"{checkpoint_label}\\nOverlay")
+        axes[2, idx].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+    return fig, axes
 
 
 def plot_multi_strategy_inference(
