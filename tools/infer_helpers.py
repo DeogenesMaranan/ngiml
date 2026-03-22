@@ -253,6 +253,50 @@ def _select_output_head(outputs: Sequence[torch.Tensor]) -> torch.Tensor:
     return outputs[0]
 
 
+def _dtype_name(value: torch.dtype | None) -> str:
+    return str(value).replace("torch.", "") if isinstance(value, torch.dtype) else "none"
+
+
+def _resolve_checkpoint_autocast_dtype(train_config: dict, device: torch.device) -> tuple[torch.dtype | None, str]:
+    precision_raw = str(train_config.get("precision", "") or "").strip().lower()
+    amp_enabled = bool(train_config.get("amp", False))
+
+    preferred: torch.dtype | None = None
+    source = "checkpoint_precision"
+
+    if precision_raw in {"bf16", "bfloat16"}:
+        preferred = torch.bfloat16
+    elif precision_raw in {"fp16", "float16", "half"}:
+        preferred = torch.float16
+    elif precision_raw in {"fp32", "float32", "32", "full", "none", "off", "disabled"}:
+        preferred = None
+    elif amp_enabled:
+        # Older checkpoints may have amp=True but unset precision; choose a safe CUDA autocast dtype.
+        preferred = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
+        source = "checkpoint_amp_fallback"
+
+    if device.type != "cuda":
+        return None, f"{source}:cpu"
+
+    if preferred is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        return torch.float16, f"{source}:bf16_unsupported_fallback_fp16"
+
+    return preferred, source
+
+
+def get_inference_autocast_dtype(model: HybridNGIML, device: torch.device) -> torch.dtype | None:
+    dtype = getattr(model, "default_autocast_dtype", None)
+    if not isinstance(dtype, torch.dtype):
+        return None
+    if device.type != "cuda":
+        return None
+    if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        return torch.float16
+    if dtype in {torch.float16, torch.bfloat16}:
+        return dtype
+    return None
+
+
 def _load_state_dict_with_fallback(model: HybridNGIML, model_state: dict) -> tuple[list[str], list[str], int]:
     try:
         missing, unexpected = model.load_state_dict(model_state, strict=False)
@@ -289,6 +333,8 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
     train_config = checkpoint.get("train_config") or {}
 
     has_train_max_short = "max_short_side" in train_config
+    autocast_dtype, autocast_source = _resolve_checkpoint_autocast_dtype(train_config, device)
+    precision_raw = str(train_config.get("precision", "") or "").strip().lower() or "unset"
     info = {
         "epoch": checkpoint_epoch,
         "missing_keys": len(missing),
@@ -300,8 +346,13 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
         "threshold_source": str(threshold_source),
         "max_short_side": int(train_config.get("max_short_side", 0) or 0),
         "max_short_side_source": "train_config" if has_train_max_short else "default",
+        "runtime_precision": precision_raw,
+        "inference_autocast_dtype": _dtype_name(autocast_dtype),
+        "inference_autocast_source": autocast_source,
     }
     setattr(model, "default_threshold", float(info["default_threshold"]))
+    setattr(model, "default_runtime_precision", precision_raw)
+    setattr(model, "default_autocast_dtype", autocast_dtype)
     return model, device, info
 
 
@@ -521,10 +572,13 @@ def predict_probability_map(
         if hp.max() > 1.0:
             hp = hp / 255.0
         hp = hp.unsqueeze(0).to(device)
+    autocast_dtype = get_inference_autocast_dtype(model, device)
+    use_amp = device.type == "cuda" and autocast_dtype is not None
     with torch.no_grad():
-        outputs = model(x, target_size=image.shape[-2:], residual_noise=hp)
-        logits = _select_output_head(outputs)
-        prob = torch.sigmoid(logits)[0, 0].detach().cpu()
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype or torch.float16, enabled=use_amp):
+            outputs = model(x, target_size=image.shape[-2:], residual_noise=hp)
+            logits = _select_output_head(outputs)
+            prob = torch.sigmoid(logits)[0, 0].detach().cpu()
     return prob
 
 
@@ -546,6 +600,179 @@ def predict_binary_map(
     if threshold is None:
         threshold = float(getattr(model, "default_threshold", 0.5))
     return (prob >= float(threshold)).float()
+
+
+def resolve_normalization_mode_for_inference(
+    manual_mode: str | None = None,
+    manifest_path: str | Path | None = None,
+    training_config: dict | None = None,
+    checkpoint_path: str | Path | None = None,
+    default_mode: str = "imagenet",
+) -> str:
+    """Resolve inference normalization with explicit override first, then manifest sources."""
+    if isinstance(manual_mode, str) and manual_mode.strip():
+        mode = manual_mode.strip().lower()
+        if mode in {"imagenet", "zero_one"}:
+            return mode
+        raise ValueError(
+            f"Unsupported normalization mode: {manual_mode!r}. "
+            "Use 'imagenet', 'zero_one', or None."
+        )
+
+    candidates: list[Path] = []
+
+    if manifest_path:
+        candidates.append(Path(manifest_path))
+
+    if isinstance(training_config, dict):
+        train_manifest = training_config.get("manifest")
+        if train_manifest:
+            candidates.append(Path(train_manifest))
+
+    if checkpoint_path:
+        try:
+            checkpoint_blob = torch.load(Path(checkpoint_path), map_location="cpu")
+            train_cfg = checkpoint_blob.get("train_config") if isinstance(checkpoint_blob, dict) else None
+            checkpoint_manifest = train_cfg.get("manifest") if isinstance(train_cfg, dict) else None
+            if checkpoint_manifest:
+                candidates.append(Path(checkpoint_manifest))
+        except Exception:
+            pass
+
+    for candidate in candidates:
+        try:
+            manifest_obj = load_manifest(candidate)
+            mode = str(manifest_obj.normalization_mode).strip().lower()
+            if mode in {"imagenet", "zero_one"}:
+                return mode
+        except Exception:
+            continue
+
+    fallback = str(default_mode).strip().lower()
+    if fallback not in {"imagenet", "zero_one"}:
+        fallback = "imagenet"
+    return fallback
+
+
+def _tile_starts(full_size: int, tile_size: int, stride: int) -> list[int]:
+    if full_size <= tile_size:
+        return [0]
+    starts = list(range(0, full_size - tile_size + 1, stride))
+    tail = full_size - tile_size
+    if starts[-1] != tail:
+        starts.append(tail)
+    return starts
+
+
+def _hann_weight_2d(h: int, w: int) -> torch.Tensor:
+    wy = torch.hann_window(h, periodic=False).float().clamp_min(1e-3)
+    wx = torch.hann_window(w, periodic=False).float().clamp_min(1e-3)
+    weight = wy[:, None] * wx[None, :]
+    return weight / weight.max().clamp_min(1e-6)
+
+
+def predict_probability_map_sliding_window(
+    model: HybridNGIML,
+    image: torch.Tensor,
+    device: torch.device,
+    normalization_mode: str = "zero_one",
+    residual_noise: torch.Tensor | None = None,
+    tile_size: int = 768,
+    overlap: float = 0.25,
+    tile_batch_size: int = 4,
+) -> torch.Tensor:
+    """Run overlap-weighted tiled inference and return full-resolution probability map."""
+    if image.ndim != 3 or image.shape[0] != 3:
+        raise ValueError(f"Expected RGB CHW image tensor, got shape={tuple(image.shape)}")
+
+    image = image.float()
+    if image.max() > 1.0:
+        image = image / 255.0
+    image = image.clamp(0.0, 1.0)
+
+    if residual_noise is None:
+        residual_noise = _compute_residual_noise_fallback(image)
+    else:
+        residual_noise = residual_noise.float()
+        if residual_noise.ndim == 2:
+            residual_noise = residual_noise.unsqueeze(0)
+        if residual_noise.shape[0] == 1:
+            residual_noise = residual_noise.repeat(3, 1, 1)
+        elif residual_noise.shape[0] > 3:
+            residual_noise = residual_noise[:3]
+        if residual_noise.max() > 1.0:
+            residual_noise = residual_noise / 255.0
+        if tuple(residual_noise.shape[-2:]) != tuple(image.shape[-2:]):
+            residual_noise = F.interpolate(
+                residual_noise.unsqueeze(0),
+                size=image.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+
+    _, h, w = image.shape
+    tile = max(64, int(tile_size))
+    stride = max(1, int(round(tile * (1.0 - float(overlap)))))
+    tile_batch = max(1, int(tile_batch_size))
+
+    pad_h = max(0, tile - h)
+    pad_w = max(0, tile - w)
+    if pad_h > 0 or pad_w > 0:
+        image = F.pad(image.unsqueeze(0), (0, pad_w, 0, pad_h), mode="reflect").squeeze(0)
+        residual_noise = F.pad(residual_noise.unsqueeze(0), (0, pad_w, 0, pad_h), mode="reflect").squeeze(0)
+
+    _, hp, wp = image.shape
+    ys = _tile_starts(hp, tile, stride)
+    xs = _tile_starts(wp, tile, stride)
+
+    weight = _hann_weight_2d(tile, tile)
+    accum = torch.zeros((hp, wp), dtype=torch.float32)
+    accum_w = torch.zeros((hp, wp), dtype=torch.float32)
+
+    def _flush(
+        rgb_tiles: list[torch.Tensor],
+        residual_tiles: list[torch.Tensor],
+        coords: list[tuple[int, int]],
+    ) -> None:
+        if not rgb_tiles:
+            return
+        xb = torch.stack(rgb_tiles, dim=0).to(device, non_blocking=True)
+        hb = torch.stack(residual_tiles, dim=0).to(device, non_blocking=True)
+
+        autocast_dtype = get_inference_autocast_dtype(model, device)
+        use_amp = device.type == "cuda" and autocast_dtype is not None
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda", dtype=autocast_dtype or torch.float16, enabled=use_amp):
+                outputs = model(xb, target_size=xb.shape[-2:], residual_noise=hb)
+                logits = _select_output_head(outputs) if isinstance(outputs, (list, tuple)) else outputs
+                probs = torch.sigmoid(logits[:, 0]).float().cpu()
+
+        for idx, (y0, x0) in enumerate(coords):
+            accum[y0 : y0 + tile, x0 : x0 + tile] += probs[idx] * weight
+            accum_w[y0 : y0 + tile, x0 : x0 + tile] += weight
+
+    tile_images: list[torch.Tensor] = []
+    tile_residuals: list[torch.Tensor] = []
+    tile_coords: list[tuple[int, int]] = []
+
+    for y0 in ys:
+        for x0 in xs:
+            rgb_tile = image[:, y0 : y0 + tile, x0 : x0 + tile]
+            hp_tile = residual_noise[:, y0 : y0 + tile, x0 : x0 + tile]
+
+            tile_images.append(normalize_image_for_inference(rgb_tile, normalization_mode=normalization_mode))
+            tile_residuals.append(hp_tile.float())
+            tile_coords.append((y0, x0))
+
+            if len(tile_images) >= tile_batch:
+                _flush(tile_images, tile_residuals, tile_coords)
+                tile_images.clear()
+                tile_residuals.clear()
+                tile_coords.clear()
+
+    _flush(tile_images, tile_residuals, tile_coords)
+    prob = accum / accum_w.clamp_min(1e-6)
+    return prob[:h, :w]
 
 
 def _center_square_crop(tensor: torch.Tensor) -> torch.Tensor:
