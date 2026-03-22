@@ -380,7 +380,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=str,
-        default="./test_benchmark",
+        default="./prepared_test_datasets",
         help="Output root for standardized samples",
     )
     parser.add_argument(
