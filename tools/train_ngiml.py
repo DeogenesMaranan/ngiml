@@ -1,4 +1,4 @@
-"""End-to-end NGIML training loop with checkpointing.
+﻿"""End-to-end NGIML training loop with checkpointing.
 
 Run example (Colab-ready):
     python tools/train_ngiml.py --manifest /content/data/manifest.json --output-dir /content/runs
@@ -1239,12 +1239,12 @@ def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
             param.requires_grad = bool(trainable)
 
 
-def _sample_has_mask_high_pass(record) -> tuple[bool, bool]:
+def _sample_has_mask_residual_noise(record) -> tuple[bool, bool]:
     has_mask = bool(record.mask_path)
-    has_high_pass = bool(record.high_pass_path)
+    has_residual_noise = bool(record.residual_noise_path)
     image_path = str(record.image_path)
     if not image_path.endswith(".npz"):
-        return has_mask, has_high_pass
+        return has_mask, has_residual_noise
 
     try:
         if "::" in image_path:
@@ -1255,15 +1255,15 @@ def _sample_has_mask_high_pass(record) -> tuple[bool, bool]:
                     raise FileNotFoundError(f"Missing member {member_name} in {archive_path}")
                 with np.load(io.BytesIO(member.read()), allow_pickle=False) as npz_data:
                     has_mask = has_mask or ("mask" in npz_data and npz_data["mask"].size > 0)
-                    has_high_pass = has_high_pass or ("high_pass" in npz_data and npz_data["high_pass"].size > 0)
+                    has_residual_noise = has_residual_noise or ("residual_noise" in npz_data and npz_data["residual_noise"].size > 0)
         else:
             with np.load(image_path, allow_pickle=False) as npz_data:
                 has_mask = has_mask or ("mask" in npz_data and npz_data["mask"].size > 0)
-                has_high_pass = has_high_pass or ("high_pass" in npz_data and npz_data["high_pass"].size > 0)
+                has_residual_noise = has_residual_noise or ("residual_noise" in npz_data and npz_data["residual_noise"].size > 0)
     except Exception as exc:
-        raise ValueError(f"Failed to inspect NPZ sample for mask/high_pass fields: {image_path}") from exc
+        raise ValueError(f"Failed to inspect NPZ sample for mask/residual_noise fields: {image_path}") from exc
 
-    return has_mask, has_high_pass
+    return has_mask, has_residual_noise
 
 
 def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
@@ -1276,7 +1276,7 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
     real_count = 0
     fake_count = 0
     mask_count = 0
-    high_pass_count = 0
+    residual_noise_count = 0
 
     for sample in train_samples:
         per_dataset_counts[sample.dataset] = per_dataset_counts.get(sample.dataset, 0) + 1
@@ -1288,11 +1288,11 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
         else:
             raise ValueError(f"Unexpected train label {label} for sample: {sample.image_path}")
 
-        has_mask, has_high_pass = _sample_has_mask_high_pass(sample)
+        has_mask, has_residual_noise = _sample_has_mask_residual_noise(sample)
         if has_mask:
             mask_count += 1
-        if has_high_pass:
-            high_pass_count += 1
+        if has_residual_noise:
+            residual_noise_count += 1
 
     total = len(train_samples)
     print("Train dataset integrity summary")
@@ -1310,7 +1310,7 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
     print(
         "  Coverage: "
         f"masks={100.0 * (mask_count / max(total, 1)):.1f}% "
-        f"high_pass={100.0 * (high_pass_count / max(total, 1)):.1f}%"
+        f"residual_noise={100.0 * (residual_noise_count / max(total, 1)):.1f}%"
     )
 
     if fake_count <= 0:
@@ -1808,12 +1808,12 @@ def train_one_epoch(
             images = images.to(device, non_blocking=True)
         if masks.device != device:
             masks = masks.to(device, non_blocking=True)
-        high_pass = batch.get("high_pass")
-        if isinstance(high_pass, torch.Tensor):
-            if high_pass.device != device:
-                high_pass = high_pass.to(device, non_blocking=True)
+        residual_noise = batch.get("residual_noise")
+        if isinstance(residual_noise, torch.Tensor):
+            if residual_noise.device != device:
+                residual_noise = residual_noise.to(device, non_blocking=True)
         else:
-            high_pass = None
+            residual_noise = None
         # Apply GPU-side augmentations and normalization when requested.
         aug_start = None
         forward_start = None
@@ -1859,14 +1859,14 @@ def train_one_epoch(
                     img_slice = images[idxs]
                     mask_slice = masks[idxs]
                     hp_slice = None
-                    if high_pass is not None:
-                        hp_slice = high_pass[idxs]
+                    if residual_noise is not None:
+                        hp_slice = residual_noise[idxs]
 
                     img_out, mask_out, hp_out = _apply_gpu_augmentations_batch(
                         img_slice,
                         mask_slice,
                         aug_cfg,
-                        high_pass=hp_slice,
+                        residual_noise=hp_slice,
                         generator=gen,
                     )
 
@@ -1878,8 +1878,8 @@ def train_one_epoch(
 
                     images[idxs] = img_out
                     masks[idxs] = mask_out
-                    if hp_out is not None and high_pass is not None:
-                        high_pass[idxs] = hp_out
+                    if hp_out is not None and residual_noise is not None:
+                        residual_noise[idxs] = hp_out
             aug_end = time.perf_counter()
         else:
             aug_end = None
@@ -1889,8 +1889,8 @@ def train_one_epoch(
         sampled_total += total_count
         if cfg.channels_last and device.type == "cuda":
             images = images.contiguous(memory_format=torch.channels_last)
-            if high_pass is not None:
-                high_pass = high_pass.contiguous(memory_format=torch.channels_last)
+            if residual_noise is not None:
+                residual_noise = residual_noise.contiguous(memory_format=torch.channels_last)
 
         precision_name = (getattr(cfg, "precision", "fp32") or "fp32").lower()
         amp_dtype = torch.bfloat16 if precision_name == "bf16" else (torch.float16 if precision_name == "fp16" else None)
@@ -1898,12 +1898,12 @@ def train_one_epoch(
         if amp_dtype is not None:
             forward_start = time.perf_counter()
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+                preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
                 loss = loss_fn(preds, masks)
             forward_end = time.perf_counter()
         else:
             forward_start = time.perf_counter()
-            preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+            preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
             loss = loss_fn(preds, masks)
             forward_end = time.perf_counter()
 
@@ -1989,23 +1989,23 @@ def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: T
     for batch in loader:
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
-        high_pass = batch.get("high_pass")
-        if isinstance(high_pass, torch.Tensor):
-            high_pass = high_pass.to(device, non_blocking=True)
+        residual_noise = batch.get("residual_noise")
+        if isinstance(residual_noise, torch.Tensor):
+            residual_noise = residual_noise.to(device, non_blocking=True)
         else:
-            high_pass = None
+            residual_noise = None
         if cfg.channels_last and device.type == "cuda":
             images = images.contiguous(memory_format=torch.channels_last)
-            if high_pass is not None:
-                high_pass = high_pass.contiguous(memory_format=torch.channels_last)
+            if residual_noise is not None:
+                residual_noise = residual_noise.contiguous(memory_format=torch.channels_last)
         precision_name = (getattr(cfg, "precision", "fp32") or "fp32").lower()
         amp_dtype = torch.bfloat16 if precision_name == "bf16" else (torch.float16 if precision_name == "fp16" else None)
         use_amp = cfg.amp and device.type == "cuda" and (amp_dtype is not None)
         if amp_dtype is not None:
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+                preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
         else:
-            preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+            preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
         logits = _select_pred_head(preds, cfg.final_pred_stage)
 
         for threshold in thresholds:
@@ -2066,11 +2066,11 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
     for batch in progress:
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
-        high_pass = batch.get("high_pass")
-        if isinstance(high_pass, torch.Tensor):
-            high_pass = high_pass.to(device, non_blocking=True)
+        residual_noise = batch.get("residual_noise")
+        if isinstance(residual_noise, torch.Tensor):
+            residual_noise = residual_noise.to(device, non_blocking=True)
         else:
-            high_pass = None
+            residual_noise = None
         # If collate left normalization to be done on-device (collate used zero_one),
         # perform normalization here on the GPU for evaluation.
         if device.type == "cuda" and normalization_mode is not None:
@@ -2079,17 +2079,17 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
                 images[i] = _normalize(images[i], normalization_mode, imagenet_mean=imagenet_mean, imagenet_std=imagenet_std)
         if cfg.channels_last and device.type == "cuda":
             images = images.contiguous(memory_format=torch.channels_last)
-            if high_pass is not None:
-                high_pass = high_pass.contiguous(memory_format=torch.channels_last)
+            if residual_noise is not None:
+                residual_noise = residual_noise.contiguous(memory_format=torch.channels_last)
         precision_name = (getattr(cfg, "precision", "fp32") or "fp32").lower()
         amp_dtype = torch.bfloat16 if precision_name == "bf16" else (torch.float16 if precision_name == "fp16" else None)
         use_amp = cfg.amp and device.type == "cuda" and (amp_dtype is not None)
         if amp_dtype is not None:
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+                preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
                 loss = loss_fn(preds, masks)
         else:
-            preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+            preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
             loss = loss_fn(preds, masks)
         logits = _select_pred_head(preds, cfg.final_pred_stage)
 
@@ -2644,3 +2644,4 @@ def run_training(cfg: TrainConfig) -> None:
 if __name__ == "__main__":
     configuration = parse_args()
     run_training(configuration)
+

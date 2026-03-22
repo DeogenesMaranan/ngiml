@@ -1,9 +1,10 @@
-"""Prepare datasets into a common manifest with optional resizing."""
+﻿"""Prepare datasets into a common manifest with optional resizing."""
 from __future__ import annotations
 
 import argparse
 import io
 import random
+import re
 import sys
 import tarfile
 import time
@@ -29,27 +30,46 @@ from src.data.config import DatasetStructureConfig, Manifest, PreparationConfig,
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
-def _compute_high_pass(image_np: np.ndarray) -> np.ndarray:
-    """Compute a deterministic per-channel high-pass map (uint8 HWC)."""
+def _gaussian_kernel1d(sigma: float = 1.0) -> np.ndarray:
+    sigma = max(0.5, float(sigma))
+    radius = max(1, int(round(3.0 * sigma)))
+    x = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = np.exp(-(x ** 2) / (2.0 * sigma * sigma))
+    kernel /= np.sum(kernel)
+    return kernel.astype(np.float32)
+
+
+def _gaussian_blur_rgb(image_f: np.ndarray, sigma: float = 1.0) -> np.ndarray:
+    if image_f.ndim != 3 or image_f.shape[2] != 3:
+        raise ValueError(f"Expected float RGB image HxWx3, got shape {image_f.shape}")
+
+    kernel = _gaussian_kernel1d(sigma=sigma)
+    radius = kernel.shape[0] // 2
+    h, w, _ = image_f.shape
+
+    tmp = np.empty_like(image_f, dtype=np.float32)
+    out = np.empty_like(image_f, dtype=np.float32)
+
+    for channel in range(3):
+        padded_w = np.pad(image_f[:, :, channel], ((0, 0), (radius, radius)), mode="reflect")
+        for y in range(h):
+            tmp[y, :, channel] = np.convolve(padded_w[y, :], kernel, mode="valid")
+
+        padded_h = np.pad(tmp[:, :, channel], ((radius, radius), (0, 0)), mode="reflect")
+        for x in range(w):
+            out[:, x, channel] = np.convolve(padded_h[:, x], kernel, mode="valid")
+
+    return out
+
+
+def _compute_residual_noise(image_np: np.ndarray) -> np.ndarray:
+    """Compute residual noise as image_f - gaussian_blur(image_f), float32 HWC."""
     if image_np.ndim != 3 or image_np.shape[2] != 3:
         raise ValueError(f"Expected RGB image HxWx3, got shape {image_np.shape}")
 
     image_f = image_np.astype(np.float32) / 255.0
-    padded = np.pad(image_f, ((1, 1), (1, 1), (0, 0)), mode="reflect")
-
-    center = padded[1:-1, 1:-1, :]
-    top = padded[:-2, 1:-1, :]
-    bottom = padded[2:, 1:-1, :]
-    left = padded[1:-1, :-2, :]
-    right = padded[1:-1, 2:, :]
-
-    hp = np.abs(4.0 * center - top - bottom - left - right)
-    scale = np.percentile(hp, 99.5)
-    if scale <= 1e-6:
-        return np.zeros_like(image_np, dtype=np.uint8)
-
-    hp_uint8 = np.clip((hp / scale) * 255.0, 0.0, 255.0).astype(np.uint8)
-    return hp_uint8
+    blur_f = _gaussian_blur_rgb(image_f, sigma=1.0)
+    return (image_f - blur_f).astype(np.float32)
 
 
 class TarShardWriter:
@@ -109,78 +129,198 @@ def _find_mask(fake_path: Path, mask_dir: Path, mask_suffix: str) -> Path | None
     return None
 
 
-def _split_records(records: Sequence[SampleRecord], split_cfg: SplitConfig) -> Dict[str, List[SampleRecord]]:
+def _build_grouping_rules(cfg: DatasetStructureConfig) -> tuple[set[str], tuple[str, ...]]:
+    dir_tokens = {
+        cfg.real_subdir.lower().strip(),
+        cfg.fake_subdir.lower().strip(),
+        cfg.mask_subdir.lower().strip(),
+    }
+    dir_tokens = {token for token in dir_tokens if token}
+
+    stem_suffixes: list[str] = []
+    suffix = cfg.mask_suffix.lower().strip()
+    if suffix:
+        stem_suffixes.append(suffix)
+
+    return dir_tokens, tuple(stem_suffixes)
+
+
+def _normalize_source_stem(stem: str, stem_suffixes: Sequence[str]) -> str:
+    text = stem.lower()
+    for suffix in stem_suffixes:
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+    text = re.sub(r"(?:[_\-.]?)(?:copy|clone|tampered|forged|splice|spliced|edited)$", "", text)
+    text = re.sub(r"(?:[_\-.]?)(?:v\d+|ver\d+)$", "", text)
+    text = re.sub(r"[\s\-]+", "_", text)
+    return text.strip("_") or stem.lower()
+
+
+def _source_group_key(
+    path: Path,
+    root: Path,
+    dir_tokens: set[str],
+    stem_suffixes: Sequence[str],
+) -> str:
+    rel = path.relative_to(root)
+    parts = [p.lower() for p in rel.parts[:-1] if p.lower() not in dir_tokens]
+    stem = _normalize_source_stem(path.stem, stem_suffixes)
+    prefix = "/".join(parts[-2:]) if parts else ""
+    return f"{prefix}/{stem}" if prefix else stem
+
+
+def _assign_grouped_items(
+    grouped_items: Sequence[List[SampleRecord]],
+    ratios: Sequence[float],
+    rng: random.Random,
+) -> Dict[str, List[SampleRecord]]:
+    split_names = ["train", "val", "test"]
+    total = sum(len(group) for group in grouped_items)
+    target = [float(total) * r for r in ratios]
+    assigned_counts = [0, 0, 0]
+    splits: Dict[str, List[SampleRecord]] = {"train": [], "val": [], "test": []}
+
+    shuffled = [list(group) for group in grouped_items]
+    rng.shuffle(shuffled)
+    shuffled.sort(key=len, reverse=True)
+
+    for group in shuffled:
+        valid_indices = [idx for idx, ratio in enumerate(ratios) if ratio > 0]
+        if not valid_indices:
+            valid_indices = [0]
+        chosen_idx = max(valid_indices, key=lambda idx: (target[idx] - assigned_counts[idx], ratios[idx]))
+        split_name = split_names[chosen_idx]
+        splits[split_name].extend(group)
+        assigned_counts[chosen_idx] += len(group)
+
+    return splits
+
+
+def _split_records(
+    records: Sequence[SampleRecord],
+    split_cfg: SplitConfig,
+    dataset_root: Path,
+    dir_tokens: set[str],
+    stem_suffixes: Sequence[str],
+) -> Dict[str, List[SampleRecord]]:
     split_cfg.validate()
     rng = random.Random(split_cfg.seed)
-    per_label: Dict[int, List[SampleRecord]] = {0: [], 1: []}
+    per_label_groups: Dict[int, Dict[str, List[SampleRecord]]] = {0: {}, 1: {}}
     for rec in records:
-        per_label.setdefault(rec.label, []).append(rec)
+        key = _source_group_key(Path(rec.image_path), dataset_root, dir_tokens, stem_suffixes)
+        label_groups = per_label_groups.setdefault(rec.label, {})
+        label_groups.setdefault(key, []).append(rec)
 
     splits = {"train": [], "val": [], "test": []}
-    for label, items in per_label.items():
-        items = items.copy()
-        rng.shuffle(items)
-        n = len(items)
+    for label_groups in per_label_groups.values():
+        groups = list(label_groups.values())
+        n = sum(len(group) for group in groups)
+        if n == 0:
+            continue
         ratios = [split_cfg.train, split_cfg.val, split_cfg.test]
-        raw_counts = [n * r for r in ratios]
-        counts = [int(c) for c in raw_counts]
-        remainder = n - sum(counts)
-
-        if remainder > 0:
-            # Distribute leftover samples by largest fractional remainder,
-            # but never allocate to a split whose target ratio is zero.
-            order = sorted(
-                range(3),
-                key=lambda idx: (raw_counts[idx] - counts[idx], ratios[idx]),
-                reverse=True,
-            )
-            for idx in order:
-                if remainder == 0:
-                    break
-                if ratios[idx] <= 0:
-                    continue
-                counts[idx] += 1
-                remainder -= 1
-
-        if remainder > 0:
-            counts[0] += remainder
-
-        n_train, n_val, _ = counts
-        train_items = items[:n_train]
-        val_items = items[n_train : n_train + n_val]
-        test_items = items[n_train + n_val :]
-        splits["train"].extend(train_items)
-        splits["val"].extend(val_items)
-        splits["test"].extend(test_items)
+        label_splits = _assign_grouped_items(groups, ratios, rng)
+        splits["train"].extend(label_splits["train"])
+        splits["val"].extend(label_splits["val"])
+        splits["test"].extend(label_splits["test"])
     return splits
 
 
 def _build_npz_bytes(
     image_path: Path,
     mask_path: Path | None,
-    target_size: int,
-    include_high_pass: bool = True,
+    split_name: str,
+    crop_size: int,
+    resize_max_side: int,
+    rng: random.Random,
+    include_residual_noise: bool = True,
 ) -> bytes:
     image = Image.open(image_path).convert("RGB")
-    if image_path.suffix.lower() not in {".jpg", ".jpeg"}:
-        buf_jpg = io.BytesIO()
-        image.save(buf_jpg, format="JPEG", quality=95)
-        buf_jpg.seek(0)
-        image = Image.open(buf_jpg).convert("RGB")
-
     mask_img = Image.open(mask_path).convert("L") if mask_path is not None else None
-    if target_size > 0:
-        image = image.resize((target_size, target_size), Image.BILINEAR)
-        if mask_img is not None:
-            mask_img = mask_img.resize((target_size, target_size), Image.NEAREST)
 
-    image_np = np.asarray(image, dtype=np.uint8)
+    if resize_max_side > 0:
+        w, h = image.size
+        long_side = max(w, h)
+        if long_side > resize_max_side:
+            scale = float(resize_max_side) / float(long_side)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            image = image.resize((new_w, new_h), Image.BILINEAR)
+            if mask_img is not None:
+                mask_img = mask_img.resize((new_w, new_h), Image.NEAREST)
+
+    if crop_size > 0 and split_name in {"train", "val"}:
+        w, h = image.size
+        min_side = min(w, h)
+        if min_side < crop_size:
+            scale = float(crop_size) / float(min_side)
+            new_w = max(crop_size, int(round(w * scale)))
+            new_h = max(crop_size, int(round(h * scale)))
+            image = image.resize((new_w, new_h), Image.BILINEAR)
+            if mask_img is not None:
+                mask_img = mask_img.resize((new_w, new_h), Image.NEAREST)
+
+        image_np_full = np.asarray(image, dtype=np.uint8)
+        mask_np_full = np.asarray(mask_img, dtype=np.uint8) if mask_img is not None else None
+
+        h_full, w_full = image_np_full.shape[:2]
+        max_top = max(0, h_full - crop_size)
+        max_left = max(0, w_full - crop_size)
+
+        top = 0
+        left = 0
+        if mask_np_full is not None:
+            mask_bin = mask_np_full > 127
+            fg_coords = np.argwhere(mask_bin)
+            if fg_coords.shape[0] > 0:
+                # Bias fake crops to boundaries when possible.
+                up = np.pad(mask_bin[:-1, :], ((1, 0), (0, 0)), constant_values=False)
+                down = np.pad(mask_bin[1:, :], ((0, 1), (0, 0)), constant_values=False)
+                left_n = np.pad(mask_bin[:, :-1], ((0, 0), (1, 0)), constant_values=False)
+                right_n = np.pad(mask_bin[:, 1:], ((0, 0), (0, 1)), constant_values=False)
+                boundary = mask_bin & (~(up & down & left_n & right_n))
+                boundary_coords = np.argwhere(boundary)
+
+                use_boundary = boundary_coords.shape[0] > 0 and rng.random() < 0.7
+                coords = boundary_coords if use_boundary else fg_coords
+                center_y, center_x = coords[rng.randrange(coords.shape[0])]
+                jitter_y = rng.randint(-crop_size // 6, crop_size // 6)
+                jitter_x = rng.randint(-crop_size // 6, crop_size // 6)
+                top = int(center_y) - crop_size // 2 + jitter_y
+                left = int(center_x) - crop_size // 2 + jitter_x
+                top = max(0, min(top, max_top))
+                left = max(0, min(left, max_left))
+
+                crop_mask = mask_bin[top : top + crop_size, left : left + crop_size]
+                if crop_mask.sum() == 0:
+                    for _ in range(12):
+                        center_y, center_x = fg_coords[rng.randrange(fg_coords.shape[0])]
+                        top = max(0, min(int(center_y) - crop_size // 2, max_top))
+                        left = max(0, min(int(center_x) - crop_size // 2, max_left))
+                        crop_mask = mask_bin[top : top + crop_size, left : left + crop_size]
+                        if crop_mask.sum() > 0:
+                            break
+            else:
+                top = rng.randint(0, max_top) if max_top > 0 else 0
+                left = rng.randint(0, max_left) if max_left > 0 else 0
+        else:
+            top = rng.randint(0, max_top) if max_top > 0 else 0
+            left = rng.randint(0, max_left) if max_left > 0 else 0
+
+        image_np = image_np_full[top : top + crop_size, left : left + crop_size]
+        if mask_np_full is not None:
+            mask_np = mask_np_full[top : top + crop_size, left : left + crop_size]
+        else:
+            mask_np = None
+    else:
+        image_np = np.asarray(image, dtype=np.uint8)
+        mask_np = np.asarray(mask_img, dtype=np.uint8) if mask_img is not None else None
+
     payload = {"image": image_np}
-    if mask_img is not None:
-        mask_np = np.asarray(mask_img, dtype=np.uint8)
-        payload["mask"] = mask_np
-    if include_high_pass:
-        payload["high_pass"] = _compute_high_pass(image_np)
+    if mask_np is not None:
+        payload["mask"] = (mask_np > 127).astype(np.uint8)
+    if include_residual_noise:
+        payload["residual_noise"] = _compute_residual_noise(image_np)
 
     buf = io.BytesIO()
     # np.savez (not compressed) to avoid CPU overhead from compression.
@@ -203,6 +343,7 @@ def prepare_single_dataset(
 
     real_images = _discover_images(real_dir) if real_dir.exists() else []
     fake_images = _discover_images(fake_dir) if fake_dir.exists() else []
+    dir_tokens, stem_suffixes = _build_grouping_rules(cfg)
 
     records: List[SampleRecord] = []
 
@@ -240,11 +381,14 @@ def prepare_single_dataset(
         rng = random.Random(split_cfg.seed)
         records = rng.sample(records, sample_limit)
 
-    splits = _split_records(records, split_cfg)
+    splits = _split_records(records, split_cfg, root, dir_tokens, stem_suffixes)
 
     prepared_records: List[SampleRecord] = []
-    target_size = sorted(prep_cfg.target_size_set())[0]
+    crop_size = sorted(prep_cfg.target_size_set())[0]
+    split_rng = random.Random(split_cfg.seed)
     for split_name, split_records in splits.items():
+        if not split_records:
+            continue
         tar_writer: TarShardWriter | None = None
         if prep_cfg.tar_shard_size > 0:
             tar_root = cfg.prepared_dir() / split_name
@@ -256,8 +400,11 @@ def prepare_single_dataset(
             npz_bytes = _build_npz_bytes(
                 image_path=image_path,
                 mask_path=mask_path,
-                target_size=target_size,
-                include_high_pass=prep_cfg.enable_high_pass,
+                split_name=split_name,
+                crop_size=crop_size,
+                resize_max_side=prep_cfg.resize_max_side,
+                rng=split_rng,
+                include_residual_noise=prep_cfg.enable_residual_noise,
             )
 
             stem = f"{cfg.dataset_name}_{split_name}_{'fake' if rec.label else 'real'}_{idx:06d}"
@@ -278,7 +425,17 @@ def prepare_single_dataset(
                     image_path=sample_path,
                     mask_path=None,
                     label=rec.label,
-                    high_pass_path=None,
+                    residual_noise_path=None,
+                    original_image_path=rec.image_path,
+                    original_mask_path=rec.mask_path,
+                    metadata={
+                        "dataset": rec.dataset,
+                        "path": sample_path,
+                        "original_image_path": rec.image_path,
+                        "original_mask_path": rec.mask_path,
+                        "storage": "npz",
+                        "residual_noise": bool(prep_cfg.enable_residual_noise),
+                    },
                 )
             )
 
@@ -347,33 +504,6 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
             mask_suffix="_mask",
             prepared_root="./prepared",
         ),
-        DatasetStructureConfig(
-            dataset_root="./datasets",
-            dataset_name="CASIA1",
-            real_subdir="Au",
-            fake_subdir="Tp",
-            mask_subdir="Gt",
-            mask_suffix="_gt",
-            prepared_root="./prepared",
-        ),
-        DatasetStructureConfig(
-            dataset_root="./datasets",
-            dataset_name="COVERAGE",
-            real_subdir="real",
-            fake_subdir="fake",
-            mask_subdir="mask",
-            mask_suffix="forged",
-            prepared_root="./prepared",
-        ),
-        DatasetStructureConfig(
-            dataset_root="./datasets",
-            dataset_name="Columbia",
-            real_subdir="real",
-            fake_subdir="fake",
-            mask_subdir="mask",
-            mask_suffix="_edgemask",
-            prepared_root="./prepared",
-        ),
     ]
 
     per_dataset_splits = {
@@ -381,12 +511,14 @@ def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, Spl
         "TampCOCO": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
         "NIST": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
         "IMD2020": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
-        "CASIA1": SplitConfig(train=0.0, val=0.0, test=1.0, seed=shared_seed),
-        "COVERAGE": SplitConfig(train=0.0, val=0.0, test=1.0, seed=shared_seed),
-        "Columbia": SplitConfig(train=0.0, val=0.0, test=1.0, seed=shared_seed),
     }
 
-    prep_cfg = PreparationConfig(target_sizes=(384,), normalization_mode="imagenet", tar_shard_size=500)
+    prep_cfg = PreparationConfig(
+        target_sizes=(384,),
+        normalization_mode="imagenet",
+        tar_shard_size=500,
+        resize_max_side=768,
+    )
 
     return datasets, per_dataset_splits, prep_cfg
 
@@ -398,7 +530,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default=None,
-        help="Name of a single dataset to process (e.g., CASIA2, IMD2020, Columbia, COVERAGE). If omitted, processes all.")
+        help="Name of a single dataset to process (e.g., CASIA2, IMD2020, NIST, TampCOCO). If omitted, processes all.")
     parser.add_argument(
         "--sample-limit",
         type=int,
@@ -440,3 +572,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

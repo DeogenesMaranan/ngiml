@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, List
 
@@ -44,7 +44,7 @@ class ResidualNoiseModule(nn.Module):
     Forensic motivation: Disables normalization for residual branch to preserve forensic signal integrity. Adds learnable scale to strengthen residual branch contribution.
 
     For splicing / copy-move detection:
-        Image → SRMResidualBranch → ResidualNoiseBackbone → multi-scale features
+        Image â†’ SRMResidualBranch â†’ ResidualNoiseBackbone â†’ multi-scale features
     """
 
     def __init__(self, config: Optional[ResidualNoiseConfig] = None, in_channels: int = 3) -> None:
@@ -115,7 +115,7 @@ class ResidualNoiseModule(nn.Module):
         return kernels
 
     # ------------------------------------------------------------------
-    def forward(self, x: Tensor, high_pass: Tensor | None = None) -> List[Tensor]:
+    def forward(self, x: Tensor, residual_noise: Tensor | None = None) -> List[Tensor]:
         """
         Args:
             x : (B, C, H, W), e.g., RGB image
@@ -132,23 +132,23 @@ class ResidualNoiseModule(nn.Module):
             groups=c,
         )  # shape: (B, C*3, H, W)
 
-        if high_pass is not None:
-            hp = high_pass
+        if residual_noise is not None:
+            hp = residual_noise
             if hp.shape[-2:] != x.shape[-2:]:
                 _LOG.warning(
-                    "ResidualNoiseBranch high_pass spatial align: (%d,%d) -> (%d,%d)",
+                    "ResidualNoiseBranch residual_noise spatial align: (%d,%d) -> (%d,%d)",
                     hp.shape[-2], hp.shape[-1], x.shape[-2], x.shape[-1],
                 )
                 hp = F.interpolate(hp, size=x.shape[-2:], mode="bilinear", align_corners=False)
             if hp.shape[1] == 1 and c > 1:
                 _LOG.warning(
-                    "ResidualNoiseBranch high_pass channel repeat: %d -> %d",
+                    "ResidualNoiseBranch residual_noise channel repeat: %d -> %d",
                     hp.shape[1], c,
                 )
                 hp = hp.repeat(1, c, 1, 1)
             elif hp.shape[1] != c:
                 _LOG.warning(
-                    "ResidualNoiseBranch high_pass channel align: %d -> %d",
+                    "ResidualNoiseBranch residual_noise channel align: %d -> %d",
                     hp.shape[1], c,
                 )
                 hp = hp[:, :c, ...]
@@ -179,3 +179,4 @@ class ResidualNoiseModule(nn.Module):
 ResidualNoiseBranch = ResidualNoiseModule
 
 __all__ = ["ResidualNoiseModule", "ResidualNoiseBranch", "ResidualNoiseConfig"]
+

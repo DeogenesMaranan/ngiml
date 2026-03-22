@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from collections import Counter
@@ -11,7 +11,7 @@ from torchvision.transforms import functional as TVF
 from torchvision.transforms.functional import InterpolationMode
 
 from src.data.dataloaders import (
-    _compute_high_pass_fallback,
+    _compute_residual_noise_fallback,
     _load_from_npz,
     _load_from_tar_npz,
     _load_image,
@@ -345,29 +345,29 @@ def _resolve_possible_local_path(path_str: str) -> str:
 def resize_for_inference(
     image: torch.Tensor,
     mask: torch.Tensor | None = None,
-    high_pass: torch.Tensor | None = None,
+    residual_noise: torch.Tensor | None = None,
     max_short_side: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     cap = int(max_short_side or 0)
     if cap <= 0:
-        return image, mask, high_pass
+        return image, mask, residual_noise
 
     h, w = image.shape[-2:]
     short_side = min(h, w)
     if short_side <= 0 or short_side <= cap:
-        return image, mask, high_pass
+        return image, mask, residual_noise
 
     scale = float(cap) / float(short_side)
     new_h, new_w = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
     image = TVF.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
     if mask is not None:
         mask = TVF.resize(mask, [new_h, new_w], interpolation=InterpolationMode.NEAREST)
-    if high_pass is not None:
-        high_pass = TVF.resize(high_pass, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-    return image, mask, high_pass
+    if residual_noise is not None:
+        residual_noise = TVF.resize(residual_noise, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+    return image, mask, residual_noise
 
 
-def should_use_high_pass_for_records(records: Sequence[SampleRecord]) -> bool:
+def should_use_residual_noise_for_records(records: Sequence[SampleRecord]) -> bool:
     """Mirror dataloader behavior: if any non-NPZ sample lacks high-pass, disable high-pass for the whole split."""
     for record in records:
         image_path = str(record.image_path)
@@ -375,7 +375,7 @@ def should_use_high_pass_for_records(records: Sequence[SampleRecord]) -> bool:
         if is_npz_like:
             # NPZ/tar::NPZ samples synthesize high-pass fallback at load time.
             continue
-        if record.high_pass_path is None:
+        if record.residual_noise_path is None:
             return False
     return True
 
@@ -383,21 +383,21 @@ def should_use_high_pass_for_records(records: Sequence[SampleRecord]) -> bool:
 def collate_eval_batch_like_training(
     records: Sequence[SampleRecord],
     max_short_side: int | None = None,
-    use_high_pass: bool = True,
+    use_residual_noise: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, list[str]]:
     """Load and collate a batch using the same median-short-side resize + padding policy as training eval."""
     images: list[torch.Tensor] = []
     masks: list[torch.Tensor] = []
-    high_passes: list[torch.Tensor] = []
+    residual_noisees: list[torch.Tensor] = []
     datasets: list[str] = []
 
     for record in records:
-        image, mask, high_pass = load_image_mask_from_record(record, max_short_side=max_short_side)
+        image, mask, residual_noise = load_image_mask_from_record(record, max_short_side=max_short_side)
         images.append(image)
         masks.append(mask)
         datasets.append(str(record.dataset))
-        if use_high_pass and high_pass is not None:
-            high_passes.append(high_pass)
+        if use_residual_noise and residual_noise is not None:
+            residual_noisees.append(residual_noise)
 
     shorts = [min(int(img.shape[-2]), int(img.shape[-1])) for img in images]
     target_short = int(round(float(torch.tensor(shorts, dtype=torch.float32).median().item()))) if shorts else 0
@@ -412,15 +412,15 @@ def collate_eval_batch_like_training(
                 new_w = max(1, int(round(w * scale)))
                 images[idx] = TVF.resize(images[idx], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
                 masks[idx] = TVF.resize(masks[idx], [new_h, new_w], interpolation=InterpolationMode.NEAREST)
-                if use_high_pass and idx < len(high_passes):
-                    high_passes[idx] = TVF.resize(high_passes[idx], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+                if use_residual_noise and idx < len(residual_noisees):
+                    residual_noisees[idx] = TVF.resize(residual_noisees[idx], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
 
     max_h = max(int(img.shape[-2]) for img in images)
     max_w = max(int(img.shape[-1]) for img in images)
 
     padded_images: list[torch.Tensor] = []
     padded_masks: list[torch.Tensor] = []
-    padded_high_passes: list[torch.Tensor] = []
+    padded_residual_noisees: list[torch.Tensor] = []
 
     for idx, (image, mask) in enumerate(zip(images, masks)):
         h, w = image.shape[-2:]
@@ -432,23 +432,23 @@ def collate_eval_batch_like_training(
         padded_images.append(image)
         padded_masks.append(mask)
 
-        if use_high_pass and idx < len(high_passes):
-            hp = high_passes[idx]
+        if use_residual_noise and idx < len(residual_noisees):
+            hp = residual_noisees[idx]
             hh, hw = hp.shape[-2:]
             hp_pad_h = max_h - hh
             hp_pad_w = max_w - hw
             if hp_pad_h > 0 or hp_pad_w > 0:
                 hp = F.pad(hp.unsqueeze(0), (0, hp_pad_w, 0, hp_pad_h), mode="constant", value=0.0).squeeze(0)
-            padded_high_passes.append(hp)
+            padded_residual_noisees.append(hp)
 
     image_batch = torch.stack(padded_images, dim=0)
     mask_batch = torch.stack(padded_masks, dim=0)
 
-    high_pass_batch = None
-    if use_high_pass and len(padded_high_passes) == len(padded_images):
-        high_pass_batch = torch.stack(padded_high_passes, dim=0)
+    residual_noise_batch = None
+    if use_residual_noise and len(padded_residual_noisees) == len(padded_images):
+        residual_noise_batch = torch.stack(padded_residual_noisees, dim=0)
 
-    return image_batch, mask_batch, high_pass_batch, datasets
+    return image_batch, mask_batch, residual_noise_batch, datasets
 
 
 def load_image_mask_from_record(
@@ -457,19 +457,19 @@ def load_image_mask_from_record(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     image_path = str(record.image_path)
     if "::" in image_path and image_path.endswith(".npz"):
-        image, mask, high_pass = _load_from_tar_npz(image_path)
+        image, mask, residual_noise = _load_from_tar_npz(image_path)
     elif image_path.endswith(".npz"):
-        image, mask, high_pass = _load_from_npz(_resolve_possible_local_path(image_path))
+        image, mask, residual_noise = _load_from_npz(_resolve_possible_local_path(image_path))
     else:
         image = _load_image(_resolve_possible_local_path(image_path))
-        high_pass = None
+        residual_noise = None
         mask = None
         if record.mask_path is not None:
             loaded = _load_image(_resolve_possible_local_path(record.mask_path))
             mask = loaded[:1] if loaded.shape[0] > 1 else loaded
-        if record.high_pass_path is not None:
-            loaded_high = _load_image(_resolve_possible_local_path(record.high_pass_path))
-            high_pass = loaded_high if loaded_high.shape[0] in (1, 3) else loaded_high[:3]
+        if record.residual_noise_path is not None:
+            loaded_high = _load_image(_resolve_possible_local_path(record.residual_noise_path))
+            residual_noise = loaded_high if loaded_high.shape[0] in (1, 3) else loaded_high[:3]
 
     image = image.float()
     if image.max() > 1.0:
@@ -488,23 +488,23 @@ def load_image_mask_from_record(
         if tuple(mask.shape[-2:]) != tuple(image.shape[-2:]):
             mask = F.interpolate(mask.unsqueeze(0), size=image.shape[-2:], mode="nearest").squeeze(0)
 
-    if high_pass is not None:
-        high_pass = high_pass.float()
-        if high_pass.ndim == 2:
-            high_pass = high_pass.unsqueeze(0)
-        if high_pass.shape[0] == 1:
-            high_pass = high_pass.repeat(3, 1, 1)
-        elif high_pass.shape[0] > 3:
-            high_pass = high_pass[:3]
-        if high_pass.max() > 1.0:
-            high_pass = high_pass / 255.0
-        if tuple(high_pass.shape[-2:]) != tuple(image.shape[-2:]):
-            high_pass = F.interpolate(high_pass.unsqueeze(0), size=image.shape[-2:], mode="bilinear", align_corners=False).squeeze(0)
+    if residual_noise is not None:
+        residual_noise = residual_noise.float()
+        if residual_noise.ndim == 2:
+            residual_noise = residual_noise.unsqueeze(0)
+        if residual_noise.shape[0] == 1:
+            residual_noise = residual_noise.repeat(3, 1, 1)
+        elif residual_noise.shape[0] > 3:
+            residual_noise = residual_noise[:3]
+        if residual_noise.max() > 1.0:
+            residual_noise = residual_noise / 255.0
+        if tuple(residual_noise.shape[-2:]) != tuple(image.shape[-2:]):
+            residual_noise = F.interpolate(residual_noise.unsqueeze(0), size=image.shape[-2:], mode="bilinear", align_corners=False).squeeze(0)
     else:
-        high_pass = _compute_high_pass_fallback(image)
+        residual_noise = _compute_residual_noise_fallback(image)
 
-    image, mask, high_pass = resize_for_inference(image, mask=mask, high_pass=high_pass, max_short_side=max_short_side)
-    return image, mask, high_pass
+    image, mask, residual_noise = resize_for_inference(image, mask=mask, residual_noise=residual_noise, max_short_side=max_short_side)
+    return image, mask, residual_noise
 
 
 def normalize_image_for_inference(image: torch.Tensor, normalization_mode: str = "zero_one") -> torch.Tensor:
@@ -519,20 +519,20 @@ def predict_probability_map(
     image: torch.Tensor,
     device: torch.device,
     normalization_mode: str = "zero_one",
-    high_pass: torch.Tensor | None = None,
+    residual_noise: torch.Tensor | None = None,
     final_pred_stage: int | None = None,
 ) -> torch.Tensor:
     normalized = normalize_image_for_inference(image, normalization_mode=normalization_mode)
     x = normalized.unsqueeze(0).to(device)
     hp = None
-    if high_pass is not None:
-        hp = high_pass.float()
+    if residual_noise is not None:
+        hp = residual_noise.float()
         if hp.max() > 1.0:
             hp = hp / 255.0
         hp = hp.unsqueeze(0).to(device)
     stage_index = int(getattr(model, "final_pred_stage", -1) if final_pred_stage is None else final_pred_stage)
     with torch.no_grad():
-        outputs = model(x, target_size=image.shape[-2:], high_pass=hp)
+        outputs = model(x, target_size=image.shape[-2:], residual_noise=hp)
         logits = _select_output_head(outputs, stage_index)
         prob = torch.sigmoid(logits)[0, 0].detach().cpu()
     return prob
@@ -544,7 +544,7 @@ def predict_binary_map(
     device: torch.device,
     threshold: float | None = None,
     normalization_mode: str = "zero_one",
-    high_pass: torch.Tensor | None = None,
+    residual_noise: torch.Tensor | None = None,
     final_pred_stage: int | None = None,
 ) -> torch.Tensor:
     prob = predict_probability_map(
@@ -552,7 +552,7 @@ def predict_binary_map(
         image,
         device,
         normalization_mode=normalization_mode,
-        high_pass=high_pass,
+        residual_noise=residual_noise,
         final_pred_stage=final_pred_stage,
     )
     if threshold is None:
@@ -587,13 +587,13 @@ def infer_from_image_path(
     if crop_square:
         image = _center_square_crop(image)
 
-    high_pass = _compute_high_pass_fallback(image)
+    residual_noise = _compute_residual_noise_fallback(image)
     if prep_target_size is not None and prep_target_size > 0:
         image = TVF.resize(image, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
-        high_pass = TVF.resize(high_pass, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
+        residual_noise = TVF.resize(residual_noise, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
     else:
-        image, _, high_pass = resize_for_inference(image, mask=None, high_pass=high_pass, max_short_side=max_short_side)
-    pred = predict_probability_map(model, image, device, normalization_mode=normalization_mode, high_pass=high_pass)
+        image, _, residual_noise = resize_for_inference(image, mask=None, residual_noise=residual_noise, max_short_side=max_short_side)
+    pred = predict_probability_map(model, image, device, normalization_mode=normalization_mode, residual_noise=residual_noise)
     return image, pred, orig_image
 
 
@@ -615,12 +615,12 @@ def multiscale_infer_from_image_path(
     image = orig_image
     if crop_square:
         image = _center_square_crop(image)
-    high_pass = _compute_high_pass_fallback(image)
+    residual_noise = _compute_residual_noise_fallback(image)
     if prep_target_size is not None and prep_target_size > 0:
         image = TVF.resize(image, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
-        high_pass = TVF.resize(high_pass, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
+        residual_noise = TVF.resize(residual_noise, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
     else:
-        image, _, high_pass = resize_for_inference(image, mask=None, high_pass=high_pass, max_short_side=max_short_side)
+        image, _, residual_noise = resize_for_inference(image, mask=None, residual_noise=residual_noise, max_short_side=max_short_side)
 
     base_h, base_w = image.shape[-2:]
     merge = None if merge_mode is None else ("max" if str(merge_mode).lower() == "max" else "mean")
@@ -641,19 +641,19 @@ def multiscale_infer_from_image_path(
     for scale in cleaned_scales:
         if abs(scale - 1.0) < 1e-6:
             scaled_img = image
-            scaled_hp = high_pass
+            scaled_hp = residual_noise
         else:
             new_h = max(1, int(round(base_h * scale)))
             new_w = max(1, int(round(base_w * scale)))
             scaled_img = TVF.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-            scaled_hp = None if high_pass is None else TVF.resize(high_pass, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+            scaled_hp = None if residual_noise is None else TVF.resize(residual_noise, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
 
         prob = predict_probability_map(
             model,
             scaled_img,
             device,
             normalization_mode=normalization_mode,
-            high_pass=scaled_hp,
+            residual_noise=scaled_hp,
         )
 
         if prob.shape[-2:] != (base_h, base_w):
@@ -704,7 +704,7 @@ def get_model_complexity_stats(
             self.base_model = base_model
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            out = self.base_model(x, target_size=x.shape[-2:], high_pass=None)
+            out = self.base_model(x, target_size=x.shape[-2:], residual_noise=None)
             if isinstance(out, (list, tuple)):
                 stage_index = int(getattr(self.base_model, "final_pred_stage", -1))
                 return _select_output_head(out, stage_index)
@@ -757,3 +757,4 @@ def get_model_complexity_stats(
         model.train(was_training)
 
     return stats
+

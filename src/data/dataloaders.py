@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 
 import io
@@ -30,7 +30,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".npz"}
 # Per-process LRU cache of open tar archives to avoid reopening on every sample.
 _TAR_CACHE_LIMIT = 8
 _TAR_CACHE: "OrderedDict[str, tarfile.TarFile]" = OrderedDict()
-_MISSING_HIGH_PASS_WARNED = False
+_MISSING_RESIDUAL_WARNED = False
 
 
 def _close_all_tars() -> None:
@@ -98,18 +98,22 @@ def _safe_scale_to_unit_float32(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to(dtype=torch.float32)
 
 
-def _compute_high_pass_fallback(image: torch.Tensor) -> torch.Tensor:
-    gray = image.mean(dim=0, keepdim=True)
-    blurred = NN_F.avg_pool2d(gray.unsqueeze(0), kernel_size=5, stride=1, padding=2).squeeze(0)
-    high_pass = torch.abs(gray - blurred)
-    high_pass = torch.clamp(high_pass * 4.0, 0.0, 1.0)
-    return high_pass.repeat(3, 1, 1).to(dtype=torch.float32)
+def _compute_residual_noise_fallback(image: torch.Tensor) -> torch.Tensor:
+    if image.ndim != 3 or image.shape[0] != 3:
+        raise ValueError(f"Expected CHW image with 3 channels, got shape {tuple(image.shape)}")
+    blurred = NN_F.avg_pool2d(image.unsqueeze(0), kernel_size=5, stride=1, padding=2).squeeze(0)
+    return (image - blurred).to(dtype=torch.float32)
+
+
+def _compute_residual_noise_fallback(image: torch.Tensor) -> torch.Tensor:
+    """Backwards-compatible alias; now returns residual-noise style signal."""
+    return _compute_residual_noise_fallback(image)
 
 
 def _load_from_npz(
     path: str | io.BytesIO,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    global _MISSING_HIGH_PASS_WARNED
+    global _MISSING_RESIDUAL_WARNED
     with np.load(path, allow_pickle=False) as data:
         image_np = data["image"]
         image = torch.from_numpy(image_np)
@@ -143,34 +147,35 @@ def _load_from_npz(
                 mask = mask / 255.0
             mask = mask.float()
 
-        high_pass = None
-        if "high_pass" in data:
-            hp_np = data["high_pass"]
-            if hp_np.size > 0:
-                high_pass = torch.from_numpy(hp_np)
-                if high_pass.ndim == 2:
-                    high_pass = high_pass.unsqueeze(0)
-                elif high_pass.ndim == 3 and high_pass.shape[-1] in (1, 3):
-                    high_pass = high_pass.permute(2, 0, 1)
-                elif high_pass.ndim == 3 and high_pass.shape[0] in (1, 3):
+        residual_noise = None
+        residual_key = "residual_noise" if "residual_noise" in data else ("residual_noise" if "residual_noise" in data else None)
+        if residual_key is not None:
+            residual_np = data[residual_key]
+            if residual_np.size > 0:
+                residual_noise = torch.from_numpy(residual_np)
+                if residual_noise.ndim == 2:
+                    residual_noise = residual_noise.unsqueeze(0)
+                elif residual_noise.ndim == 3 and residual_noise.shape[-1] in (1, 3):
+                    residual_noise = residual_noise.permute(2, 0, 1)
+                elif residual_noise.ndim == 3 and residual_noise.shape[0] in (1, 3):
                     pass
                 else:
-                    raise ValueError(f"Unexpected high_pass shape in NPZ: {high_pass.shape}")
-                if high_pass.shape[0] == 1:
-                    high_pass = high_pass.repeat(3, 1, 1)
-                high_pass = _safe_scale_to_unit_float32(high_pass)
+                    raise ValueError(f"Unexpected residual/residual_noise shape in NPZ: {residual_noise.shape}")
+                if residual_noise.shape[0] == 1:
+                    residual_noise = residual_noise.repeat(3, 1, 1)
+                residual_noise = _safe_scale_to_unit_float32(residual_noise)
 
-        if high_pass is None:
-            if not _MISSING_HIGH_PASS_WARNED:
+        if residual_noise is None:
+            if not _MISSING_RESIDUAL_WARNED:
                 warnings.warn(
-                    "NPZ sample missing high_pass; computing lightweight fallback from image.",
+                    "NPZ sample missing residual_noise/residual_noise; computing residual fallback from image.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
-                _MISSING_HIGH_PASS_WARNED = True
-            high_pass = _compute_high_pass_fallback(image)
+                _MISSING_RESIDUAL_WARNED = True
+            residual_noise = _compute_residual_noise_fallback(image)
 
-    return image, mask, high_pass
+    return image, mask, residual_noise
 
 
 def _load_from_tar_npz(
@@ -226,13 +231,13 @@ class PerDatasetDataset(Dataset):
         record = self.samples[index]
 
         if "::" in record.image_path and record.image_path.endswith(".npz"):
-            image, mask, high_pass = _load_from_tar_npz(record.image_path)
+            image, mask, residual_noise = _load_from_tar_npz(record.image_path)
         elif record.image_path.endswith(".npz"):
-            image, mask, high_pass = _load_from_npz(record.image_path)
+            image, mask, residual_noise = _load_from_npz(record.image_path)
         else:
             image = _load_image(record.image_path)
             mask = _load_mask(record.mask_path, image.shape[-2:])
-            high_pass = None
+            residual_noise = None
 
         if mask is None:
             mask = torch.zeros((1, image.shape[-2], image.shape[-1]), dtype=torch.float32)
@@ -247,8 +252,8 @@ class PerDatasetDataset(Dataset):
                 # Resize before any augmentations to keep sizes bounded
                 image = F.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
                 mask = F.resize(mask, [new_h, new_w], interpolation=InterpolationMode.NEAREST)
-                if high_pass is not None:
-                    high_pass = F.resize(high_pass, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+                if residual_noise is not None:
+                    residual_noise = F.resize(residual_noise, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
 
         cfg = self.aug_cfg
 
@@ -260,11 +265,11 @@ class PerDatasetDataset(Dataset):
             if self.aug_seed is not None:
                 gen = torch.Generator()
                 gen.manual_seed(int(self.aug_seed) + int(worker_offset) + int(index))
-            image, mask, high_pass = _apply_gpu_augmentations(
+            image, mask, residual_noise = _apply_gpu_augmentations(
                 image,
                 mask,
                 cfg,
-                high_pass=high_pass,
+                residual_noise=residual_noise,
                 generator=gen,
             )
 
@@ -275,7 +280,7 @@ class PerDatasetDataset(Dataset):
             "mask": mask,
             "label": label,
             "dataset": record.dataset,
-            "high_pass": high_pass,
+            "residual_noise": residual_noise,
         }
 
 
@@ -498,6 +503,10 @@ def _normalize(
     if mode == "zero_one":
         return image
     if mode == "imagenet":
+        # ImageNet stats are defined for RGB only. Keep non-RGB tensors
+        # (for example residual/noise inputs) in their native scale.
+        if image.ndim != 3 or image.shape[0] != 3:
+            return image
         if imagenet_mean is None or imagenet_std is None:
             mean = torch.tensor([0.485, 0.456, 0.406], device=image.device).view(3, 1, 1)
             std = torch.tensor([0.229, 0.224, 0.225], device=image.device).view(3, 1, 1)
@@ -512,7 +521,7 @@ def _apply_gpu_augmentations(
     image: torch.Tensor,
     mask: torch.Tensor,
     cfg: AugmentationConfig,
-    high_pass: torch.Tensor | None = None,
+    residual_noise: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     def _rand_scalar() -> torch.Tensor:
@@ -533,13 +542,13 @@ def _apply_gpu_augmentations(
     def _elastic_deform(
         image_t: torch.Tensor,
         mask_t: torch.Tensor,
-        high_pass_t: torch.Tensor | None,
+        residual_noise_t: torch.Tensor | None,
         alpha: float,
         sigma: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         _, h, w = image_t.shape
         if h < 4 or w < 4:
-            return image_t, mask_t, high_pass_t
+            return image_t, mask_t, residual_noise_t
 
         dx = torch.rand((1, 1, h, w), device=image_t.device, generator=generator) * 2.0 - 1.0
         dy = torch.rand((1, 1, h, w), device=image_t.device, generator=generator) * 2.0 - 1.0
@@ -571,37 +580,37 @@ def _apply_gpu_augmentations(
             align_corners=True,
         ).squeeze(0)
 
-        high_pass_out = None
-        if high_pass_t is not None:
-            high_pass_out = NN_F.grid_sample(
-                high_pass_t.unsqueeze(0),
+        residual_noise_out = None
+        if residual_noise_t is not None:
+            residual_noise_out = NN_F.grid_sample(
+                residual_noise_t.unsqueeze(0),
                 grid,
                 mode="bilinear",
                 padding_mode="reflection",
                 align_corners=True,
             ).squeeze(0)
 
-        return image_out, mask_out, high_pass_out
+        return image_out, mask_out, residual_noise_out
 
     if cfg.enable_flips:
         if _rand_scalar() < 0.5:
             image = torch.flip(image, dims=[2])
             mask = torch.flip(mask, dims=[2])
-            if high_pass is not None:
-                high_pass = torch.flip(high_pass, dims=[2])
+            if residual_noise is not None:
+                residual_noise = torch.flip(residual_noise, dims=[2])
         if _rand_scalar() < 0.2:
             image = torch.flip(image, dims=[1])
             mask = torch.flip(mask, dims=[1])
-            if high_pass is not None:
-                high_pass = torch.flip(high_pass, dims=[1])
+            if residual_noise is not None:
+                residual_noise = torch.flip(residual_noise, dims=[1])
 
     if cfg.enable_rotations and cfg.max_rotation_degrees > 0:
         angle = float((_rand_scalar() * 2 - 1) * cfg.max_rotation_degrees)
         if abs(angle) > 1e-3:
             image = F.rotate(image, angle=angle, interpolation=InterpolationMode.BILINEAR)
             mask = F.rotate(mask, angle=angle, interpolation=InterpolationMode.NEAREST)
-            if high_pass is not None:
-                high_pass = F.rotate(high_pass, angle=angle, interpolation=InterpolationMode.BILINEAR)
+            if residual_noise is not None:
+                residual_noise = F.rotate(residual_noise, angle=angle, interpolation=InterpolationMode.BILINEAR)
 
     if cfg.enable_random_crop:
         scale = float(
@@ -630,18 +639,18 @@ def _apply_gpu_augmentations(
 
             image = F.resized_crop(image, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.BILINEAR)
             mask = F.resized_crop(mask, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.NEAREST)
-            if high_pass is not None:
-                high_pass = F.resized_crop(high_pass, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.BILINEAR)
+            if residual_noise is not None:
+                residual_noise = F.resized_crop(residual_noise, top, left, crop_h, crop_w, size=[h, w], interpolation=InterpolationMode.BILINEAR)
 
     if getattr(cfg, "enable_elastic", False):
         elastic_prob = float(min(max(getattr(cfg, "elastic_prob", 0.0), 0.0), 1.0))
         elastic_alpha = float(max(0.0, getattr(cfg, "elastic_alpha", 0.0)))
         elastic_sigma = float(max(0.5, getattr(cfg, "elastic_sigma", 1.0)))
         if elastic_prob > 0 and elastic_alpha > 0 and _rand_scalar() < elastic_prob:
-            image, mask, high_pass = _elastic_deform(
+            image, mask, residual_noise = _elastic_deform(
                 image,
                 mask,
-                high_pass,
+                residual_noise,
                 alpha=elastic_alpha,
                 sigma=elastic_sigma,
             )
@@ -664,14 +673,14 @@ def _apply_gpu_augmentations(
             noise = torch.randn_like(image) * std
             image = torch.clamp(image + noise, 0.0, 1.0)
 
-    return image, mask, high_pass
+    return image, mask, residual_noise
 
 
 def _apply_gpu_augmentations_batch(
     images: torch.Tensor,
     masks: torch.Tensor,
     cfg: AugmentationConfig,
-    high_pass: torch.Tensor | None = None,
+    residual_noise: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Batched version of `_apply_gpu_augmentations` operating on tensors
@@ -699,13 +708,13 @@ def _apply_gpu_augmentations_batch(
         if horiz.any():
             images[horiz] = torch.flip(images[horiz], dims=[3])
             masks[horiz] = torch.flip(masks[horiz], dims=[3])
-            if high_pass is not None:
-                high_pass[horiz] = torch.flip(high_pass[horiz], dims=[3])
+            if residual_noise is not None:
+                residual_noise[horiz] = torch.flip(residual_noise[horiz], dims=[3])
         if vert.any():
             images[vert] = torch.flip(images[vert], dims=[2])
             masks[vert] = torch.flip(masks[vert], dims=[2])
-            if high_pass is not None:
-                high_pass[vert] = torch.flip(high_pass[vert], dims=[2])
+            if residual_noise is not None:
+                residual_noise[vert] = torch.flip(residual_noise[vert], dims=[2])
 
     # Rotations via affine grid (vectorized)
     if cfg.enable_rotations and cfg.max_rotation_degrees > 0:
@@ -723,8 +732,8 @@ def _apply_gpu_augmentations_batch(
             grid = torch.nn.functional.affine_grid(thetas, images.size(), align_corners=True)
             images = torch.nn.functional.grid_sample(images, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
             masks = torch.nn.functional.grid_sample(masks, grid, mode="nearest", padding_mode="zeros", align_corners=True)
-            if high_pass is not None:
-                high_pass = torch.nn.functional.grid_sample(high_pass, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
+            if residual_noise is not None:
+                residual_noise = torch.nn.functional.grid_sample(residual_noise, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
 
     # Color jitter (brightness/contrast) vectorized
     if cfg.enable_color_jitter:
@@ -794,10 +803,10 @@ def _apply_gpu_augmentations_batch(
             grid = torch.nn.functional.affine_grid(thetas, images.size(), align_corners=True)
             images = torch.nn.functional.grid_sample(images, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
             masks = torch.nn.functional.grid_sample(masks, grid, mode="nearest", padding_mode="zeros", align_corners=True)
-            if high_pass is not None:
-                high_pass = torch.nn.functional.grid_sample(high_pass, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
+            if residual_noise is not None:
+                residual_noise = torch.nn.functional.grid_sample(residual_noise, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
 
-    return images, masks, high_pass
+    return images, masks, residual_noise
 
 
 
@@ -885,36 +894,36 @@ def _collate_impl(
     masks: List[torch.Tensor] = []
     labels: List[torch.Tensor] = []
     datasets: List[str] = []
-    high_passes: List[torch.Tensor] = []
-    collect_high_pass = True
+    residual_noisees: List[torch.Tensor] = []
+    collect_residual_noise = True
 
     for sample in batch:
         image = sample["image"]
         mask = sample["mask"]
         label = sample["label"]
         dataset_name = str(sample["dataset"])
-        high_pass = sample.get("high_pass")
-        if high_pass is None:
-            collect_high_pass = False
+        residual_noise = sample.get("residual_noise")
+        if residual_noise is None:
+            collect_residual_noise = False
         aug_cfg = per_dataset_aug.get(dataset_name, AugmentationConfig(enable=False))
         views = aug_cfg.views_per_sample if (training and aug_cfg.enable) else 1
         views = max(1, views)
 
         base_image = image
         base_mask = mask
-        base_high_pass = high_pass
+        base_residual_noise = residual_noise
 
         for _ in range(views):
             view_image = base_image
             view_mask = base_mask
-            view_high_pass = base_high_pass
+            view_residual_noise = base_residual_noise
 
             if training and aug_cfg.enable:
-                view_image, view_mask, view_high_pass = _apply_gpu_augmentations(
+                view_image, view_mask, view_residual_noise = _apply_gpu_augmentations(
                     view_image,
                     view_mask,
                     aug_cfg,
-                    high_pass=view_high_pass,
+                    residual_noise=view_residual_noise,
                     generator=aug_generator,
                 )
 
@@ -929,8 +938,8 @@ def _collate_impl(
             masks.append(view_mask)
             labels.append(label)
             datasets.append(dataset_name)
-            if collect_high_pass and view_high_pass is not None:
-                high_passes.append(view_high_pass)
+            if collect_residual_noise and view_residual_noise is not None:
+                residual_noisees.append(view_residual_noise)
 
     # Reduce per-batch size variance: resize all images in the batch to the
     # median short-side to avoid excessive padding across widely varying sizes.
@@ -955,8 +964,8 @@ def _collate_impl(
                     masks[i] = torch.zeros((1, new_h, new_w), dtype=torch.float32, device=images[i].device)
                 else:
                     masks[i] = F.resize(masks[i], [new_h, new_w], interpolation=InterpolationMode.NEAREST)
-                if collect_high_pass and i < len(high_passes):
-                    high_passes[i] = F.resize(high_passes[i], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+                if collect_residual_noise and i < len(residual_noisees):
+                    residual_noisees[i] = F.resize(residual_noisees[i], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
 
     need_pad = any(s != images[0].shape for s in [img.shape for img in images])
 
@@ -992,16 +1001,16 @@ def _collate_impl(
         images = padded_images
         masks = padded_masks
 
-        if collect_high_pass and high_passes:
+        if collect_residual_noise and residual_noisees:
             padded_high: List[torch.Tensor] = []
-            for hp in high_passes:
+            for hp in residual_noisees:
                 hc, hh, hw = hp.shape
                 ph = max_h - hh
                 pw = max_w - hw
                 if ph or pw:
                     hp = NN_F.pad(hp, (0, pw, 0, ph), value=0)
                 padded_high.append(hp)
-            high_passes = padded_high
+            residual_noisees = padded_high
 
     batch_dict = {
         "images": torch.stack(images, dim=0),
@@ -1010,8 +1019,8 @@ def _collate_impl(
         "datasets": datasets,
     }
 
-    if collect_high_pass and high_passes:
-        batch_dict["high_pass"] = torch.stack(high_passes, dim=0)
+    if collect_residual_noise and residual_noisees:
+        batch_dict["residual_noise"] = torch.stack(residual_noisees, dim=0)
 
     return batch_dict
 
@@ -1219,3 +1228,4 @@ def create_dataloaders(
         loaders[split_name] = loader
 
     return loaders
+

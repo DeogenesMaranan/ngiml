@@ -1,9 +1,9 @@
-"""Configuration dataclasses for dataset preparation and loading."""
+﻿"""Configuration dataclasses for dataset preparation and loading."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import pandas as pd
 
@@ -44,7 +44,8 @@ class PreparationConfig:
     target_sizes: Sequence[int] = (384,)
     normalization_mode: str = "imagenet"
     tar_shard_size: int = 0  # 0 disables tar sharding; otherwise samples per shard
-    enable_high_pass: bool = True
+    enable_residual_noise: bool = True
+    resize_max_side: int = 768
 
     def target_size_set(self) -> set[int]:
         return {int(s) for s in self.target_sizes}
@@ -86,18 +87,28 @@ class SampleRecord:
     image_path: str
     mask_path: str | None
     label: int
-    high_pass_path: str | None = None
+    residual_noise_path: str | None = None
+    original_image_path: str | None = None
+    original_mask_path: str | None = None
+    metadata: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, object]:
         data = {
             "dataset": self.dataset,
             "split": self.split,
+            "path": self.image_path,
             "image_path": self.image_path,
             "mask_path": self.mask_path,
             "label": self.label,
         }
-        if self.high_pass_path:
-            data["high_pass_path"] = self.high_pass_path
+        if self.residual_noise_path:
+            data["residual_noise_path"] = self.residual_noise_path
+        if self.original_image_path is not None:
+            data["original_image_path"] = self.original_image_path
+        if self.original_mask_path is not None:
+            data["original_mask_path"] = self.original_mask_path
+        if self.metadata is not None:
+            data["metadata"] = self.metadata
         return data
 
     @staticmethod
@@ -105,10 +116,17 @@ class SampleRecord:
         return SampleRecord(
             dataset=str(data["dataset"]),
             split=str(data["split"]),
-            image_path=str(data["image_path"]),
+            image_path=str(data.get("image_path", data.get("path"))),
             mask_path=str(data.get("mask_path")) if data.get("mask_path") is not None else None,
             label=int(data["label"]),
-            high_pass_path=str(data["high_pass_path"]) if "high_pass_path" in data and data.get("high_pass_path") else None,
+            residual_noise_path=str(data["residual_noise_path"]) if "residual_noise_path" in data and data.get("residual_noise_path") else None,
+            original_image_path=(
+                str(data["original_image_path"]) if "original_image_path" in data and data.get("original_image_path") is not None else None
+            ),
+            original_mask_path=(
+                str(data["original_mask_path"]) if "original_mask_path" in data and data.get("original_mask_path") is not None else None
+            ),
+            metadata=(data.get("metadata") if isinstance(data.get("metadata"), dict) else None),
         )
 
 
@@ -148,11 +166,27 @@ class Manifest:
             SampleRecord(
                 dataset=str(row.dataset),
                 split=str(row.split),
-                image_path=str(row.image_path),
+                image_path=str(row.image_path) if hasattr(row, "image_path") else str(row.path),
                 mask_path=str(row.mask_path) if pd.notna(row.mask_path) else None,
                 label=int(row.label),
-                high_pass_path=str(row.high_pass_path) if hasattr(row, "high_pass_path") and pd.notna(row.high_pass_path) else None,
+                residual_noise_path=str(row.residual_noise_path) if hasattr(row, "residual_noise_path") and pd.notna(row.residual_noise_path) else None,
+                original_image_path=(
+                    str(row.original_image_path)
+                    if hasattr(row, "original_image_path") and pd.notna(row.original_image_path)
+                    else None
+                ),
+                original_mask_path=(
+                    str(row.original_mask_path)
+                    if hasattr(row, "original_mask_path") and pd.notna(row.original_mask_path)
+                    else None
+                ),
+                metadata=(
+                    row.metadata
+                    if hasattr(row, "metadata") and isinstance(row.metadata, dict)
+                    else None
+                ),
             )
             for row in df.itertuples(index=False)
         ]
         return Manifest(samples=samples, normalization_mode=norm_mode)
+
