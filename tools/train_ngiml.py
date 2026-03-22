@@ -2471,12 +2471,16 @@ def run_training(cfg: TrainConfig) -> None:
             iou_improved = val_iou > (best_val_iou + cfg.early_stopping_min_delta)
             f1_improved = val_f1 > (best_val_f1 + cfg.early_stopping_min_delta)
             loss_improved = val_loss < (best_val_loss - cfg.early_stopping_min_delta)
-            # Save best iou checkpoint as before
             if iou_improved:
                 best_val_iou = val_iou
-                best_iou_path = checkpoint_dir / "best_iou_checkpoint.pt"
+            if f1_improved:
+                best_val_f1 = val_f1
+
+            overlap_improved = iou_improved or f1_improved
+            if overlap_improved:
+                best_f1_iou_path = checkpoint_dir / "best_f1_iou_checkpoint.pt"
                 save_checkpoint(
-                    best_iou_path,
+                    best_f1_iou_path,
                     model,
                     optimizer,
                     scaler,
@@ -2487,29 +2491,10 @@ def run_training(cfg: TrainConfig) -> None:
                     ema_model=ema_model,
                     use_ema_for_model_state=(ema_model is not None),
                 )
-                print(f"New best val iou {best_val_iou:.4f}; saved to {best_iou_path}")
-                # If IoU is the early-stopping monitor, also save a best-F1 checkpoint
-                try:
-                    monitor_name = str(cfg.early_stopping_monitor).strip().lower()
-                except Exception:
-                    monitor_name = ""
-                if monitor_name == "iou":
-                    if val_f1 is not None and val_f1 > best_val_f1:
-                        best_val_f1 = val_f1
-                        best_f1_path = checkpoint_dir / "best_f1_checkpoint.pt"
-                        save_checkpoint(
-                            best_f1_path,
-                            model,
-                            optimizer,
-                            scaler,
-                            epoch + 1,
-                            global_step,
-                            cfg,
-                            scheduler=scheduler,
-                            ema_model=ema_model,
-                            use_ema_for_model_state=(ema_model is not None),
-                        )
-                        print(f"New best val f1 {best_val_f1:.4f}; saved to {best_f1_path}")
+                print(
+                    f"New best overlap metrics | iou {best_val_iou:.4f} | f1 {best_val_f1:.4f}; "
+                    f"saved to {best_f1_iou_path}"
+                )
 
             # Use the configured early-stopping monitor to determine when to reset patience
             monitor_value = _metric_for_monitor(metrics, cfg.early_stopping_monitor)
@@ -2522,8 +2507,9 @@ def run_training(cfg: TrainConfig) -> None:
 
             if loss_improved:
                 best_val_loss = val_loss
-                configured_monitor = str(getattr(cfg, "early_stopping_monitor", "loss")).strip().lower()
-                monitor_for_metadata = configured_monitor if configured_monitor in metrics else "loss"
+
+            if monitor_improved:
+                monitor_for_metadata = str(getattr(cfg, "early_stopping_monitor", "loss")).strip().lower()
                 monitor_value_for_metadata = _metric_for_monitor(metrics, monitor_for_metadata)
                 best_alias_path = checkpoint_dir / "best_checkpoint.pt"
                 save_checkpoint(
@@ -2560,14 +2546,13 @@ def run_training(cfg: TrainConfig) -> None:
                     },
                 )
                 print(
-                    f"New best val loss {val_loss:.4f}; "
+                    f"New best {monitor_for_metadata} {monitor_value_for_metadata:.4f}; "
                     f"saved to {best_alias_path} (threshold metadata: {best_threshold_path})"
                 )
 
             if monitor_improved:
                 # Update recorded bests and reset patience
                 best_monitor_value = monitor_value
-                best_val_f1 = val_f1
                 no_improve_epochs = 0
                 print(f"New best {cfg.early_stopping_monitor} {monitor_value:.4f}")
             else:
