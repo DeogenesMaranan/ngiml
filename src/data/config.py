@@ -17,8 +17,6 @@ class DatasetStructureConfig:
     mask_subdir: str
     mask_suffix: str
     prepared_root: str
-    edge_mask_subdir: str | None = None
-    edge_mask_suffix: str | None = None
     sample_limit: int = 0  # 0 means use all
 
     def root(self) -> Path:
@@ -89,7 +87,6 @@ class SampleRecord:
     mask_path: str | None
     label: int
     high_pass_path: str | None = None
-    edge_mask_path: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         data = {
@@ -101,8 +98,6 @@ class SampleRecord:
         }
         if self.high_pass_path:
             data["high_pass_path"] = self.high_pass_path
-        if self.edge_mask_path:
-            data["edge_mask_path"] = self.edge_mask_path
         return data
 
     @staticmethod
@@ -114,7 +109,6 @@ class SampleRecord:
             mask_path=str(data.get("mask_path")) if data.get("mask_path") is not None else None,
             label=int(data["label"]),
             high_pass_path=str(data["high_pass_path"]) if "high_pass_path" in data and data.get("high_pass_path") else None,
-            edge_mask_path=str(data["edge_mask_path"]) if "edge_mask_path" in data and data.get("edge_mask_path") else None,
         )
 
 
@@ -158,7 +152,6 @@ class Manifest:
                 mask_path=str(row.mask_path) if pd.notna(row.mask_path) else None,
                 label=int(row.label),
                 high_pass_path=str(row.high_pass_path) if hasattr(row, "high_pass_path") and pd.notna(row.high_pass_path) else None,
-                edge_mask_path=str(row.edge_mask_path) if hasattr(row, "edge_mask_path") and pd.notna(row.edge_mask_path) else None,
             )
             for row in df.itertuples(index=False)
         ]

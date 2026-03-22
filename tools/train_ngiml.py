@@ -1239,13 +1239,12 @@ def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
             param.requires_grad = bool(trainable)
 
 
-def _sample_has_mask_high_pass_edge(record) -> tuple[bool, bool, bool]:
+def _sample_has_mask_high_pass(record) -> tuple[bool, bool]:
     has_mask = bool(record.mask_path)
     has_high_pass = bool(record.high_pass_path)
-    has_edge_mask = bool(getattr(record, "edge_mask_path", None))
     image_path = str(record.image_path)
     if not image_path.endswith(".npz"):
-        return has_mask, has_high_pass, has_edge_mask
+        return has_mask, has_high_pass
 
     try:
         if "::" in image_path:
@@ -1257,16 +1256,14 @@ def _sample_has_mask_high_pass_edge(record) -> tuple[bool, bool, bool]:
                 with np.load(io.BytesIO(member.read()), allow_pickle=False) as npz_data:
                     has_mask = has_mask or ("mask" in npz_data and npz_data["mask"].size > 0)
                     has_high_pass = has_high_pass or ("high_pass" in npz_data and npz_data["high_pass"].size > 0)
-                    has_edge_mask = has_edge_mask or ("edge_mask" in npz_data and npz_data["edge_mask"].size > 0)
         else:
             with np.load(image_path, allow_pickle=False) as npz_data:
                 has_mask = has_mask or ("mask" in npz_data and npz_data["mask"].size > 0)
                 has_high_pass = has_high_pass or ("high_pass" in npz_data and npz_data["high_pass"].size > 0)
-                has_edge_mask = has_edge_mask or ("edge_mask" in npz_data and npz_data["edge_mask"].size > 0)
     except Exception as exc:
         raise ValueError(f"Failed to inspect NPZ sample for mask/high_pass fields: {image_path}") from exc
 
-    return has_mask, has_high_pass, has_edge_mask
+    return has_mask, has_high_pass
 
 
 def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
@@ -1280,7 +1277,6 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
     fake_count = 0
     mask_count = 0
     high_pass_count = 0
-    edge_mask_count = 0
 
     for sample in train_samples:
         per_dataset_counts[sample.dataset] = per_dataset_counts.get(sample.dataset, 0) + 1
@@ -1292,13 +1288,11 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
         else:
             raise ValueError(f"Unexpected train label {label} for sample: {sample.image_path}")
 
-        has_mask, has_high_pass, has_edge_mask = _sample_has_mask_high_pass_edge(sample)
+        has_mask, has_high_pass = _sample_has_mask_high_pass(sample)
         if has_mask:
             mask_count += 1
         if has_high_pass:
             high_pass_count += 1
-        if has_edge_mask:
-            edge_mask_count += 1
 
     total = len(train_samples)
     print("Train dataset integrity summary")
@@ -1316,8 +1310,7 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
     print(
         "  Coverage: "
         f"masks={100.0 * (mask_count / max(total, 1)):.1f}% "
-        f"high_pass={100.0 * (high_pass_count / max(total, 1)):.1f}% "
-        f"edge_masks={100.0 * (edge_mask_count / max(total, 1)):.1f}%"
+        f"high_pass={100.0 * (high_pass_count / max(total, 1)):.1f}%"
     )
 
     if fake_count <= 0:
@@ -1811,16 +1804,10 @@ def train_one_epoch(
         batch_start = time.perf_counter()
         images = batch["images"]
         masks = batch["masks"]
-        edge_masks = batch.get("edge_masks")
-        edge_mask_present = batch.get("edge_mask_present")
         if images.device != device:
             images = images.to(device, non_blocking=True)
         if masks.device != device:
             masks = masks.to(device, non_blocking=True)
-        if isinstance(edge_masks, torch.Tensor) and edge_masks.device != device:
-            edge_masks = edge_masks.to(device, non_blocking=True)
-        if isinstance(edge_mask_present, torch.Tensor) and edge_mask_present.device != device:
-            edge_mask_present = edge_mask_present.to(device, non_blocking=True)
         high_pass = batch.get("high_pass")
         if isinstance(high_pass, torch.Tensor):
             if high_pass.device != device:
@@ -1871,17 +1858,15 @@ def train_one_epoch(
                     # Slice the batch and apply batched augmentations
                     img_slice = images[idxs]
                     mask_slice = masks[idxs]
-                    edge_mask_slice = edge_masks[idxs] if isinstance(edge_masks, torch.Tensor) else None
                     hp_slice = None
                     if high_pass is not None:
                         hp_slice = high_pass[idxs]
 
-                    img_out, mask_out, hp_out, edge_mask_out = _apply_gpu_augmentations_batch(
+                    img_out, mask_out, hp_out = _apply_gpu_augmentations_batch(
                         img_slice,
                         mask_slice,
                         aug_cfg,
                         high_pass=hp_slice,
-                        edge_masks=edge_mask_slice,
                         generator=gen,
                     )
 
@@ -1895,8 +1880,6 @@ def train_one_epoch(
                     masks[idxs] = mask_out
                     if hp_out is not None and high_pass is not None:
                         high_pass[idxs] = hp_out
-                    if edge_mask_out is not None and isinstance(edge_masks, torch.Tensor):
-                        edge_masks[idxs] = edge_mask_out
             aug_end = time.perf_counter()
         else:
             aug_end = None
@@ -1916,12 +1899,12 @@ def train_one_epoch(
             forward_start = time.perf_counter()
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
-                loss = loss_fn(preds, masks, edge_target=edge_masks, edge_target_present=edge_mask_present)
+                loss = loss_fn(preds, masks)
             forward_end = time.perf_counter()
         else:
             forward_start = time.perf_counter()
             preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
-            loss = loss_fn(preds, masks, edge_target=edge_masks, edge_target_present=edge_mask_present)
+            loss = loss_fn(preds, masks)
             forward_end = time.perf_counter()
 
         if cfg.hard_mining_enabled and epoch >= int(max(0, cfg.hard_mining_start_epoch)):
@@ -2083,16 +2066,6 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
     for batch in progress:
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
-        edge_masks = batch.get("edge_masks")
-        if isinstance(edge_masks, torch.Tensor):
-            edge_masks = edge_masks.to(device, non_blocking=True)
-        else:
-            edge_masks = None
-        edge_mask_present = batch.get("edge_mask_present")
-        if isinstance(edge_mask_present, torch.Tensor):
-            edge_mask_present = edge_mask_present.to(device, non_blocking=True)
-        else:
-            edge_mask_present = None
         high_pass = batch.get("high_pass")
         if isinstance(high_pass, torch.Tensor):
             high_pass = high_pass.to(device, non_blocking=True)
@@ -2114,10 +2087,10 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         if amp_dtype is not None:
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
-                loss = loss_fn(preds, masks, edge_target=edge_masks, edge_target_present=edge_mask_present)
+                loss = loss_fn(preds, masks)
         else:
             preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
-            loss = loss_fn(preds, masks, edge_target=edge_masks, edge_target_present=edge_mask_present)
+            loss = loss_fn(preds, masks)
         logits = _select_pred_head(preds, cfg.final_pred_stage)
 
         with torch.no_grad():

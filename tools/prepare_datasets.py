@@ -52,34 +52,6 @@ def _compute_high_pass(image_np: np.ndarray) -> np.ndarray:
     return hp_uint8
 
 
-def _compute_edge_mask(mask_np: np.ndarray) -> np.ndarray:
-    """Compute a thin binary edge map from a single-channel mask."""
-    if mask_np.ndim != 2:
-        raise ValueError(f"Expected grayscale mask HxW, got shape {mask_np.shape}")
-
-    mask_bin = (mask_np > 127).astype(np.uint8, copy=False)
-    if not np.any(mask_bin):
-        return np.zeros_like(mask_np, dtype=np.uint8)
-
-    padded = np.pad(mask_bin, ((1, 1), (1, 1)), mode="edge")
-    center = padded[1:-1, 1:-1]
-    neighbors = (
-        padded[:-2, 1:-1],
-        padded[2:, 1:-1],
-        padded[1:-1, :-2],
-        padded[1:-1, 2:],
-        padded[:-2, :-2],
-        padded[:-2, 2:],
-        padded[2:, :-2],
-        padded[2:, 2:],
-    )
-    eroded = center.copy()
-    for neighbor in neighbors:
-        np.bitwise_and(eroded, neighbor, out=eroded)
-    edge = np.bitwise_and(center, np.uint8(1) - eroded)
-    return edge * np.uint8(255)
-
-
 class TarShardWriter:
     """Utility to write NPZ payloads into sequential tar shards."""
 
@@ -186,10 +158,8 @@ def _split_records(records: Sequence[SampleRecord], split_cfg: SplitConfig) -> D
 def _build_npz_bytes(
     image_path: Path,
     mask_path: Path | None,
-    edge_mask_path: Path | None,
     target_size: int,
     include_high_pass: bool = True,
-    compute_edge_mask: bool = False,
 ) -> bytes:
     image = Image.open(image_path).convert("RGB")
     if image_path.suffix.lower() not in {".jpg", ".jpeg"}:
@@ -199,30 +169,16 @@ def _build_npz_bytes(
         image = Image.open(buf_jpg).convert("RGB")
 
     mask_img = Image.open(mask_path).convert("L") if mask_path is not None else None
-    edge_mask_img = Image.open(edge_mask_path).convert("L") if edge_mask_path is not None else None
-
     if target_size > 0:
         image = image.resize((target_size, target_size), Image.BILINEAR)
         if mask_img is not None:
             mask_img = mask_img.resize((target_size, target_size), Image.NEAREST)
-        if edge_mask_img is not None:
-            edge_mask_img = edge_mask_img.resize((target_size, target_size), Image.NEAREST)
 
     image_np = np.asarray(image, dtype=np.uint8)
     payload = {"image": image_np}
     if mask_img is not None:
         mask_np = np.asarray(mask_img, dtype=np.uint8)
         payload["mask"] = mask_np
-    else:
-        mask_np = None
-    if edge_mask_img is None and compute_edge_mask and mask_np is not None:
-        edge_mask_np = _compute_edge_mask(mask_np)
-    elif edge_mask_img is not None:
-        edge_mask_np = np.asarray(edge_mask_img, dtype=np.uint8)
-    else:
-        edge_mask_np = None
-    if edge_mask_np is not None:
-        payload["edge_mask"] = edge_mask_np
     if include_high_pass:
         payload["high_pass"] = _compute_high_pass(image_np)
 
@@ -244,7 +200,6 @@ def prepare_single_dataset(
     real_dir = root / cfg.real_subdir
     fake_dir = root / cfg.fake_subdir
     mask_dir = root / cfg.mask_subdir
-    edge_mask_dir = root / cfg.edge_mask_subdir if cfg.edge_mask_subdir else mask_dir
 
     real_images = _discover_images(real_dir) if real_dir.exists() else []
     fake_images = _discover_images(fake_dir) if fake_dir.exists() else []
@@ -267,9 +222,6 @@ def prepare_single_dataset(
         if mask_path is None:
             print(f"Skipping fake image without mask: {fake_img}", file=sys.stderr)
             continue
-        edge_mask_path = None
-        if cfg.edge_mask_suffix:
-            edge_mask_path = _find_mask(fake_img, edge_mask_dir, cfg.edge_mask_suffix)
         records.append(
             SampleRecord(
                 dataset=cfg.dataset_name,
@@ -277,7 +229,6 @@ def prepare_single_dataset(
                 image_path=str(fake_img),
                 mask_path=str(mask_path),
                 label=1,
-                edge_mask_path=str(edge_mask_path) if edge_mask_path is not None else None,
             )
         )
 
@@ -302,14 +253,11 @@ def prepare_single_dataset(
         for idx, rec in enumerate(tqdm(split_records, desc=f"{cfg.dataset_name} {split_name}", leave=False)):
             image_path = Path(rec.image_path)
             mask_path = Path(rec.mask_path) if rec.mask_path is not None else None
-            edge_mask_path = Path(rec.edge_mask_path) if rec.edge_mask_path is not None else None
             npz_bytes = _build_npz_bytes(
                 image_path=image_path,
                 mask_path=mask_path,
-                edge_mask_path=edge_mask_path,
                 target_size=target_size,
                 include_high_pass=prep_cfg.enable_high_pass,
-                compute_edge_mask=(split_name == "train"),
             )
 
             stem = f"{cfg.dataset_name}_{split_name}_{'fake' if rec.label else 'real'}_{idx:06d}"
@@ -331,7 +279,6 @@ def prepare_single_dataset(
                     mask_path=None,
                     label=rec.label,
                     high_pass_path=None,
-                    edge_mask_path=None,
                 )
             )
 
