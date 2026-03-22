@@ -35,7 +35,7 @@ def test_loss_defaults_are_stable_overlap_core(monkeypatch):
     assert cfg.tversky_weight == 0.0
     assert cfg.tversky_beta == 0.8
     assert cfg.lovasz_weight == 0.0
-    assert cfg.use_boundary_loss is False
+    assert cfg.use_boundary_loss is True
     assert cfg.boundary_weight == 0.05
 
 
@@ -52,15 +52,7 @@ def test_overlap_focused_threshold_and_mining_defaults(monkeypatch):
     assert cfg.hard_mining_weight == 0.03
 
 
-def test_final_pred_stage_ablation_cli_defaults(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["train_ngiml.py", "--manifest", "dummy_manifest.json"])
+def test_boundary_loss_cli_toggle(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["train_ngiml.py", "--manifest", "dummy_manifest.json", "--no-use-boundary-loss"])
     cfg = parse_args()
-    assert cfg.final_pred_stage == -1
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["train_ngiml.py", "--manifest", "dummy_manifest.json", "--final-pred-stage", "0"],
-    )
-    cfg_stage0 = parse_args()
-    assert cfg_stage0.final_pred_stage == 0
+    assert cfg.use_boundary_loss is False

@@ -209,7 +209,6 @@ def run() -> None:
         threshold = float(info.get("default_threshold", 0.5))
         max_short_side = int(info.get("max_short_side", 0) or 0)
         max_short_side_source = str(info.get("max_short_side_source", "checkpoint"))
-        final_pred_stage = int(info.get("final_pred_stage", -1))
 
         prep_target_size = None
         if args.train_preprocess:
@@ -241,7 +240,6 @@ def run() -> None:
             "threshold_source": str(info.get("threshold_source", "unknown")),
             "max_short_side": max_short_side,
             "max_short_side_source": max_short_side_source,
-            "final_pred_stage": final_pred_stage,
             "train_preprocess": bool(args.train_preprocess),
             "train_preprocess_target_size": None if prep_target_size is None else int(prep_target_size),
             "normalization_mode": normalization_mode,
@@ -253,10 +251,6 @@ def run() -> None:
             "images": [],
         }
 
-        print(
-            "  using final_pred_stage",
-            f"{final_pred_stage} (0-based, -1 = last stage)",
-        )
         if args.train_preprocess:
             print(f"  using train preprocess target size: {prep_target_size}x{prep_target_size}")
 

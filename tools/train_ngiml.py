@@ -197,7 +197,6 @@ class TrainConfig:
     early_stopping_patience: int = 3
     early_stopping_min_delta: float = 5e-4
     early_stopping_monitor: str = "loss"
-    final_pred_stage: int = -1
     metric_threshold: float = 0.5
     optimize_threshold: bool = True
     threshold_metric: str = "f1"
@@ -482,12 +481,6 @@ def parse_args() -> TrainConfig:
         choices=["loss", "iou", "f1", "recall", "precision", "accuracy"],
         help="Validation metric used for early stopping and best checkpoint",
     )
-    parser.add_argument(
-        "--final-pred-stage",
-        type=int,
-        default=-1,
-        help="Prediction stage used as final output for metrics and scoring (0=highest resolution, -1=last stage)",
-    )
     parser.add_argument("--metric-threshold", type=float, default=0.5, help="Fixed threshold for sigmoid outputs when threshold optimization is disabled")
     parser.add_argument("--optimize-threshold", action=argparse.BooleanOptionalAction, default=True, help="Search validation thresholds and use the best for metric reporting")
     parser.add_argument("--threshold-metric", type=str, default="f1", choices=["iou", "f1"], help="Metric used to select best threshold")
@@ -527,7 +520,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--tversky-alpha", type=float, default=0.3, help="Tversky alpha (FP penalty)")
     parser.add_argument("--tversky-beta", type=float, default=0.8, help="Tversky beta (FN penalty)")
     parser.add_argument("--lovasz-weight", type=float, default=0.0, help="Lovasz Hinge Loss weight for IoU optimization")
-    parser.add_argument("--use-boundary-loss", action=argparse.BooleanOptionalAction, default=False, help="Enable Sobel boundary loss on final prediction")
+    parser.add_argument("--use-boundary-loss", action=argparse.BooleanOptionalAction, default=True, help="Enable Sobel boundary loss on final prediction")
     parser.add_argument("--boundary-weight", type=float, default=0.05, help="Boundary loss weight when --use-boundary-loss is enabled")
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=True, help="Use EMA weights for validation and best checkpoints")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay factor")
@@ -581,7 +574,6 @@ def parse_args() -> TrainConfig:
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
         early_stopping_monitor=args.early_stopping_monitor,
-        final_pred_stage=int(args.final_pred_stage),
         metric_threshold=args.metric_threshold,
         optimize_threshold=args.optimize_threshold,
         threshold_metric=args.threshold_metric,
@@ -904,21 +896,11 @@ def _segmentation_counts(logits: torch.Tensor, target: torch.Tensor, threshold: 
     return {"tp": float(tp), "tn": float(tn), "fp": float(fp), "fn": float(fn)}
 
 
-def _select_pred_head(preds: Sequence[torch.Tensor], stage_index: int) -> torch.Tensor:
+def _select_pred_head(preds: Sequence[torch.Tensor]) -> torch.Tensor:
     if not preds:
         raise ValueError("Model returned empty predictions list")
-
-    num_stages = len(preds)
-    idx = int(stage_index)
-    if idx < 0:
-        idx = num_stages + idx
-
-    if idx < 0 or idx >= num_stages:
-        raise ValueError(
-            f"final_pred_stage {stage_index} is out of range for {num_stages} prediction stages"
-        )
-
-    return preds[idx]
+    # Highest-resolution decoder output is index 0 by contract.
+    return preds[0]
 
 
 def _metrics_from_counts(tp: float, tn: float, fp: float, fn: float, eps: float = 1e-6) -> Dict[str, float]:
@@ -1908,7 +1890,7 @@ def train_one_epoch(
             forward_end = time.perf_counter()
 
         if cfg.hard_mining_enabled and epoch >= int(max(0, cfg.hard_mining_start_epoch)):
-            final_logits = _select_pred_head(preds, cfg.final_pred_stage)
+            final_logits = _select_pred_head(preds)
             if final_logits.shape[-2:] != masks.shape[-2:]:
                 final_logits = torch.nn.functional.interpolate(
                     final_logits,
@@ -2006,7 +1988,7 @@ def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: T
                 preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
         else:
             preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
-        logits = _select_pred_head(preds, cfg.final_pred_stage)
+        logits = _select_pred_head(preds)
 
         for threshold in thresholds:
             counts = _segmentation_counts(logits, masks, threshold=threshold)
@@ -2091,7 +2073,7 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         else:
             preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
             loss = loss_fn(preds, masks)
-        logits = _select_pred_head(preds, cfg.final_pred_stage)
+        logits = _select_pred_head(preds)
 
         with torch.no_grad():
             fg_ratio = masks.float().mean(dim=(1, 2, 3))
