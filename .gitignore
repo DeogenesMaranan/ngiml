@@ -212,3 +212,4 @@ prepared/*
 checkpoints/*
 samples/*
 inference_outputs/*
+temp/*

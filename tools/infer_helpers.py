@@ -560,20 +560,41 @@ def predict_binary_map(
     return (prob >= float(threshold)).float()
 
 
+def _center_square_crop(tensor: torch.Tensor) -> torch.Tensor:
+    h, w = tensor.shape[-2:]
+    if h == w:
+        return tensor
+    side = min(h, w)
+    top = (h - side) // 2
+    left = (w - side) // 2
+    return tensor[..., top : top + side, left : left + side]
+
+
 def infer_from_image_path(
     model: HybridNGIML,
     image_path: Path,
     device: torch.device,
     normalization_mode: str = "zero_one",
     max_short_side: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    image = _load_image(str(Path(image_path).as_posix())).float()
-    if image.max() > 1.0:
-        image = image / 255.0
+    crop_square: bool = False,
+    prep_target_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    orig_image = _load_image(str(Path(image_path).as_posix())).float()
+    if orig_image.max() > 1.0:
+        orig_image = orig_image / 255.0
+
+    image = orig_image
+    if crop_square:
+        image = _center_square_crop(image)
+
     high_pass = _compute_high_pass_fallback(image)
-    image, _, high_pass = resize_for_inference(image, mask=None, high_pass=high_pass, max_short_side=max_short_side)
+    if prep_target_size is not None and prep_target_size > 0:
+        image = TVF.resize(image, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
+        high_pass = TVF.resize(high_pass, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
+    else:
+        image, _, high_pass = resize_for_inference(image, mask=None, high_pass=high_pass, max_short_side=max_short_side)
     pred = predict_probability_map(model, image, device, normalization_mode=normalization_mode, high_pass=high_pass)
-    return image, pred
+    return image, pred, orig_image
 
 
 def multiscale_infer_from_image_path(
@@ -584,12 +605,22 @@ def multiscale_infer_from_image_path(
     max_short_side: int | None = None,
     scales: Sequence[float] = (1.0,),
     merge_mode: str = "mean",
-) -> tuple[torch.Tensor, torch.Tensor | None, list[tuple[float, torch.Tensor]]]:
-    image = _load_image(str(Path(image_path).as_posix())).float()
-    if image.max() > 1.0:
-        image = image / 255.0
+    crop_square: bool = False,
+    prep_target_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, list[tuple[float, torch.Tensor]], torch.Tensor]:
+    orig_image = _load_image(str(Path(image_path).as_posix())).float()
+    if orig_image.max() > 1.0:
+        orig_image = orig_image / 255.0
+
+    image = orig_image
+    if crop_square:
+        image = _center_square_crop(image)
     high_pass = _compute_high_pass_fallback(image)
-    image, _, high_pass = resize_for_inference(image, mask=None, high_pass=high_pass, max_short_side=max_short_side)
+    if prep_target_size is not None and prep_target_size > 0:
+        image = TVF.resize(image, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
+        high_pass = TVF.resize(high_pass, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
+    else:
+        image, _, high_pass = resize_for_inference(image, mask=None, high_pass=high_pass, max_short_side=max_short_side)
 
     base_h, base_w = image.shape[-2:]
     merge = None if merge_mode is None else ("max" if str(merge_mode).lower() == "max" else "mean")
@@ -646,7 +677,7 @@ def multiscale_infer_from_image_path(
         elif merge != "max":
             merged = merged / float(count or len(cleaned_scales))
 
-    return image, merged, scale_outputs
+    return image, merged, scale_outputs, orig_image
 
 
 def get_model_complexity_stats(

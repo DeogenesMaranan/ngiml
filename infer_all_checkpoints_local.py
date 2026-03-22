@@ -82,6 +82,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable merged multi-scale output; save each scale separately only.",
     )
+    parser.add_argument(
+        "--crop-square",
+        action="store_true",
+        help="Center-crop inputs to square before inference.",
+    )
+    parser.add_argument(
+        "--overlay-on-original",
+        action="store_true",
+        help="Project masks back to the original image size and draw overlays on the original image instead of the resized tensor.",
+    )
+    parser.add_argument(
+        "--train-preprocess",
+        action="store_true",
+        help=(
+            "Resize inputs to the training dataprep target size (square) before inference, "
+            "matching prepare_datasets.py behavior instead of max-short-side scaling."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -191,6 +209,19 @@ def run() -> None:
         threshold = float(info.get("default_threshold", 0.5))
         max_short_side = int(info.get("max_short_side", 0) or 0)
         max_short_side_source = str(info.get("max_short_side_source", "checkpoint"))
+        final_pred_stage = int(info.get("final_pred_stage", -1))
+
+        prep_target_size = None
+        if args.train_preprocess:
+            prep_target_size = int(
+                _read_train_config_field(ckpt_path, "prep_target_size", 0)
+                or getattr(getattr(model, "cfg", None), "swin", None).input_size
+                if getattr(getattr(model, "cfg", None), "swin", None) is not None
+                else 0
+            )
+            if prep_target_size <= 0:
+                prep_target_size = 384
+            max_short_side_source = "train_preprocess"
 
         if args.full_res:
             max_short_side = 0
@@ -210,17 +241,28 @@ def run() -> None:
             "threshold_source": str(info.get("threshold_source", "unknown")),
             "max_short_side": max_short_side,
             "max_short_side_source": max_short_side_source,
-            "final_pred_stage": int(info.get("final_pred_stage", -1)),
+            "final_pred_stage": final_pred_stage,
+            "train_preprocess": bool(args.train_preprocess),
+            "train_preprocess_target_size": None if prep_target_size is None else int(prep_target_size),
             "normalization_mode": normalization_mode,
             "multi_scale_enabled": use_multiscale,
             "multi_scale_scales": scales,
             "multi_scale_merge": merge_mode,
+            "crop_square": bool(args.crop_square),
+            "overlay_on_original": bool(args.overlay_on_original),
             "images": [],
         }
 
+        print(
+            "  using final_pred_stage",
+            f"{final_pred_stage} (0-based, -1 = last stage)",
+        )
+        if args.train_preprocess:
+            print(f"  using train preprocess target size: {prep_target_size}x{prep_target_size}")
+
         for image_path in sample_images:
             if use_multiscale:
-                image_tensor, prob_map, scale_maps = multiscale_infer_from_image_path(
+                image_tensor, prob_map, scale_maps, orig_image = multiscale_infer_from_image_path(
                     model,
                     image_path=image_path,
                     device=device,
@@ -228,14 +270,18 @@ def run() -> None:
                     max_short_side=max_short_side,
                     scales=scales,
                     merge_mode=merge_mode,
+                    crop_square=args.crop_square,
+                    prep_target_size=prep_target_size,
                 )
             else:
-                image_tensor, prob_map = infer_from_image_path(
+                image_tensor, prob_map, orig_image = infer_from_image_path(
                     model,
                     image_path=image_path,
                     device=device,
                     normalization_mode=normalization_mode,
                     max_short_side=max_short_side,
+                    crop_square=args.crop_square,
+                    prep_target_size=prep_target_size,
                 )
                 scale_maps = [(1.0, prob_map)]
             rel_parent = image_path.parent.relative_to(samples_dir)
@@ -244,8 +290,10 @@ def run() -> None:
             per_scale_outputs = []
             merged_paths: dict[str, str] | None = None
 
+            orig_h, orig_w = orig_image.shape[-2:]
+
             if merge_mode is not None and prob_map is not None:
-                # Save merged output (existing behavior)
+                # Save merged output
                 prob_np = prob_map.numpy().astype(np.float32)
                 bin_np = (prob_np >= threshold).astype(np.uint8)
 
@@ -258,7 +306,14 @@ def run() -> None:
 
                 _save_mask_png(prob_img, prob_out)
                 _save_mask_png(bin_img, bin_out)
-                _save_overlay_png(image_tensor, bin_np, overlay_out)
+
+                if args.overlay_on_original:
+                    # Upsample mask back to original spatial size for overlay
+                    bin_up = torch.from_numpy(bin_np).unsqueeze(0).unsqueeze(0)
+                    bin_up = torch.nn.functional.interpolate(bin_up.float(), size=(orig_h, orig_w), mode="nearest")[0, 0]
+                    _save_overlay_png(orig_image, bin_up.numpy().astype(np.uint8), overlay_out)
+                else:
+                    _save_overlay_png(image_tensor, bin_np, overlay_out)
 
                 merged_paths = {
                     "probability_map": str(prob_out),
@@ -279,7 +334,12 @@ def run() -> None:
 
                 _save_mask_png(s_prob_img, s_prob_out)
                 _save_mask_png(s_bin_img, s_bin_out)
-                _save_overlay_png(image_tensor, scale_bin, s_overlay_out)
+                if args.overlay_on_original:
+                    s_bin_up = torch.from_numpy(scale_bin).unsqueeze(0).unsqueeze(0)
+                    s_bin_up = torch.nn.functional.interpolate(s_bin_up.float(), size=(orig_h, orig_w), mode="nearest")[0, 0]
+                    _save_overlay_png(orig_image, s_bin_up.numpy().astype(np.uint8), s_overlay_out)
+                else:
+                    _save_overlay_png(image_tensor, scale_bin, s_overlay_out)
 
                 per_scale_outputs.append(
                     {
