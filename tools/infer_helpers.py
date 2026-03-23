@@ -1121,7 +1121,7 @@ def plot_multi_strategy_inference(
 
 def get_model_complexity_stats(
     model: HybridNGIML,
-    input_size: tuple[int, int, int, int] = (1, 3, 384, 384),
+    input_size: tuple[int, int, int, int] = (1, 3, 448, 448),
 ) -> dict[str, object]:
     total_params = sum(parameter.numel() for parameter in model.parameters())
     trainable_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)

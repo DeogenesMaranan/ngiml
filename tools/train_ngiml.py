@@ -261,7 +261,7 @@ def build_default_components() -> tuple[HybridNGIMLConfig, MultiStageLossConfig,
 
     model_cfg = HybridNGIMLConfig(
         efficientnet=EfficientNetBackboneConfig(pretrained=True),
-        swin=SwinBackboneConfig(model_name="swin_tiny_patch4_window7_224", pretrained=True, input_size=384),
+        swin=SwinBackboneConfig(model_name="swin_tiny_patch4_window7_224", pretrained=True, input_size=448),
         residual=ResidualNoiseConfig(num_kernels=3, base_channels=32, num_stages=4),
         fusion=FeatureFusionConfig(fusion_channels=(64, 128, 192, 256)),
         decoder=UNetDecoderConfig(decoder_channels=None, out_channels=1, per_stage_heads=True),
@@ -467,7 +467,7 @@ def parse_args() -> TrainConfig:
         help="Reuse existing local cached manifest when available to shorten startup",
     )
     parser.add_argument("--views-per-sample", type=int, default=2, help="Number of augmented views per sample (on-the-fly)")
-    parser.add_argument("--resize-max-side", type=int, default=384, help="Cap image short side before batching (lower is faster)")
+    parser.add_argument("--resize-max-side", type=int, default=448, help="Cap image short side before batching (lower is faster)")
     parser.add_argument("--max-rotation-degrees", type=float, default=0.0, help="Random rotation range (+/-)")
     parser.add_argument("--noise-std-max", type=float, default=0.01, help="Max Gaussian noise std")
     parser.add_argument("--disable-aug", action="store_true", help="Disable GPU augmentations")

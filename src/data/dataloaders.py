@@ -1134,7 +1134,7 @@ def create_dataloaders(
                         ss = None
                     probed_count += 1
                 if ss is None:
-                    ss = int(resize_max_side) if resize_max_side is not None else 384
+                    ss = int(resize_max_side) if resize_max_side is not None else 448
                 combined_short_sides.append(int(ss))
 
         if not datasets:
