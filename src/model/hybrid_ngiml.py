@@ -1,4 +1,4 @@
-"""Hybrid NGIML model that fuses CNN, Transformer, and noise cues."""
+﻿"""Hybrid NGIML model that fuses CNN, Transformer, and noise cues."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -151,10 +151,10 @@ class HybridNGIML(nn.Module):
             if self.residual_attention_proj.bias is not None:
                 nn.init.zeros_(self.residual_attention_proj.bias)
 
-    def _extract_features(self, x: Tensor, high_pass: Tensor | None = None) -> Dict[str, Optional[List[Tensor] | Tensor]]:
+    def _extract_features(self, x: Tensor, residual_noise: Tensor | None = None) -> Dict[str, Optional[List[Tensor] | Tensor]]:
         low_level = self.efficientnet(x) if self.efficientnet is not None else None
         context = self.swin(x) if self.swin is not None else None
-        residual = self.noise(x, high_pass=high_pass) if self.noise is not None else None
+        residual = self.noise(x, residual_noise=residual_noise) if self.noise is not None else None
 
         # Residual-guided attention (modulate semantic features before fusion)
         if self.enable_residual_attention and isinstance(low_level, list) and isinstance(residual, list):
@@ -184,9 +184,9 @@ class HybridNGIML(nn.Module):
         self,
         x: Tensor,
         target_size: Optional[Tuple[int, int]] = None,
-        high_pass: Tensor | None = None,
+        residual_noise: Tensor | None = None,
     ) -> List[Tensor]:
-        backbone_feats = self._extract_features(x, high_pass=high_pass)
+        backbone_feats = self._extract_features(x, residual_noise=residual_noise)
         fusion_inputs = {}
         if self.cfg.use_low_level and backbone_feats["low_level"] is not None:
             fusion_inputs["low_level"] = backbone_feats["low_level"]
@@ -200,9 +200,9 @@ class HybridNGIML(nn.Module):
         self,
         x: Tensor,
         target_size: Optional[Tuple[int, int]] = None,
-        high_pass: Tensor | None = None,
+        residual_noise: Tensor | None = None,
     ) -> List[Tensor]:
-        fused = self.forward_features(x, target_size=None, high_pass=high_pass)
+        fused = self.forward_features(x, target_size=None, residual_noise=residual_noise)
         preds = self.decoder(fused)
         if target_size is None:
             return preds
@@ -257,3 +257,4 @@ __all__ = [
     "OptimizerGroupConfig",
     "UNetDecoderConfig",
 ]
+

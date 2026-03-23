@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from collections import Counter
@@ -11,7 +11,7 @@ from torchvision.transforms import functional as TVF
 from torchvision.transforms.functional import InterpolationMode
 
 from src.data.dataloaders import (
-    _compute_high_pass_fallback,
+    _compute_residual_noise,
     _load_from_npz,
     _load_from_tar_npz,
     _load_image,
@@ -217,6 +217,9 @@ def _build_model_config_from_checkpoint(checkpoint: dict) -> tuple[object, str]:
                 "enable_edge_guidance",
                 "use_dropout",
                 "dropout_p",
+                "enable_boundary_refinement",
+                "boundary_refine_channels",
+                "boundary_refine_scale",
             ):
                 if attr in decoder_cfg and hasattr(model_cfg.decoder, attr):
                     setattr(model_cfg.decoder, attr, decoder_cfg[attr])
@@ -243,20 +246,76 @@ def _build_model_config_from_checkpoint(checkpoint: dict) -> tuple[object, str]:
     return model_cfg, "defaults"
 
 
-def _select_output_head(outputs: Sequence[torch.Tensor], stage_index: int) -> torch.Tensor:
+def _disable_pretrained_backbones(model_cfg: object) -> object:
+    """Prevent backbone weight downloads when instantiating from checkpoints."""
+    try:
+        if hasattr(model_cfg, "efficientnet") and hasattr(model_cfg.efficientnet, "pretrained"):
+            model_cfg.efficientnet.pretrained = False
+    except Exception:
+        pass
+    try:
+        if hasattr(model_cfg, "swin") and hasattr(model_cfg.swin, "pretrained"):
+            model_cfg.swin.pretrained = False
+    except Exception:
+        pass
+    return model_cfg
+
+
+def _select_output_head(outputs: Sequence[torch.Tensor]) -> torch.Tensor:
     if not outputs:
         raise ValueError("Model returned empty predictions list")
+    # Highest-resolution decoder output is index 0 by contract.
+    return outputs[0]
 
-    num_stages = len(outputs)
-    idx = int(stage_index)
-    if idx < 0:
-        idx = num_stages + idx
 
-    if idx < 0 or idx >= num_stages:
-        raise ValueError(
-            f"final_pred_stage {stage_index} is out of range for {num_stages} prediction stages"
-        )
-    return outputs[idx]
+def _model_uses_residual_noise(model: HybridNGIML) -> bool:
+    cfg = getattr(model, "cfg", None)
+    cfg_flag = bool(getattr(cfg, "use_residual", True))
+    return cfg_flag and (getattr(model, "noise", None) is not None)
+
+
+def _dtype_name(value: torch.dtype | None) -> str:
+    return str(value).replace("torch.", "") if isinstance(value, torch.dtype) else "none"
+
+
+def _resolve_checkpoint_autocast_dtype(train_config: dict, device: torch.device) -> tuple[torch.dtype | None, str]:
+    precision_raw = str(train_config.get("precision", "") or "").strip().lower()
+    amp_enabled = bool(train_config.get("amp", False))
+
+    preferred: torch.dtype | None = None
+    source = "checkpoint_precision"
+
+    if precision_raw in {"bf16", "bfloat16"}:
+        preferred = torch.bfloat16
+    elif precision_raw in {"fp16", "float16", "half"}:
+        preferred = torch.float16
+    elif precision_raw in {"fp32", "float32", "32", "full", "none", "off", "disabled"}:
+        preferred = None
+    elif amp_enabled:
+        # Older checkpoints may have amp=True but unset precision; choose a safe CUDA autocast dtype.
+        preferred = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
+        source = "checkpoint_amp_fallback"
+
+    if device.type != "cuda":
+        return None, f"{source}:cpu"
+
+    if preferred is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        return torch.float16, f"{source}:bf16_unsupported_fallback_fp16"
+
+    return preferred, source
+
+
+def get_inference_autocast_dtype(model: HybridNGIML, device: torch.device) -> torch.dtype | None:
+    dtype = getattr(model, "default_autocast_dtype", None)
+    if not isinstance(dtype, torch.dtype):
+        return None
+    if device.type != "cuda":
+        return None
+    if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        return torch.float16
+    if dtype in {torch.float16, torch.bfloat16}:
+        return dtype
+    return None
 
 
 def _load_state_dict_with_fallback(model: HybridNGIML, model_state: dict) -> tuple[list[str], list[str], int]:
@@ -282,6 +341,7 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
     checkpoint = torch.load(checkpoint_path, map_location=device)
     checkpoint_epoch = int(checkpoint.get("epoch", -1))
     model_cfg, config_source = _build_model_config_from_checkpoint(checkpoint)
+    model_cfg = _disable_pretrained_backbones(model_cfg)
     model = HybridNGIML(model_cfg).to(device)
 
     missing, unexpected, skipped_mismatched = _load_state_dict_with_fallback(model, checkpoint["model_state"])
@@ -294,7 +354,9 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
 
     train_config = checkpoint.get("train_config") or {}
 
-    has_train_max_short = "max_short_side" in train_config
+    has_train_resize_max_side = "resize_max_side" in train_config
+    autocast_dtype, autocast_source = _resolve_checkpoint_autocast_dtype(train_config, device)
+    precision_raw = str(train_config.get("precision", "") or "").strip().lower() or "unset"
     info = {
         "epoch": checkpoint_epoch,
         "missing_keys": len(missing),
@@ -304,12 +366,15 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
         "fusion_channels": tuple(int(value) for value in model.cfg.fusion.fusion_channels),
         "default_threshold": float(resolved_threshold),
         "threshold_source": str(threshold_source),
-        "max_short_side": int(train_config.get("max_short_side", 0) or 0),
-        "max_short_side_source": "train_config" if has_train_max_short else "default",
-        "final_pred_stage": int(train_config.get("final_pred_stage", -1)),
+        "resize_max_side": int(train_config.get("resize_max_side", 0) or 0),
+        "resize_max_side_source": "train_config" if has_train_resize_max_side else "default",
+        "runtime_precision": precision_raw,
+        "inference_autocast_dtype": _dtype_name(autocast_dtype),
+        "inference_autocast_source": autocast_source,
     }
     setattr(model, "default_threshold", float(info["default_threshold"]))
-    setattr(model, "final_pred_stage", int(info["final_pred_stage"]))
+    setattr(model, "default_runtime_precision", precision_raw)
+    setattr(model, "default_autocast_dtype", autocast_dtype)
     return model, device, info
 
 
@@ -345,131 +410,45 @@ def _resolve_possible_local_path(path_str: str) -> str:
 def resize_for_inference(
     image: torch.Tensor,
     mask: torch.Tensor | None = None,
-    high_pass: torch.Tensor | None = None,
-    max_short_side: int | None = None,
+    residual_noise: torch.Tensor | None = None,
+    resize_max_side: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    cap = int(max_short_side or 0)
+    cap = int(resize_max_side or 0)
     if cap <= 0:
-        return image, mask, high_pass
+        return image, mask, residual_noise
 
     h, w = image.shape[-2:]
     short_side = min(h, w)
     if short_side <= 0 or short_side <= cap:
-        return image, mask, high_pass
+        return image, mask, residual_noise
 
     scale = float(cap) / float(short_side)
     new_h, new_w = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
     image = TVF.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
     if mask is not None:
         mask = TVF.resize(mask, [new_h, new_w], interpolation=InterpolationMode.NEAREST)
-    if high_pass is not None:
-        high_pass = TVF.resize(high_pass, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-    return image, mask, high_pass
+    if residual_noise is not None:
+        residual_noise = TVF.resize(residual_noise, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+    return image, mask, residual_noise
 
-
-def should_use_high_pass_for_records(records: Sequence[SampleRecord]) -> bool:
-    """Mirror dataloader behavior: if any non-NPZ sample lacks high-pass, disable high-pass for the whole split."""
-    for record in records:
-        image_path = str(record.image_path)
-        is_npz_like = image_path.endswith(".npz")
-        if is_npz_like:
-            # NPZ/tar::NPZ samples synthesize high-pass fallback at load time.
-            continue
-        if record.high_pass_path is None:
-            return False
-    return True
-
-
-def collate_eval_batch_like_training(
-    records: Sequence[SampleRecord],
-    max_short_side: int | None = None,
-    use_high_pass: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, list[str]]:
-    """Load and collate a batch using the same median-short-side resize + padding policy as training eval."""
-    images: list[torch.Tensor] = []
-    masks: list[torch.Tensor] = []
-    high_passes: list[torch.Tensor] = []
-    datasets: list[str] = []
-
-    for record in records:
-        image, mask, high_pass = load_image_mask_from_record(record, max_short_side=max_short_side)
-        images.append(image)
-        masks.append(mask)
-        datasets.append(str(record.dataset))
-        if use_high_pass and high_pass is not None:
-            high_passes.append(high_pass)
-
-    shorts = [min(int(img.shape[-2]), int(img.shape[-1])) for img in images]
-    target_short = int(round(float(torch.tensor(shorts, dtype=torch.float32).median().item()))) if shorts else 0
-
-    if target_short > 0:
-        for idx, image in enumerate(images):
-            h, w = image.shape[-2:]
-            short_side = min(h, w)
-            if short_side > 0 and short_side != target_short:
-                scale = float(target_short) / float(short_side)
-                new_h = max(1, int(round(h * scale)))
-                new_w = max(1, int(round(w * scale)))
-                images[idx] = TVF.resize(images[idx], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-                masks[idx] = TVF.resize(masks[idx], [new_h, new_w], interpolation=InterpolationMode.NEAREST)
-                if use_high_pass and idx < len(high_passes):
-                    high_passes[idx] = TVF.resize(high_passes[idx], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-
-    max_h = max(int(img.shape[-2]) for img in images)
-    max_w = max(int(img.shape[-1]) for img in images)
-
-    padded_images: list[torch.Tensor] = []
-    padded_masks: list[torch.Tensor] = []
-    padded_high_passes: list[torch.Tensor] = []
-
-    for idx, (image, mask) in enumerate(zip(images, masks)):
-        h, w = image.shape[-2:]
-        pad_h = max_h - h
-        pad_w = max_w - w
-        if pad_h > 0 or pad_w > 0:
-            image = F.pad(image.unsqueeze(0), (0, pad_w, 0, pad_h), mode="constant", value=0.0).squeeze(0)
-            mask = F.pad(mask.unsqueeze(0), (0, pad_w, 0, pad_h), mode="constant", value=0.0).squeeze(0)
-        padded_images.append(image)
-        padded_masks.append(mask)
-
-        if use_high_pass and idx < len(high_passes):
-            hp = high_passes[idx]
-            hh, hw = hp.shape[-2:]
-            hp_pad_h = max_h - hh
-            hp_pad_w = max_w - hw
-            if hp_pad_h > 0 or hp_pad_w > 0:
-                hp = F.pad(hp.unsqueeze(0), (0, hp_pad_w, 0, hp_pad_h), mode="constant", value=0.0).squeeze(0)
-            padded_high_passes.append(hp)
-
-    image_batch = torch.stack(padded_images, dim=0)
-    mask_batch = torch.stack(padded_masks, dim=0)
-
-    high_pass_batch = None
-    if use_high_pass and len(padded_high_passes) == len(padded_images):
-        high_pass_batch = torch.stack(padded_high_passes, dim=0)
-
-    return image_batch, mask_batch, high_pass_batch, datasets
 
 
 def load_image_mask_from_record(
     record: SampleRecord,
-    max_short_side: int | None = None,
+    resize_max_side: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     image_path = str(record.image_path)
     if "::" in image_path and image_path.endswith(".npz"):
-        image, mask, high_pass = _load_from_tar_npz(image_path)
+        image, mask, residual_noise = _load_from_tar_npz(image_path)
     elif image_path.endswith(".npz"):
-        image, mask, high_pass = _load_from_npz(_resolve_possible_local_path(image_path))
+        image, mask, residual_noise = _load_from_npz(_resolve_possible_local_path(image_path))
     else:
         image = _load_image(_resolve_possible_local_path(image_path))
-        high_pass = None
+        residual_noise = None
         mask = None
         if record.mask_path is not None:
             loaded = _load_image(_resolve_possible_local_path(record.mask_path))
             mask = loaded[:1] if loaded.shape[0] > 1 else loaded
-        if record.high_pass_path is not None:
-            loaded_high = _load_image(_resolve_possible_local_path(record.high_pass_path))
-            high_pass = loaded_high if loaded_high.shape[0] in (1, 3) else loaded_high[:3]
 
     image = image.float()
     if image.max() > 1.0:
@@ -488,23 +467,12 @@ def load_image_mask_from_record(
         if tuple(mask.shape[-2:]) != tuple(image.shape[-2:]):
             mask = F.interpolate(mask.unsqueeze(0), size=image.shape[-2:], mode="nearest").squeeze(0)
 
-    if high_pass is not None:
-        high_pass = high_pass.float()
-        if high_pass.ndim == 2:
-            high_pass = high_pass.unsqueeze(0)
-        if high_pass.shape[0] == 1:
-            high_pass = high_pass.repeat(3, 1, 1)
-        elif high_pass.shape[0] > 3:
-            high_pass = high_pass[:3]
-        if high_pass.max() > 1.0:
-            high_pass = high_pass / 255.0
-        if tuple(high_pass.shape[-2:]) != tuple(image.shape[-2:]):
-            high_pass = F.interpolate(high_pass.unsqueeze(0), size=image.shape[-2:], mode="bilinear", align_corners=False).squeeze(0)
-    else:
-        high_pass = _compute_high_pass_fallback(image)
+    # Residual noise is always derived on-the-fly from RGB, independent of
+    # whether a legacy manifest still contains residual_noise_path fields.
+    residual_noise = _compute_residual_noise(image)
 
-    image, mask, high_pass = resize_for_inference(image, mask=mask, high_pass=high_pass, max_short_side=max_short_side)
-    return image, mask, high_pass
+    image, mask, residual_noise = resize_for_inference(image, mask=mask, residual_noise=residual_noise, resize_max_side=resize_max_side)
+    return image, mask, residual_noise
 
 
 def normalize_image_for_inference(image: torch.Tensor, normalization_mode: str = "zero_one") -> torch.Tensor:
@@ -519,22 +487,21 @@ def predict_probability_map(
     image: torch.Tensor,
     device: torch.device,
     normalization_mode: str = "zero_one",
-    high_pass: torch.Tensor | None = None,
-    final_pred_stage: int | None = None,
+    residual_noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     normalized = normalize_image_for_inference(image, normalization_mode=normalization_mode)
     x = normalized.unsqueeze(0).to(device)
     hp = None
-    if high_pass is not None:
-        hp = high_pass.float()
-        if hp.max() > 1.0:
-            hp = hp / 255.0
-        hp = hp.unsqueeze(0).to(device)
-    stage_index = int(getattr(model, "final_pred_stage", -1) if final_pred_stage is None else final_pred_stage)
+    if _model_uses_residual_noise(model):
+        hp_src = residual_noise if residual_noise is not None else _compute_residual_noise(image)
+        hp = hp_src.unsqueeze(0).to(device)
+    autocast_dtype = get_inference_autocast_dtype(model, device)
+    use_amp = device.type == "cuda" and autocast_dtype is not None
     with torch.no_grad():
-        outputs = model(x, target_size=image.shape[-2:], high_pass=hp)
-        logits = _select_output_head(outputs, stage_index)
-        prob = torch.sigmoid(logits)[0, 0].detach().cpu()
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype or torch.float16, enabled=use_amp):
+            outputs = model(x, target_size=image.shape[-2:], residual_noise=hp)
+            logits = _select_output_head(outputs)
+            prob = torch.sigmoid(logits)[0, 0].detach().cpu()
     return prob
 
 
@@ -544,140 +511,612 @@ def predict_binary_map(
     device: torch.device,
     threshold: float | None = None,
     normalization_mode: str = "zero_one",
-    high_pass: torch.Tensor | None = None,
-    final_pred_stage: int | None = None,
+    residual_noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     prob = predict_probability_map(
         model,
         image,
         device,
         normalization_mode=normalization_mode,
-        high_pass=high_pass,
-        final_pred_stage=final_pred_stage,
+        residual_noise=residual_noise,
     )
     if threshold is None:
         threshold = float(getattr(model, "default_threshold", 0.5))
     return (prob >= float(threshold)).float()
 
 
-def _center_square_crop(tensor: torch.Tensor) -> torch.Tensor:
-    h, w = tensor.shape[-2:]
-    if h == w:
-        return tensor
-    side = min(h, w)
-    top = (h - side) // 2
-    left = (w - side) // 2
-    return tensor[..., top : top + side, left : left + side]
-
-
-def infer_from_image_path(
-    model: HybridNGIML,
-    image_path: Path,
-    device: torch.device,
-    normalization_mode: str = "zero_one",
-    max_short_side: int | None = None,
-    crop_square: bool = False,
-    prep_target_size: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    orig_image = _load_image(str(Path(image_path).as_posix())).float()
-    if orig_image.max() > 1.0:
-        orig_image = orig_image / 255.0
-
-    image = orig_image
-    if crop_square:
-        image = _center_square_crop(image)
-
-    high_pass = _compute_high_pass_fallback(image)
-    if prep_target_size is not None and prep_target_size > 0:
-        image = TVF.resize(image, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
-        high_pass = TVF.resize(high_pass, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
-    else:
-        image, _, high_pass = resize_for_inference(image, mask=None, high_pass=high_pass, max_short_side=max_short_side)
-    pred = predict_probability_map(model, image, device, normalization_mode=normalization_mode, high_pass=high_pass)
-    return image, pred, orig_image
-
-
-def multiscale_infer_from_image_path(
-    model: HybridNGIML,
-    image_path: Path,
-    device: torch.device,
-    normalization_mode: str = "zero_one",
-    max_short_side: int | None = None,
-    scales: Sequence[float] = (1.0,),
-    merge_mode: str = "mean",
-    crop_square: bool = False,
-    prep_target_size: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None, list[tuple[float, torch.Tensor]], torch.Tensor]:
-    orig_image = _load_image(str(Path(image_path).as_posix())).float()
-    if orig_image.max() > 1.0:
-        orig_image = orig_image / 255.0
-
-    image = orig_image
-    if crop_square:
-        image = _center_square_crop(image)
-    high_pass = _compute_high_pass_fallback(image)
-    if prep_target_size is not None and prep_target_size > 0:
-        image = TVF.resize(image, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
-        high_pass = TVF.resize(high_pass, [prep_target_size, prep_target_size], interpolation=InterpolationMode.BILINEAR)
-    else:
-        image, _, high_pass = resize_for_inference(image, mask=None, high_pass=high_pass, max_short_side=max_short_side)
-
-    base_h, base_w = image.shape[-2:]
-    merge = None if merge_mode is None else ("max" if str(merge_mode).lower() == "max" else "mean")
-
-    cleaned_scales: list[float] = []
-    for scale in scales or (1.0,):
-        value = float(scale)
-        if value <= 0:
-            continue
-        cleaned_scales.append(value)
-    if not cleaned_scales:
-        cleaned_scales = [1.0]
-
-    merged: torch.Tensor | None = None
-    count = 0
-    scale_outputs: list[tuple[float, torch.Tensor]] = []
-
-    for scale in cleaned_scales:
-        if abs(scale - 1.0) < 1e-6:
-            scaled_img = image
-            scaled_hp = high_pass
-        else:
-            new_h = max(1, int(round(base_h * scale)))
-            new_w = max(1, int(round(base_w * scale)))
-            scaled_img = TVF.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-            scaled_hp = None if high_pass is None else TVF.resize(high_pass, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-
-        prob = predict_probability_map(
-            model,
-            scaled_img,
-            device,
-            normalization_mode=normalization_mode,
-            high_pass=scaled_hp,
+def resolve_normalization_mode_for_inference(
+    manual_mode: str | None = None,
+    manifest_path: str | Path | None = None,
+    training_config: dict | None = None,
+    checkpoint_path: str | Path | None = None,
+    default_mode: str = "imagenet",
+) -> str:
+    """Resolve inference normalization with explicit override first, then manifest sources."""
+    if isinstance(manual_mode, str) and manual_mode.strip():
+        mode = manual_mode.strip().lower()
+        if mode in {"imagenet", "zero_one"}:
+            return mode
+        raise ValueError(
+            f"Unsupported normalization mode: {manual_mode!r}. "
+            "Use 'imagenet', 'zero_one', or None."
         )
 
-        if prob.shape[-2:] != (base_h, base_w):
-            prob = F.interpolate(prob.unsqueeze(0).unsqueeze(0), size=(base_h, base_w), mode="bilinear", align_corners=False)[0, 0]
+    candidates: list[Path] = []
 
-        scale_outputs.append((scale, prob))
+    if manifest_path:
+        candidates.append(Path(manifest_path))
 
-        # Accumulate merged map only when caller wants a merge (len(cleaned_scales) > 1 handled upstream)
-        if merge is not None:
-            if merge == "max":
-                merged = prob if merged is None else torch.maximum(merged, prob)
-            else:
-                merged = prob if merged is None else merged + prob
-                count += 1
+    if isinstance(training_config, dict):
+        train_manifest = training_config.get("manifest")
+        if train_manifest:
+            candidates.append(Path(train_manifest))
 
-    if merge is None:
-        merged = None
+    if checkpoint_path:
+        try:
+            checkpoint_blob = torch.load(Path(checkpoint_path), map_location="cpu")
+            train_cfg = checkpoint_blob.get("train_config") if isinstance(checkpoint_blob, dict) else None
+            checkpoint_manifest = train_cfg.get("manifest") if isinstance(train_cfg, dict) else None
+            if checkpoint_manifest:
+                candidates.append(Path(checkpoint_manifest))
+        except Exception:
+            pass
+
+    for candidate in candidates:
+        try:
+            manifest_obj = load_manifest(candidate)
+            mode = str(manifest_obj.normalization_mode).strip().lower()
+            if mode in {"imagenet", "zero_one"}:
+                return mode
+        except Exception:
+            continue
+
+    fallback = str(default_mode).strip().lower()
+    if fallback not in {"imagenet", "zero_one"}:
+        fallback = "imagenet"
+    return fallback
+
+
+def _tile_starts(full_size: int, tile_size: int, stride: int) -> list[int]:
+    if full_size <= tile_size:
+        return [0]
+    starts = list(range(0, full_size - tile_size + 1, stride))
+    tail = full_size - tile_size
+    if starts[-1] != tail:
+        starts.append(tail)
+    return starts
+
+
+def _hann_weight_2d(h: int, w: int) -> torch.Tensor:
+    wy = torch.hann_window(h, periodic=False).float().clamp_min(1e-3)
+    wx = torch.hann_window(w, periodic=False).float().clamp_min(1e-3)
+    weight = wy[:, None] * wx[None, :]
+    return weight / weight.max().clamp_min(1e-6)
+
+
+def predict_probability_map_sliding_window(
+    model: HybridNGIML,
+    image: torch.Tensor,
+    device: torch.device,
+    normalization_mode: str = "zero_one",
+    residual_noise: torch.Tensor | None = None,
+    tile_size: int = 448,
+    overlap: float = 0.25,
+    tile_batch_size: int = 4,
+) -> torch.Tensor:
+    """Run overlap-weighted tiled inference and return full-resolution probability map."""
+    model_uses_residual = _model_uses_residual_noise(model)
+    if image.ndim != 3 or image.shape[0] != 3:
+        raise ValueError(f"Expected RGB CHW image tensor, got shape={tuple(image.shape)}")
+
+    image = image.float()
+    if image.max() > 1.0:
+        image = image / 255.0
+    image = image.clamp(0.0, 1.0)
+
+    if model_uses_residual:
+        residual_noise = residual_noise if residual_noise is not None else _compute_residual_noise(image)
     else:
-        if merged is None:
-            merged = torch.empty((base_h, base_w))
-        elif merge != "max":
-            merged = merged / float(count or len(cleaned_scales))
+        residual_noise = None
 
-    return image, merged, scale_outputs, orig_image
+    _, h, w = image.shape
+    tile = max(64, int(tile_size))
+    stride = max(1, int(round(tile * (1.0 - float(overlap)))))
+    tile_batch = max(1, int(tile_batch_size))
+
+    pad_h = max(0, tile - h)
+    pad_w = max(0, tile - w)
+    if pad_h > 0 or pad_w > 0:
+        image = F.pad(image.unsqueeze(0), (0, pad_w, 0, pad_h), mode="reflect").squeeze(0)
+        if residual_noise is not None:
+            residual_noise = F.pad(residual_noise.unsqueeze(0), (0, pad_w, 0, pad_h), mode="reflect").squeeze(0)
+
+    _, hp, wp = image.shape
+    ys = _tile_starts(hp, tile, stride)
+    xs = _tile_starts(wp, tile, stride)
+
+    weight = _hann_weight_2d(tile, tile)
+    accum = torch.zeros((hp, wp), dtype=torch.float32)
+    accum_w = torch.zeros((hp, wp), dtype=torch.float32)
+
+    def _flush(
+        rgb_tiles: list[torch.Tensor],
+        residual_tiles: list[torch.Tensor],
+        coords: list[tuple[int, int]],
+    ) -> None:
+        if not rgb_tiles:
+            return
+        xb = torch.stack(rgb_tiles, dim=0).to(device, non_blocking=True)
+        hb = torch.stack(residual_tiles, dim=0).to(device, non_blocking=True) if residual_tiles else None
+
+        autocast_dtype = get_inference_autocast_dtype(model, device)
+        use_amp = device.type == "cuda" and autocast_dtype is not None
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda", dtype=autocast_dtype or torch.float16, enabled=use_amp):
+                outputs = model(xb, target_size=xb.shape[-2:], residual_noise=hb)
+                logits = _select_output_head(outputs) if isinstance(outputs, (list, tuple)) else outputs
+                probs = torch.sigmoid(logits[:, 0]).float().cpu()
+
+        for idx, (y0, x0) in enumerate(coords):
+            accum[y0 : y0 + tile, x0 : x0 + tile] += probs[idx] * weight
+            accum_w[y0 : y0 + tile, x0 : x0 + tile] += weight
+
+    tile_images: list[torch.Tensor] = []
+    tile_residuals: list[torch.Tensor] = []
+    tile_coords: list[tuple[int, int]] = []
+
+    for y0 in ys:
+        for x0 in xs:
+            rgb_tile = image[:, y0 : y0 + tile, x0 : x0 + tile]
+            hp_tile = residual_noise[:, y0 : y0 + tile, x0 : x0 + tile] if residual_noise is not None else None
+
+            tile_images.append(normalize_image_for_inference(rgb_tile, normalization_mode=normalization_mode))
+            if hp_tile is not None:
+                tile_residuals.append(hp_tile.float())
+            tile_coords.append((y0, x0))
+
+            if len(tile_images) >= tile_batch:
+                _flush(tile_images, tile_residuals, tile_coords)
+                tile_images.clear()
+                tile_residuals.clear()
+                tile_coords.clear()
+
+    _flush(tile_images, tile_residuals, tile_coords)
+    prob = accum / accum_w.clamp_min(1e-6)
+    return prob[:h, :w]
+
+
+def _resize_prob_to_original(prob: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
+    if tuple(prob.shape[-2:]) == (out_h, out_w):
+        return prob
+    return F.interpolate(
+        prob.unsqueeze(0).unsqueeze(0),
+        size=(out_h, out_w),
+        mode="bilinear",
+        align_corners=False,
+    )[0, 0]
+
+
+def predict_probability_map_by_strategy(
+    model: HybridNGIML,
+    image: torch.Tensor,
+    device: torch.device,
+    strategy: str,
+    normalization_mode: str = "imagenet",
+    infer_size: int = 448,
+    tile_size: int = 448,
+    tile_overlap: float = 0.5,
+    tile_batch_size: int = 16,
+) -> torch.Tensor:
+    """Run a single inference strategy and return probability map at original image resolution."""
+    if image.ndim != 3 or image.shape[0] != 3:
+        raise ValueError(f"Expected RGB CHW image tensor, got shape={tuple(image.shape)}")
+
+    image = image.float()
+    if image.max() > 1.0:
+        image = image / 255.0
+    image = image.clamp(0.0, 1.0)
+
+    orig_h, orig_w = int(image.shape[-2]), int(image.shape[-1])
+    strategy_key = str(strategy).strip().lower()
+
+    if strategy_key == "direct":
+        return predict_probability_map(
+            model=model,
+            image=image,
+            device=device,
+            normalization_mode=normalization_mode,
+        )
+
+    if strategy_key == "sliding_window":
+        return predict_probability_map_sliding_window(
+            model=model,
+            image=image,
+            device=device,
+            normalization_mode=normalization_mode,
+            tile_size=tile_size,
+            overlap=tile_overlap,
+            tile_batch_size=tile_batch_size,
+        )
+
+    if strategy_key == "resize_keep_aspect_center_crop":
+        h, w = image.shape[-2:]
+        scale = float(infer_size) / float(min(h, w))
+        new_h = max(1, int(round(h * scale)))
+        new_w = max(1, int(round(w * scale)))
+        resized = TVF.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+        top = max(0, (new_h - infer_size) // 2)
+        left = max(0, (new_w - infer_size) // 2)
+        cropped = TVF.crop(resized, top, left, infer_size, infer_size)
+        prob = predict_probability_map(
+            model=model,
+            image=cropped,
+            device=device,
+            normalization_mode=normalization_mode,
+        )
+        return _resize_prob_to_original(prob, orig_h, orig_w)
+
+    if strategy_key == "center_crop":
+        h, w = image.shape[-2:]
+        crop_side = min(h, w)
+        top = max(0, (h - crop_side) // 2)
+        left = max(0, (w - crop_side) // 2)
+        cropped = TVF.crop(image, top, left, crop_side, crop_side)
+        resized = TVF.resize(cropped, [infer_size, infer_size], interpolation=InterpolationMode.BILINEAR)
+        prob = predict_probability_map(
+            model=model,
+            image=resized,
+            device=device,
+            normalization_mode=normalization_mode,
+        )
+        return _resize_prob_to_original(prob, orig_h, orig_w)
+
+    if strategy_key == "resize":
+        resized = TVF.resize(image, [infer_size, infer_size], interpolation=InterpolationMode.BILINEAR)
+        prob = predict_probability_map(
+            model=model,
+            image=resized,
+            device=device,
+            normalization_mode=normalization_mode,
+        )
+        return _resize_prob_to_original(prob, orig_h, orig_w)
+
+    raise ValueError(
+        f"Unknown strategy: {strategy}. "
+        "Supported: direct, sliding_window, resize_keep_aspect_center_crop, center_crop, resize"
+    )
+
+
+def run_multi_strategy_inference(
+    model: HybridNGIML,
+    image: torch.Tensor,
+    device: torch.device,
+    normalization_mode: str = "imagenet",
+    threshold: float | None = None,
+    infer_size: int = 448,
+    tile_size: int = 448,
+    tile_overlap: float = 0.5,
+    tile_batch_size: int = 16,
+    strategies: Sequence[str] | None = None,
+    show_plot: bool = True,
+    show_progress: bool = True,
+) -> dict[str, object]:
+    """Run configured inference strategies, optionally visualize, and return metrics/maps."""
+    strategy_list = list(strategies) if strategies is not None else [
+        "direct",
+        "sliding_window",
+        "resize_keep_aspect_center_crop",
+        "center_crop",
+        "resize",
+    ]
+    if not strategy_list:
+        raise ValueError("At least one strategy must be provided")
+
+    image = image.float()
+    if image.max() > 1.0:
+        image = image / 255.0
+    image = image.clamp(0.0, 1.0)
+
+    resolved_threshold = float(
+        threshold if threshold is not None else getattr(model, "default_threshold", 0.5)
+    )
+
+    strategy_probs: dict[str, torch.Tensor] = {}
+    strategy_bins: dict[str, torch.Tensor] = {}
+    summary: dict[str, dict[str, float]] = {}
+
+    iterator = strategy_list
+    if show_progress:
+        try:
+            import importlib
+
+            tqdm_auto = importlib.import_module("tqdm.auto")
+            iterator = tqdm_auto.tqdm(strategy_list, desc="Inference strategies", leave=False)
+        except Exception:
+            iterator = strategy_list
+
+    for strategy_name in iterator:
+        prob = predict_probability_map_by_strategy(
+            model=model,
+            image=image,
+            device=device,
+            strategy=strategy_name,
+            normalization_mode=normalization_mode,
+            infer_size=infer_size,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            tile_batch_size=tile_batch_size,
+        ).clamp(0.0, 1.0)
+        binary = (prob >= resolved_threshold).float()
+
+        strategy_probs[strategy_name] = prob
+        strategy_bins[strategy_name] = binary
+        summary[strategy_name] = {
+            "mean_probability": float(prob.mean().item()),
+            "max_probability": float(prob.max().item()),
+            "predicted_positive_ratio": float(binary.mean().item()),
+        }
+
+    if show_plot:
+        plot_multi_strategy_inference(
+            image=image,
+            strategy_probs=strategy_probs,
+            strategy_bins=strategy_bins,
+            threshold=resolved_threshold,
+            strategy_order=strategy_list,
+        )
+
+    return {
+        "strategies": strategy_list,
+        "normalization_mode": normalization_mode,
+        "threshold": resolved_threshold,
+        "infer_size": int(infer_size),
+        "tile_size": int(tile_size),
+        "tile_overlap": float(tile_overlap),
+        "tile_batch_size": int(tile_batch_size),
+        "probabilities": strategy_probs,
+        "binaries": strategy_bins,
+        "summary": summary,
+    }
+
+
+def _epoch_from_checkpoint_name(checkpoint_path: Path) -> int | None:
+    match = re.search(r"checkpoint_epoch_(\d+)", checkpoint_path.name)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def list_epoch_checkpoints(checkpoint_dir: str | Path) -> list[Path]:
+    checkpoint_root = Path(checkpoint_dir)
+    checkpoints = list(checkpoint_root.glob("checkpoint_epoch_*.pt"))
+    if not checkpoints:
+        return []
+
+    def _sort_key(path: Path) -> tuple[int, float, str]:
+        epoch = _epoch_from_checkpoint_name(path)
+        epoch_key = int(epoch) if epoch is not None else -1
+        try:
+            mtime = float(path.stat().st_mtime)
+        except OSError:
+            mtime = 0.0
+        return (epoch_key, mtime, path.name)
+
+    return sorted(checkpoints, key=_sort_key)
+
+
+def sweep_checkpoint_inference_for_image(
+    checkpoint_dir: str | Path,
+    image: torch.Tensor,
+    normalization_mode: str = "imagenet",
+    strategy: str = "direct",
+    threshold: float | None = None,
+    infer_size: int = 448,
+    tile_size: int = 448,
+    tile_overlap: float = 0.5,
+    tile_batch_size: int = 16,
+    show_progress: bool = True,
+    show_plot: bool = True,
+    plot_max_checkpoints: int | None = 8,
+) -> dict[str, object]:
+    """Run one strategy for one image across all epoch checkpoints in a directory."""
+    checkpoint_paths = list_epoch_checkpoints(checkpoint_dir)
+    if not checkpoint_paths:
+        raise FileNotFoundError(f"No checkpoint_epoch_*.pt files found in {checkpoint_dir}")
+
+    image = image.float()
+    if image.max() > 1.0:
+        image = image / 255.0
+    image = image.clamp(0.0, 1.0)
+
+    records: list[dict[str, object]] = []
+    strategy_key = str(strategy).strip().lower()
+    checkpoint_probs: dict[str, torch.Tensor] = {}
+    checkpoint_bins: dict[str, torch.Tensor] = {}
+    checkpoint_thresholds: dict[str, float] = {}
+
+    iterator = checkpoint_paths
+    if show_progress:
+        try:
+            import importlib
+
+            tqdm_auto = importlib.import_module("tqdm.auto")
+            iterator = tqdm_auto.tqdm(checkpoint_paths, desc="Checkpoint sweep", leave=False)
+        except Exception:
+            iterator = checkpoint_paths
+
+    for checkpoint_path in iterator:
+        model, device, ckpt_info = load_model_from_checkpoint(checkpoint_path)
+        run = run_multi_strategy_inference(
+            model=model,
+            image=image,
+            device=device,
+            normalization_mode=normalization_mode,
+            threshold=threshold,
+            infer_size=infer_size,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            tile_batch_size=tile_batch_size,
+            strategies=[strategy_key],
+            show_plot=False,
+            show_progress=False,
+        )
+
+        summary = run["summary"][strategy_key]
+        records.append(
+            {
+                "checkpoint_path": str(checkpoint_path),
+                "checkpoint_epoch_from_name": _epoch_from_checkpoint_name(checkpoint_path),
+                "checkpoint_epoch_from_state": ckpt_info.get("epoch"),
+                "strategy": strategy_key,
+                "normalization_mode": normalization_mode,
+                "threshold_used": float(run["threshold"]),
+                "mean_probability": float(summary["mean_probability"]),
+                "max_probability": float(summary["max_probability"]),
+                "predicted_positive_ratio": float(summary["predicted_positive_ratio"]),
+            }
+        )
+
+        if show_plot:
+            checkpoint_label = f"ep{int(ckpt_info.get('epoch', -1))}"
+            checkpoint_probs[checkpoint_label] = run["probabilities"][strategy_key]
+            checkpoint_bins[checkpoint_label] = run["binaries"][strategy_key]
+            checkpoint_thresholds[checkpoint_label] = float(run["threshold"])
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    best_by_max_probability = max(records, key=lambda row: float(row["max_probability"]))
+
+    if show_plot and checkpoint_probs:
+        labels = list(checkpoint_probs.keys())
+        if isinstance(plot_max_checkpoints, int) and plot_max_checkpoints > 0 and len(labels) > plot_max_checkpoints:
+            labels = labels[-plot_max_checkpoints:]
+        plot_checkpoint_sweep_inference(
+            image=image,
+            checkpoint_probs={label: checkpoint_probs[label] for label in labels},
+            checkpoint_bins={label: checkpoint_bins[label] for label in labels},
+            checkpoint_thresholds={label: checkpoint_thresholds[label] for label in labels},
+            strategy_name=strategy_key,
+            checkpoint_order=labels,
+        )
+
+    return {
+        "strategy": strategy_key,
+        "normalization_mode": normalization_mode,
+        "num_checkpoints": len(records),
+        "records": records,
+        "best_by_max_probability": best_by_max_probability,
+    }
+
+
+def plot_checkpoint_sweep_inference(
+    image: torch.Tensor,
+    checkpoint_probs: dict[str, torch.Tensor],
+    checkpoint_bins: dict[str, torch.Tensor],
+    checkpoint_thresholds: dict[str, float],
+    strategy_name: str,
+    checkpoint_order: Sequence[str] | None = None,
+):
+    """Render probability, binary, and overlay grids across checkpoints for one strategy."""
+    import importlib
+
+    plt = importlib.import_module("matplotlib.pyplot")
+    np = importlib.import_module("numpy")
+
+    order = list(checkpoint_order) if checkpoint_order is not None else list(checkpoint_probs.keys())
+    if not order:
+        raise ValueError("No checkpoints provided for sweep plotting")
+
+    img_np = image.float().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
+    n = len(order)
+    fig, axes = plt.subplots(3, n + 1, figsize=(4 * (n + 1), 12))
+
+    axes[0, 0].imshow(img_np)
+    axes[0, 0].set_title("Uploaded RGB")
+    axes[0, 0].axis("off")
+    axes[1, 0].axis("off")
+    axes[2, 0].axis("off")
+
+    for idx, checkpoint_label in enumerate(order, start=1):
+        prob_np = checkpoint_probs[checkpoint_label].detach().cpu().numpy()
+        bin_np = checkpoint_bins[checkpoint_label].detach().cpu().numpy()
+        threshold = float(checkpoint_thresholds.get(checkpoint_label, 0.5))
+
+        overlay_color = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        alpha = 0.45 * prob_np[..., None]
+        overlay_np = np.clip(img_np * (1.0 - alpha) + overlay_color * alpha, 0.0, 1.0)
+
+        axes[0, idx].imshow(prob_np, cmap="magma", vmin=0.0, vmax=1.0)
+        axes[0, idx].set_title(f"{checkpoint_label}\\n{strategy_name} Prob")
+        axes[0, idx].axis("off")
+
+        axes[1, idx].imshow(bin_np, cmap="gray", vmin=0.0, vmax=1.0)
+        axes[1, idx].set_title(f"{checkpoint_label}\\nBinary (t={threshold:.2f})")
+        axes[1, idx].axis("off")
+
+        axes[2, idx].imshow(overlay_np)
+        axes[2, idx].set_title(f"{checkpoint_label}\\nOverlay")
+        axes[2, idx].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+    return fig, axes
+
+
+def plot_multi_strategy_inference(
+    image: torch.Tensor,
+    strategy_probs: dict[str, torch.Tensor],
+    strategy_bins: dict[str, torch.Tensor],
+    threshold: float,
+    strategy_order: Sequence[str] | None = None,
+):
+    """Render probability, binary, and overlay grids for each strategy."""
+    import importlib
+
+    plt = importlib.import_module("matplotlib.pyplot")
+    np = importlib.import_module("numpy")
+
+    order = list(strategy_order) if strategy_order is not None else list(strategy_probs.keys())
+    if not order:
+        raise ValueError("No strategies provided for plotting")
+
+    img_np = image.float().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
+    n = len(order)
+    fig, axes = plt.subplots(3, n + 1, figsize=(4 * (n + 1), 12))
+
+    axes[0, 0].imshow(img_np)
+    axes[0, 0].set_title("Uploaded RGB")
+    axes[0, 0].axis("off")
+    axes[1, 0].axis("off")
+    axes[2, 0].axis("off")
+
+    for idx, strategy_name in enumerate(order, start=1):
+        prob_np = strategy_probs[strategy_name].detach().cpu().numpy()
+        bin_np = strategy_bins[strategy_name].detach().cpu().numpy()
+
+        overlay_color = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        alpha = 0.45 * prob_np[..., None]
+        overlay_np = np.clip(img_np * (1.0 - alpha) + overlay_color * alpha, 0.0, 1.0)
+
+        title_name = strategy_name.replace("_", " ").title()
+
+        axes[0, idx].imshow(prob_np, cmap="magma", vmin=0.0, vmax=1.0)
+        axes[0, idx].set_title(f"{title_name}\\nProbability")
+        axes[0, idx].axis("off")
+
+        axes[1, idx].imshow(bin_np, cmap="gray", vmin=0.0, vmax=1.0)
+        axes[1, idx].set_title(f"{title_name}\\nBinary (t={threshold:.2f})")
+        axes[1, idx].axis("off")
+
+        axes[2, idx].imshow(overlay_np)
+        axes[2, idx].set_title(f"{title_name}\\nOverlay")
+        axes[2, idx].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+    return fig, axes
 
 
 def get_model_complexity_stats(
@@ -704,10 +1143,9 @@ def get_model_complexity_stats(
             self.base_model = base_model
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            out = self.base_model(x, target_size=x.shape[-2:], high_pass=None)
+            out = self.base_model(x, target_size=x.shape[-2:], residual_noise=None)
             if isinstance(out, (list, tuple)):
-                stage_index = int(getattr(self.base_model, "final_pred_stage", -1))
-                return _select_output_head(out, stage_index)
+                return _select_output_head(out)
             return out
 
     profile_model = _ProfileWrapper(model).to(sample_device)
@@ -757,3 +1195,4 @@ def get_model_complexity_stats(
         model.train(was_training)
 
     return stats
+

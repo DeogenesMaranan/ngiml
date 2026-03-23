@@ -58,6 +58,9 @@ class UNetDecoderConfig:
     enable_edge_guidance: bool = True  # Edge-aware decoder refinement (enabled by default)
     use_dropout: bool = True  # Dropout2d in highest-res decoder output enabled by default
     dropout_p: float = 0.2
+    enable_boundary_refinement: bool = True  # Sobel-guided residual correction after final logits
+    boundary_refine_channels: int = 8  # Lightweight hidden width for post-logit correction
+    boundary_refine_scale: float = 1.0  # Multiplicative scale for residual correction
 
 
 class UNetDecoder(nn.Module):
@@ -137,6 +140,59 @@ class UNetDecoder(nn.Module):
             ]
         )
 
+        # Lightweight post-logit boundary refinement (optional).
+        self.enable_boundary_refinement = bool(getattr(self.cfg, "enable_boundary_refinement", False))
+        self.boundary_refine_scale = float(getattr(self.cfg, "boundary_refine_scale", 1.0))
+        if self.enable_boundary_refinement:
+            refine_channels = int(max(1, getattr(self.cfg, "boundary_refine_channels", 8)))
+            self.boundary_refine_head = nn.Sequential(
+                nn.Conv2d(2, refine_channels, kernel_size=3, padding=1, bias=False),
+                _build_activation(self.cfg.activation),
+                nn.Conv2d(refine_channels, self.cfg.out_channels, kernel_size=1, bias=True),
+            )
+            # Start from an identity mapping: logits + 0.0 * residual.
+            nn.init.zeros_(self.boundary_refine_head[-1].weight)
+            if self.boundary_refine_head[-1].bias is not None:
+                nn.init.zeros_(self.boundary_refine_head[-1].bias)
+
+            sobel_x = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+            sobel_y = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+            self.register_buffer("boundary_sobel_x", sobel_x)
+            self.register_buffer("boundary_sobel_y", sobel_y)
+
+    def _refine_final_logits(self, logits: Tensor) -> Tensor:
+        if not self.enable_boundary_refinement:
+            return logits
+
+        if logits.shape[1] != self.cfg.out_channels:
+            # Conservative fallback for unexpected channel layouts.
+            return logits
+
+        sobel_x = self.boundary_sobel_x.to(dtype=logits.dtype, device=logits.device)
+        sobel_y = self.boundary_sobel_y.to(dtype=logits.dtype, device=logits.device)
+
+        if logits.shape[1] == 1:
+            probs = torch.sigmoid(logits)
+            grad_x = F.conv2d(probs, sobel_x, padding=1)
+            grad_y = F.conv2d(probs, sobel_y, padding=1)
+            edge_mag = torch.sqrt(grad_x * grad_x + grad_y * grad_y + 1e-6)
+            refine_in = torch.cat([logits, edge_mag], dim=1)
+        else:
+            # Grouped Sobel for multi-channel logits (kept for completeness).
+            probs = torch.sigmoid(logits)
+            groups = int(logits.shape[1])
+            sx = sobel_x.repeat(groups, 1, 1, 1)
+            sy = sobel_y.repeat(groups, 1, 1, 1)
+            grad_x = F.conv2d(probs, sx, padding=1, groups=groups)
+            grad_y = F.conv2d(probs, sy, padding=1, groups=groups)
+            edge_mag = torch.sqrt(grad_x * grad_x + grad_y * grad_y + 1e-6)
+            edge_mag = edge_mag.mean(dim=1, keepdim=True)
+            logit_mean = logits.mean(dim=1, keepdim=True)
+            refine_in = torch.cat([logit_mean, edge_mag], dim=1)
+
+        residual = self.boundary_refine_head(refine_in)
+        return logits + self.boundary_refine_scale * residual
+
     def forward(self, features: List[Tensor], image: Tensor = None, postprocess: Optional[str] = None) -> List[Tensor]:
         if len(features) != len(self.stage_channels):
             raise ValueError("Feature list length must match number of decoder stages")
@@ -183,7 +239,9 @@ class UNetDecoder(nn.Module):
             # Optionally apply dropout to highest-res output
             out_preds = [pred for pred in predictions if pred is not None]
             if self.use_dropout and out_preds:
-                out_preds[-1] = self.dropout(out_preds[-1])
+                out_preds[0] = self.dropout(out_preds[0])
+            if out_preds:
+                out_preds[0] = self._refine_final_logits(out_preds[0])
             if postprocess is not None:
                 if postprocess.lower() == 'sigmoid':
                     out_preds = [torch.sigmoid(p) for p in out_preds]
@@ -194,6 +252,7 @@ class UNetDecoder(nn.Module):
         final = self.predictors[0](x)
         if self.use_dropout:
             final = self.dropout(final)
+        final = self._refine_final_logits(final)
         if postprocess is not None:
             if postprocess.lower() == 'sigmoid':
                 final = torch.sigmoid(final)

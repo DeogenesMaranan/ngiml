@@ -90,13 +90,13 @@ class SwinBackbone(nn.Module):
             try:
                 import flash_attn  # type: ignore
                 # Insert flash attention logic here if needed
-            except ImportError:
+            except Exception:
                 _LOG.info("flash-attn not installed; flash attention will not be used.")
         if self.xformers:
             try:
                 import xformers  # type: ignore
                 # Insert xformers logic here if needed
-            except ImportError:
+            except Exception:
                 _LOG.info("xformers not installed; xformers attention will not be used.")
 
     @staticmethod

@@ -210,9 +210,9 @@ class MultiStageManipulationLoss(nn.Module):
             total_loss += stage_weight * stage_loss
             normalizer += stage_weight
 
-        # Add boundary loss on final prediction
+        # Add boundary loss on stage-0 (highest-resolution) prediction.
         if self.use_boundary_loss and self.boundary_loss is not None and preds:
-            boundary = self.boundary_loss(preds[-1], target)
+            boundary = self.boundary_loss(preds[0], target)
             total_loss += self.boundary_weight * boundary
 
         return total_loss / max(normalizer, 1e-6)

@@ -207,6 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 datasets/*
+test_datasets/*
+prepared_test_datasets/*
 prepared/*
 
 checkpoints/*

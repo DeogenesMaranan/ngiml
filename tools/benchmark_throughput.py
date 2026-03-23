@@ -1,4 +1,4 @@
-"""Lightweight dataloader and transfer benchmark for NGIML.
+﻿"""Lightweight dataloader and transfer benchmark for NGIML.
 
 This script measures DataLoader throughput, CPU->device transfer time, and
 prints simple recommendations. It gracefully falls back to CPU-only machines.
@@ -100,7 +100,7 @@ def main():
         # measure move to device
         t_move0 = time.time()
         if device.type == "cuda":
-            for k in ("images", "masks", "high_pass"):
+            for k in ("images", "masks", "residual_noise"):
                 v = batch.get(k)
                 if isinstance(v, torch.Tensor):
                     v = v.to(device, non_blocking=True)
@@ -152,3 +152,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

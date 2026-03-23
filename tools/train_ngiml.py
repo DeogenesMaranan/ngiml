@@ -1,4 +1,4 @@
-"""End-to-end NGIML training loop with checkpointing.
+﻿"""End-to-end NGIML training loop with checkpointing.
 
 Run example (Colab-ready):
     python tools/train_ngiml.py --manifest /content/data/manifest.json --output-dir /content/runs
@@ -26,16 +26,17 @@ import math
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
 from tqdm.auto import tqdm
 try:
     import xformers
-except ImportError:
+except Exception:
     xformers = None
 try:
     import flash_attn
-except ImportError:
+except Exception:
     flash_attn = None
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -187,7 +188,7 @@ class TrainConfig:
     local_cache_dir: Optional[str] = "/cache"
     reuse_local_cache_manifest: bool = True
     views_per_sample: int = 3
-    max_short_side: int = 480
+    resize_max_side: int = 0
     max_rotation_degrees: float = 6.0
     noise_std_max: float = 0.012
     disable_aug: bool = False
@@ -197,7 +198,6 @@ class TrainConfig:
     early_stopping_patience: int = 3
     early_stopping_min_delta: float = 5e-4
     early_stopping_monitor: str = "loss"
-    final_pred_stage: int = -1
     metric_threshold: float = 0.5
     optimize_threshold: bool = True
     threshold_metric: str = "f1"
@@ -332,7 +332,7 @@ def build_training_config(
         batch_size=20,
         num_workers=0,
         prefetch_factor=2,
-        max_short_side=480,
+        resize_max_side=896,
         max_rotation_degrees=6.0,
         noise_std_max=0.012,
         warmup_epochs=3,
@@ -467,7 +467,7 @@ def parse_args() -> TrainConfig:
         help="Reuse existing local cached manifest when available to shorten startup",
     )
     parser.add_argument("--views-per-sample", type=int, default=2, help="Number of augmented views per sample (on-the-fly)")
-    parser.add_argument("--max-short-side", type=int, default=384, help="Cap image short side before batching (lower is faster)")
+    parser.add_argument("--resize-max-side", type=int, default=384, help="Cap image short side before batching (lower is faster)")
     parser.add_argument("--max-rotation-degrees", type=float, default=0.0, help="Random rotation range (+/-)")
     parser.add_argument("--noise-std-max", type=float, default=0.01, help="Max Gaussian noise std")
     parser.add_argument("--disable-aug", action="store_true", help="Disable GPU augmentations")
@@ -481,12 +481,6 @@ def parse_args() -> TrainConfig:
         default="loss",
         choices=["loss", "iou", "f1", "recall", "precision", "accuracy"],
         help="Validation metric used for early stopping and best checkpoint",
-    )
-    parser.add_argument(
-        "--final-pred-stage",
-        type=int,
-        default=-1,
-        help="Prediction stage used as final output for metrics and scoring (0=highest resolution, -1=last stage)",
     )
     parser.add_argument("--metric-threshold", type=float, default=0.5, help="Fixed threshold for sigmoid outputs when threshold optimization is disabled")
     parser.add_argument("--optimize-threshold", action=argparse.BooleanOptionalAction, default=True, help="Search validation thresholds and use the best for metric reporting")
@@ -527,7 +521,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--tversky-alpha", type=float, default=0.3, help="Tversky alpha (FP penalty)")
     parser.add_argument("--tversky-beta", type=float, default=0.8, help="Tversky beta (FN penalty)")
     parser.add_argument("--lovasz-weight", type=float, default=0.0, help="Lovasz Hinge Loss weight for IoU optimization")
-    parser.add_argument("--use-boundary-loss", action=argparse.BooleanOptionalAction, default=False, help="Enable Sobel boundary loss on final prediction")
+    parser.add_argument("--use-boundary-loss", action=argparse.BooleanOptionalAction, default=True, help="Enable Sobel boundary loss on stage-0 (highest-resolution) prediction")
     parser.add_argument("--boundary-weight", type=float, default=0.05, help="Boundary loss weight when --use-boundary-loss is enabled")
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=True, help="Use EMA weights for validation and best checkpoints")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay factor")
@@ -536,6 +530,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--hard-mining-weight", type=float, default=0.03, help="Weight of hard-example auxiliary loss")
     parser.add_argument("--hard-mining-gamma", type=float, default=2.0, help="Scale for low-IoU hard-example weights")
     args = parser.parse_args()
+    resolved_resize_max_side = max(64, int(args.resize_max_side))
+
     return TrainConfig(
         manifest=args.manifest,
         output_dir=args.output_dir,
@@ -572,7 +568,7 @@ def parse_args() -> TrainConfig:
         local_cache_dir=args.local_cache_dir,
         reuse_local_cache_manifest=args.reuse_local_cache_manifest,
         views_per_sample=args.views_per_sample,
-        max_short_side=max(64, int(args.max_short_side)),
+        resize_max_side=resolved_resize_max_side,
         max_rotation_degrees=args.max_rotation_degrees,
         noise_std_max=args.noise_std_max,
         disable_aug=args.disable_aug,
@@ -581,7 +577,6 @@ def parse_args() -> TrainConfig:
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
         early_stopping_monitor=args.early_stopping_monitor,
-        final_pred_stage=int(args.final_pred_stage),
         metric_threshold=args.metric_threshold,
         optimize_threshold=args.optimize_threshold,
         threshold_metric=args.threshold_metric,
@@ -803,7 +798,7 @@ def _prepare_dataloaders(cfg: TrainConfig, device: torch.device):
         aug_seed=cfg.aug_seed if cfg.aug_seed is not None else cfg.seed,
         prefetch_factor=cfg.prefetch_factor,
         persistent_workers=cfg.persistent_workers,
-        max_short_side=cfg.max_short_side,
+        resize_max_side=int(cfg.resize_max_side),
         short_side_probe_samples=cfg.short_side_probe_samples,
         normalization_mode_override=collate_norm_mode,
     )
@@ -904,21 +899,11 @@ def _segmentation_counts(logits: torch.Tensor, target: torch.Tensor, threshold: 
     return {"tp": float(tp), "tn": float(tn), "fp": float(fp), "fn": float(fn)}
 
 
-def _select_pred_head(preds: Sequence[torch.Tensor], stage_index: int) -> torch.Tensor:
+def _select_pred_head(preds: Sequence[torch.Tensor]) -> torch.Tensor:
     if not preds:
         raise ValueError("Model returned empty predictions list")
-
-    num_stages = len(preds)
-    idx = int(stage_index)
-    if idx < 0:
-        idx = num_stages + idx
-
-    if idx < 0 or idx >= num_stages:
-        raise ValueError(
-            f"final_pred_stage {stage_index} is out of range for {num_stages} prediction stages"
-        )
-
-    return preds[idx]
+    # Highest-resolution decoder output is index 0 by contract.
+    return preds[0]
 
 
 def _metrics_from_counts(tp: float, tn: float, fp: float, fn: float, eps: float = 1e-6) -> Dict[str, float]:
@@ -1239,12 +1224,11 @@ def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
             param.requires_grad = bool(trainable)
 
 
-def _sample_has_mask_high_pass(record) -> tuple[bool, bool]:
+def _sample_has_mask(record) -> bool:
     has_mask = bool(record.mask_path)
-    has_high_pass = bool(record.high_pass_path)
     image_path = str(record.image_path)
     if not image_path.endswith(".npz"):
-        return has_mask, has_high_pass
+        return has_mask
 
     try:
         if "::" in image_path:
@@ -1255,15 +1239,13 @@ def _sample_has_mask_high_pass(record) -> tuple[bool, bool]:
                     raise FileNotFoundError(f"Missing member {member_name} in {archive_path}")
                 with np.load(io.BytesIO(member.read()), allow_pickle=False) as npz_data:
                     has_mask = has_mask or ("mask" in npz_data and npz_data["mask"].size > 0)
-                    has_high_pass = has_high_pass or ("high_pass" in npz_data and npz_data["high_pass"].size > 0)
         else:
             with np.load(image_path, allow_pickle=False) as npz_data:
                 has_mask = has_mask or ("mask" in npz_data and npz_data["mask"].size > 0)
-                has_high_pass = has_high_pass or ("high_pass" in npz_data and npz_data["high_pass"].size > 0)
     except Exception as exc:
-        raise ValueError(f"Failed to inspect NPZ sample for mask/high_pass fields: {image_path}") from exc
+        raise ValueError(f"Failed to inspect NPZ sample for mask field: {image_path}") from exc
 
-    return has_mask, has_high_pass
+    return has_mask
 
 
 def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
@@ -1276,7 +1258,6 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
     real_count = 0
     fake_count = 0
     mask_count = 0
-    high_pass_count = 0
 
     for sample in train_samples:
         per_dataset_counts[sample.dataset] = per_dataset_counts.get(sample.dataset, 0) + 1
@@ -1288,11 +1269,9 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
         else:
             raise ValueError(f"Unexpected train label {label} for sample: {sample.image_path}")
 
-        has_mask, has_high_pass = _sample_has_mask_high_pass(sample)
+        has_mask = _sample_has_mask(sample)
         if has_mask:
             mask_count += 1
-        if has_high_pass:
-            high_pass_count += 1
 
     total = len(train_samples)
     print("Train dataset integrity summary")
@@ -1309,8 +1288,7 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
     )
     print(
         "  Coverage: "
-        f"masks={100.0 * (mask_count / max(total, 1)):.1f}% "
-        f"high_pass={100.0 * (high_pass_count / max(total, 1)):.1f}%"
+        f"masks={100.0 * (mask_count / max(total, 1)):.1f}%"
     )
 
     if fake_count <= 0:
@@ -1479,6 +1457,30 @@ def _resolve_cuda_runtime_stability(cfg: TrainConfig, device: torch.device) -> T
         )
         return resolved
     return cfg
+
+
+def _disable_pretrained_backbones_for_checkpoint_load(model_cfg: HybridNGIMLConfig) -> HybridNGIMLConfig:
+    """Return a config that avoids external backbone downloads during checkpoint restore."""
+    cfg_out = model_cfg
+    try:
+        if hasattr(cfg_out.efficientnet, "pretrained"):
+            cfg_out = replace(cfg_out, efficientnet=replace(cfg_out.efficientnet, pretrained=False))
+    except Exception:
+        try:
+            cfg_out.efficientnet.pretrained = False
+        except Exception:
+            pass
+
+    try:
+        if hasattr(cfg_out.swin, "pretrained"):
+            cfg_out = replace(cfg_out, swin=replace(cfg_out.swin, pretrained=False))
+    except Exception:
+        try:
+            cfg_out.swin.pretrained = False
+        except Exception:
+            pass
+
+    return cfg_out
 
 
 def _is_cudnn_engine_error(exc: RuntimeError) -> bool:
@@ -1808,12 +1810,12 @@ def train_one_epoch(
             images = images.to(device, non_blocking=True)
         if masks.device != device:
             masks = masks.to(device, non_blocking=True)
-        high_pass = batch.get("high_pass")
-        if isinstance(high_pass, torch.Tensor):
-            if high_pass.device != device:
-                high_pass = high_pass.to(device, non_blocking=True)
+        residual_noise = batch.get("residual_noise")
+        if isinstance(residual_noise, torch.Tensor):
+            if residual_noise.device != device:
+                residual_noise = residual_noise.to(device, non_blocking=True)
         else:
-            high_pass = None
+            residual_noise = None
         # Apply GPU-side augmentations and normalization when requested.
         aug_start = None
         forward_start = None
@@ -1859,14 +1861,14 @@ def train_one_epoch(
                     img_slice = images[idxs]
                     mask_slice = masks[idxs]
                     hp_slice = None
-                    if high_pass is not None:
-                        hp_slice = high_pass[idxs]
+                    if residual_noise is not None:
+                        hp_slice = residual_noise[idxs]
 
                     img_out, mask_out, hp_out = _apply_gpu_augmentations_batch(
                         img_slice,
                         mask_slice,
                         aug_cfg,
-                        high_pass=hp_slice,
+                        residual_noise=hp_slice,
                         generator=gen,
                     )
 
@@ -1878,8 +1880,8 @@ def train_one_epoch(
 
                     images[idxs] = img_out
                     masks[idxs] = mask_out
-                    if hp_out is not None and high_pass is not None:
-                        high_pass[idxs] = hp_out
+                    if hp_out is not None and residual_noise is not None:
+                        residual_noise[idxs] = hp_out
             aug_end = time.perf_counter()
         else:
             aug_end = None
@@ -1889,8 +1891,8 @@ def train_one_epoch(
         sampled_total += total_count
         if cfg.channels_last and device.type == "cuda":
             images = images.contiguous(memory_format=torch.channels_last)
-            if high_pass is not None:
-                high_pass = high_pass.contiguous(memory_format=torch.channels_last)
+            if residual_noise is not None:
+                residual_noise = residual_noise.contiguous(memory_format=torch.channels_last)
 
         precision_name = (getattr(cfg, "precision", "fp32") or "fp32").lower()
         amp_dtype = torch.bfloat16 if precision_name == "bf16" else (torch.float16 if precision_name == "fp16" else None)
@@ -1898,17 +1900,17 @@ def train_one_epoch(
         if amp_dtype is not None:
             forward_start = time.perf_counter()
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+                preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
                 loss = loss_fn(preds, masks)
             forward_end = time.perf_counter()
         else:
             forward_start = time.perf_counter()
-            preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+            preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
             loss = loss_fn(preds, masks)
             forward_end = time.perf_counter()
 
         if cfg.hard_mining_enabled and epoch >= int(max(0, cfg.hard_mining_start_epoch)):
-            final_logits = _select_pred_head(preds, cfg.final_pred_stage)
+            final_logits = _select_pred_head(preds)
             if final_logits.shape[-2:] != masks.shape[-2:]:
                 final_logits = torch.nn.functional.interpolate(
                     final_logits,
@@ -1989,24 +1991,24 @@ def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: T
     for batch in loader:
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
-        high_pass = batch.get("high_pass")
-        if isinstance(high_pass, torch.Tensor):
-            high_pass = high_pass.to(device, non_blocking=True)
+        residual_noise = batch.get("residual_noise")
+        if isinstance(residual_noise, torch.Tensor):
+            residual_noise = residual_noise.to(device, non_blocking=True)
         else:
-            high_pass = None
+            residual_noise = None
         if cfg.channels_last and device.type == "cuda":
             images = images.contiguous(memory_format=torch.channels_last)
-            if high_pass is not None:
-                high_pass = high_pass.contiguous(memory_format=torch.channels_last)
+            if residual_noise is not None:
+                residual_noise = residual_noise.contiguous(memory_format=torch.channels_last)
         precision_name = (getattr(cfg, "precision", "fp32") or "fp32").lower()
         amp_dtype = torch.bfloat16 if precision_name == "bf16" else (torch.float16 if precision_name == "fp16" else None)
         use_amp = cfg.amp and device.type == "cuda" and (amp_dtype is not None)
         if amp_dtype is not None:
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+                preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
         else:
-            preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
-        logits = _select_pred_head(preds, cfg.final_pred_stage)
+            preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
+        logits = _select_pred_head(preds)
 
         for threshold in thresholds:
             counts = _segmentation_counts(logits, masks, threshold=threshold)
@@ -2066,11 +2068,11 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
     for batch in progress:
         images = batch["images"].to(device, non_blocking=True)
         masks = batch["masks"].to(device, non_blocking=True)
-        high_pass = batch.get("high_pass")
-        if isinstance(high_pass, torch.Tensor):
-            high_pass = high_pass.to(device, non_blocking=True)
+        residual_noise = batch.get("residual_noise")
+        if isinstance(residual_noise, torch.Tensor):
+            residual_noise = residual_noise.to(device, non_blocking=True)
         else:
-            high_pass = None
+            residual_noise = None
         # If collate left normalization to be done on-device (collate used zero_one),
         # perform normalization here on the GPU for evaluation.
         if device.type == "cuda" and normalization_mode is not None:
@@ -2079,19 +2081,19 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
                 images[i] = _normalize(images[i], normalization_mode, imagenet_mean=imagenet_mean, imagenet_std=imagenet_std)
         if cfg.channels_last and device.type == "cuda":
             images = images.contiguous(memory_format=torch.channels_last)
-            if high_pass is not None:
-                high_pass = high_pass.contiguous(memory_format=torch.channels_last)
+            if residual_noise is not None:
+                residual_noise = residual_noise.contiguous(memory_format=torch.channels_last)
         precision_name = (getattr(cfg, "precision", "fp32") or "fp32").lower()
         amp_dtype = torch.bfloat16 if precision_name == "bf16" else (torch.float16 if precision_name == "fp16" else None)
         use_amp = cfg.amp and device.type == "cuda" and (amp_dtype is not None)
         if amp_dtype is not None:
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+                preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
                 loss = loss_fn(preds, masks)
         else:
-            preds = model(images, target_size=masks.shape[-2:], high_pass=high_pass)
+            preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
             loss = loss_fn(preds, masks)
-        logits = _select_pred_head(preds, cfg.final_pred_stage)
+        logits = _select_pred_head(preds)
 
         with torch.no_grad():
             fg_ratio = masks.float().mean(dim=(1, 2, 3))
@@ -2234,7 +2236,19 @@ def run_training(cfg: TrainConfig) -> None:
         foreground_ratio = compute_foreground_pixel_ratio(loaders["train"], max_batches=sampled_batches)
         print(f"Foreground pixel ratio (train): {foreground_ratio:.6f}")
 
+    start_epoch = 0
+    global_step = 0
+    resume_path: Optional[Path] = None
+    if cfg.resume:
+        resume_path = Path(cfg.resume)
+    elif cfg.auto_resume:
+        resume_path = find_latest_checkpoint(out_dir)
+        if resume_path is not None:
+            print(f"Auto-resume selected latest checkpoint: {resume_path}")
+
     model_cfg = _coerce_model_config(cfg.model_config)
+    if resume_path is not None and resume_path.is_file():
+        model_cfg = _disable_pretrained_backbones_for_checkpoint_load(model_cfg)
     base_loss_cfg = _coerce_loss_config(cfg.loss_config)
     cfg = replace(cfg, model_config=model_cfg, loss_config=base_loss_cfg)
 
@@ -2305,16 +2319,6 @@ def run_training(cfg: TrainConfig) -> None:
     checkpoint_dir = out_dir / "checkpoints"
     checkpoint_log_path = checkpoint_dir / "checkpoint_metrics.json"
 
-    start_epoch = 0
-    global_step = 0
-    resume_path: Optional[Path] = None
-    if cfg.resume:
-        resume_path = Path(cfg.resume)
-    elif cfg.auto_resume:
-        resume_path = find_latest_checkpoint(out_dir)
-        if resume_path is not None:
-            print(f"Auto-resume selected latest checkpoint: {resume_path}")
-
     if resume_path:
         if resume_path.is_file():
             start_epoch, global_step = load_checkpoint(
@@ -2363,7 +2367,6 @@ def run_training(cfg: TrainConfig) -> None:
     best_monitor_value = _initial_best_for_monitor(cfg.early_stopping_monitor)
     best_val_iou = float("-inf")
     best_val_f1 = float("-inf")
-    best_val_loss = float("inf")
     no_improve_epochs = 0
     early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
     best_threshold_path = checkpoint_dir / "best_threshold.json"
@@ -2488,13 +2491,16 @@ def run_training(cfg: TrainConfig) -> None:
 
             iou_improved = val_iou > (best_val_iou + cfg.early_stopping_min_delta)
             f1_improved = val_f1 > (best_val_f1 + cfg.early_stopping_min_delta)
-            loss_improved = val_loss < (best_val_loss - cfg.early_stopping_min_delta)
-            # Save best iou checkpoint as before
             if iou_improved:
                 best_val_iou = val_iou
-                best_iou_path = checkpoint_dir / "best_iou_checkpoint.pt"
+            if f1_improved:
+                best_val_f1 = val_f1
+
+            overlap_improved = iou_improved or f1_improved
+            if overlap_improved:
+                best_f1_iou_path = checkpoint_dir / "best_f1_iou_checkpoint.pt"
                 save_checkpoint(
-                    best_iou_path,
+                    best_f1_iou_path,
                     model,
                     optimizer,
                     scaler,
@@ -2505,29 +2511,10 @@ def run_training(cfg: TrainConfig) -> None:
                     ema_model=ema_model,
                     use_ema_for_model_state=(ema_model is not None),
                 )
-                print(f"New best val iou {best_val_iou:.4f}; saved to {best_iou_path}")
-                # If IoU is the early-stopping monitor, also save a best-F1 checkpoint
-                try:
-                    monitor_name = str(cfg.early_stopping_monitor).strip().lower()
-                except Exception:
-                    monitor_name = ""
-                if monitor_name == "iou":
-                    if val_f1 is not None and val_f1 > best_val_f1:
-                        best_val_f1 = val_f1
-                        best_f1_path = checkpoint_dir / "best_f1_checkpoint.pt"
-                        save_checkpoint(
-                            best_f1_path,
-                            model,
-                            optimizer,
-                            scaler,
-                            epoch + 1,
-                            global_step,
-                            cfg,
-                            scheduler=scheduler,
-                            ema_model=ema_model,
-                            use_ema_for_model_state=(ema_model is not None),
-                        )
-                        print(f"New best val f1 {best_val_f1:.4f}; saved to {best_f1_path}")
+                print(
+                    f"New best overlap metrics | iou {best_val_iou:.4f} | f1 {best_val_f1:.4f}; "
+                    f"saved to {best_f1_iou_path}"
+                )
 
             # Use the configured early-stopping monitor to determine when to reset patience
             monitor_value = _metric_for_monitor(metrics, cfg.early_stopping_monitor)
@@ -2538,10 +2525,8 @@ def run_training(cfg: TrainConfig) -> None:
                 cfg.early_stopping_min_delta,
             )
 
-            if loss_improved:
-                best_val_loss = val_loss
-                configured_monitor = str(getattr(cfg, "early_stopping_monitor", "loss")).strip().lower()
-                monitor_for_metadata = configured_monitor if configured_monitor in metrics else "loss"
+            if monitor_improved:
+                monitor_for_metadata = str(getattr(cfg, "early_stopping_monitor", "loss")).strip().lower()
                 monitor_value_for_metadata = _metric_for_monitor(metrics, monitor_for_metadata)
                 best_alias_path = checkpoint_dir / "best_checkpoint.pt"
                 save_checkpoint(
@@ -2578,14 +2563,13 @@ def run_training(cfg: TrainConfig) -> None:
                     },
                 )
                 print(
-                    f"New best val loss {val_loss:.4f}; "
+                    f"New best {monitor_for_metadata} {monitor_value_for_metadata:.4f}; "
                     f"saved to {best_alias_path} (threshold metadata: {best_threshold_path})"
                 )
 
             if monitor_improved:
                 # Update recorded bests and reset patience
                 best_monitor_value = monitor_value
-                best_val_f1 = val_f1
                 no_improve_epochs = 0
                 print(f"New best {cfg.early_stopping_monitor} {monitor_value:.4f}")
             else:
@@ -2644,3 +2628,4 @@ def run_training(cfg: TrainConfig) -> None:
 if __name__ == "__main__":
     configuration = parse_args()
     run_training(configuration)
+
