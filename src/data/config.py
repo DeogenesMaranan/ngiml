@@ -41,7 +41,7 @@ class SplitConfig:
 
 @dataclass
 class PreparationConfig:
-    target_sizes: Sequence[int] = (384,)
+    target_sizes: Sequence[int] = (448,)
     normalization_mode: str = "imagenet"
     tar_shard_size: int = 0  # 0 disables tar sharding; otherwise samples per shard
     resize_max_side: int = 896

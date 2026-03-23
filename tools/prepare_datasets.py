@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import random
 import re
@@ -192,6 +193,7 @@ def _build_npz_bytes(
     resize_max_side: int,
     rng: random.Random,
 ) -> bytes:
+    # Tiny-image filtering is handled upstream in prepare_single_dataset.
     image = Image.open(image_path).convert("RGB")
     mask_img = Image.open(mask_path).convert("L") if mask_path is not None else None
 
@@ -207,18 +209,29 @@ def _build_npz_bytes(
                 mask_img = mask_img.resize((new_w, new_h), Image.NEAREST)
 
     if crop_size > 0 and split_name in {"train", "val"}:
-        w, h = image.size
-        min_side = min(w, h)
-        if min_side < crop_size:
-            scale = float(crop_size) / float(min_side)
-            new_w = max(crop_size, int(round(w * scale)))
-            new_h = max(crop_size, int(round(h * scale)))
-            image = image.resize((new_w, new_h), Image.BILINEAR)
-            if mask_img is not None:
-                mask_img = mask_img.resize((new_w, new_h), Image.NEAREST)
-
         image_np_full = np.asarray(image, dtype=np.uint8)
         mask_np_full = np.asarray(mask_img, dtype=np.uint8) if mask_img is not None else None
+
+        h_full, w_full = image_np_full.shape[:2]
+        pad_h = max(0, crop_size - h_full)
+        pad_w = max(0, crop_size - w_full)
+        if pad_h > 0 or pad_w > 0:
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+            image_np_full = np.pad(
+                image_np_full,
+                ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+                mode="symmetric",
+            )
+            if mask_np_full is not None:
+                mask_np_full = np.pad(
+                    mask_np_full,
+                    ((pad_top, pad_bottom), (pad_left, pad_right)),
+                    mode="constant",
+                    constant_values=0,
+                )
 
         h_full, w_full = image_np_full.shape[:2]
         max_top = max(0, h_full - crop_size)
@@ -287,6 +300,7 @@ def prepare_single_dataset(
     cfg: DatasetStructureConfig,
     split_cfg: SplitConfig,
     prep_cfg: PreparationConfig,
+    sample_limit: int = 0,
 ) -> List[SampleRecord]:
     root = cfg.root()
     if not root.exists():
@@ -299,10 +313,24 @@ def prepare_single_dataset(
     real_images = _discover_images(real_dir) if real_dir.exists() else []
     fake_images = _discover_images(fake_dir) if fake_dir.exists() else []
     dir_tokens, stem_suffixes = _build_grouping_rules(cfg)
+    target_sizes = sorted(prep_cfg.target_size_set())
+    if len(target_sizes) != 1:
+        raise ValueError(
+            f"prepare_datasets expects exactly one target size, got {target_sizes}"
+        )
+    crop_size = target_sizes[0]
+    tiny_threshold = max(1, crop_size // 2)
 
     records: List[SampleRecord] = []
+    skipped_fake_missing_mask = 0
+    skipped_tiny_images = 0
 
     for real_img in tqdm(real_images, desc=f"{cfg.dataset_name} real", leave=False):
+        with Image.open(real_img) as real_pil:
+            w, h = real_pil.size
+        if min(w, h) < tiny_threshold:
+            skipped_tiny_images += 1
+            continue
         records.append(
             SampleRecord(
                 dataset=cfg.dataset_name,
@@ -314,8 +342,14 @@ def prepare_single_dataset(
         )
 
     for fake_img in tqdm(fake_images, desc=f"{cfg.dataset_name} fake", leave=False):
+        with Image.open(fake_img) as fake_pil:
+            w, h = fake_pil.size
+        if min(w, h) < tiny_threshold:
+            skipped_tiny_images += 1
+            continue
         mask_path = _find_mask(fake_img, mask_dir, cfg.mask_suffix)
         if mask_path is None:
+            skipped_fake_missing_mask += 1
             print(f"Skipping fake image without mask: {fake_img}", file=sys.stderr)
             continue
         records.append(
@@ -329,18 +363,15 @@ def prepare_single_dataset(
         )
 
     # Apply sampling limit if set
-    sample_limit = getattr(split_cfg, 'sample_limit', 0)
-    if hasattr(split_cfg, 'sample_limit_override'):
-        sample_limit = split_cfg.sample_limit_override
-    if sample_limit is not None and sample_limit > 0 and len(records) > sample_limit:
-        rng = random.Random(split_cfg.seed)
+    if sample_limit > 0 and len(records) > sample_limit:
+        sample_seed_text = f"{split_cfg.seed}|{cfg.dataset_name}|sample_limit"
+        sample_seed = int.from_bytes(hashlib.blake2b(sample_seed_text.encode("utf-8"), digest_size=8).digest(), "big")
+        rng = random.Random(sample_seed)
         records = rng.sample(records, sample_limit)
 
     splits = _split_records(records, split_cfg, root, dir_tokens, stem_suffixes)
 
     prepared_records: List[SampleRecord] = []
-    crop_size = sorted(prep_cfg.target_size_set())[0]
-    split_rng = random.Random(split_cfg.seed)
     for split_name, split_records in splits.items():
         if not split_records:
             continue
@@ -352,13 +383,16 @@ def prepare_single_dataset(
         for idx, rec in enumerate(tqdm(split_records, desc=f"{cfg.dataset_name} {split_name}", leave=False)):
             image_path = Path(rec.image_path)
             mask_path = Path(rec.mask_path) if rec.mask_path is not None else None
+            seed_text = f"{split_cfg.seed}|{cfg.dataset_name}|{split_name}|{image_path.as_posix()}"
+            sample_seed = int.from_bytes(hashlib.blake2b(seed_text.encode("utf-8"), digest_size=8).digest(), "big")
+            sample_rng = random.Random(sample_seed)
             npz_bytes = _build_npz_bytes(
                 image_path=image_path,
                 mask_path=mask_path,
                 split_name=split_name,
                 crop_size=crop_size,
                 resize_max_side=prep_cfg.resize_max_side,
-                rng=split_rng,
+                rng=sample_rng,
             )
 
             stem = f"{cfg.dataset_name}_{split_name}_{'fake' if rec.label else 'real'}_{idx:06d}"
@@ -395,6 +429,17 @@ def prepare_single_dataset(
 
         if tar_writer is not None:
             tar_writer.close()
+
+    if skipped_fake_missing_mask > 0:
+        print(
+            f"[{cfg.dataset_name}] Skipped fake images without masks: {skipped_fake_missing_mask}",
+            file=sys.stderr,
+        )
+    if skipped_tiny_images > 0:
+        print(
+            f"[{cfg.dataset_name}] Filtered tiny images (short side < {tiny_threshold}px): {skipped_tiny_images}",
+            file=sys.stderr,
+        )
     return prepared_records
 
 
@@ -403,13 +448,14 @@ def prepare_all(
     per_dataset_splits: Dict[str, SplitConfig],
     prep_cfg: PreparationConfig,
     manifest_out: Path,
+    sample_limit: int = 0,
 ) -> Manifest:
     all_records: List[SampleRecord] = []
     for cfg in tqdm(datasets, desc="datasets"):
         split_cfg = per_dataset_splits.get(cfg.dataset_name)
         if split_cfg is None:
             raise ValueError(f"Missing split config for dataset {cfg.dataset_name}")
-        records = prepare_single_dataset(cfg, split_cfg, prep_cfg)
+        records = prepare_single_dataset(cfg, split_cfg, prep_cfg, sample_limit=sample_limit)
         all_records.extend(records)
 
     manifest = Manifest(samples=all_records, normalization_mode=prep_cfg.normalization_mode)
@@ -496,12 +542,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     datasets, per_dataset_splits, prep_cfg = build_default_configs()
-    # Inject sample_limit into split configs if set
-    if hasattr(args, 'sample_limit') and args.sample_limit is not None:
-        for cfg in datasets:
-            split_cfg = per_dataset_splits.get(cfg.dataset_name)
-            if split_cfg is not None:
-                setattr(split_cfg, 'sample_limit_override', args.sample_limit)
 
     # Filter datasets if --dataset is specified
     if args.dataset:
@@ -520,7 +560,13 @@ def main() -> None:
     else:
         manifest_out = prepared_root / "manifest.parquet"
 
-    manifest = prepare_all(datasets, per_dataset_splits, prep_cfg, manifest_out)
+    manifest = prepare_all(
+        datasets,
+        per_dataset_splits,
+        prep_cfg,
+        manifest_out,
+        sample_limit=int(args.sample_limit),
+    )
     print(f"Wrote manifest with {len(manifest.samples)} samples to {manifest_out}")
 
 

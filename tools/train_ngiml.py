@@ -196,10 +196,10 @@ class TrainConfig:
     aug_seed: Optional[int] = 42
     seed: int = 42
     early_stopping_patience: int = 3
-    early_stopping_min_delta: float = 5e-4
-    early_stopping_monitor: str = "loss"
+    early_stopping_min_delta: float = 2e-3
+    early_stopping_monitor: str = "f1"
     metric_threshold: float = 0.5
-    optimize_threshold: bool = True
+    optimize_threshold: bool = False
     threshold_metric: str = "f1"
     threshold_start: float = 0.2
     threshold_end: float = 0.8
@@ -261,7 +261,7 @@ def build_default_components() -> tuple[HybridNGIMLConfig, MultiStageLossConfig,
 
     model_cfg = HybridNGIMLConfig(
         efficientnet=EfficientNetBackboneConfig(pretrained=True),
-        swin=SwinBackboneConfig(model_name="swin_tiny_patch4_window7_224", pretrained=True, input_size=384),
+        swin=SwinBackboneConfig(model_name="swin_tiny_patch4_window7_224", pretrained=True, input_size=448),
         residual=ResidualNoiseConfig(num_kernels=3, base_channels=32, num_stages=4),
         fusion=FeatureFusionConfig(fusion_channels=(64, 128, 192, 256)),
         decoder=UNetDecoderConfig(decoder_channels=None, out_channels=1, per_stage_heads=True),
@@ -467,23 +467,23 @@ def parse_args() -> TrainConfig:
         help="Reuse existing local cached manifest when available to shorten startup",
     )
     parser.add_argument("--views-per-sample", type=int, default=2, help="Number of augmented views per sample (on-the-fly)")
-    parser.add_argument("--resize-max-side", type=int, default=384, help="Cap image short side before batching (lower is faster)")
+    parser.add_argument("--resize-max-side", type=int, default=448, help="Cap image short side before batching (lower is faster)")
     parser.add_argument("--max-rotation-degrees", type=float, default=0.0, help="Random rotation range (+/-)")
     parser.add_argument("--noise-std-max", type=float, default=0.01, help="Max Gaussian noise std")
     parser.add_argument("--disable-aug", action="store_true", help="Disable GPU augmentations")
     parser.add_argument("--device", type=str, default=None, help="Override device (e.g., cuda:0 or cpu)")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducibility")
-    parser.add_argument("--early-stopping-patience", type=int, default=1, help="Stop after N validations without improvement; <=0 disables")
-    parser.add_argument("--early-stopping-min-delta", type=float, default=5e-4, help="Minimum monitored-metric improvement to reset early stopping")
+    parser.add_argument("--early-stopping-patience", type=int, default=2, help="Stop after N validations without improvement; <=0 disables")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=2e-3, help="Minimum monitored-metric improvement to reset early stopping")
     parser.add_argument(
         "--early-stopping-monitor",
         type=str,
-        default="loss",
+        default="f1",
         choices=["loss", "iou", "f1", "recall", "precision", "accuracy"],
         help="Validation metric used for early stopping and best checkpoint",
     )
     parser.add_argument("--metric-threshold", type=float, default=0.5, help="Fixed threshold for sigmoid outputs when threshold optimization is disabled")
-    parser.add_argument("--optimize-threshold", action=argparse.BooleanOptionalAction, default=True, help="Search validation thresholds and use the best for metric reporting")
+    parser.add_argument("--optimize-threshold", action=argparse.BooleanOptionalAction, default=False, help="Search validation thresholds and use the best for metric reporting")
     parser.add_argument("--threshold-metric", type=str, default="f1", choices=["iou", "f1"], help="Metric used to select best threshold")
     parser.add_argument("--threshold-start", type=float, default=0.2, help="Threshold search range start")
     parser.add_argument("--threshold-end", type=float, default=0.8, help="Threshold search range end")

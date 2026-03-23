@@ -67,8 +67,8 @@ def test_build_npz_bytes_uses_mask_aware_crop_and_binary_mask(tmp_path: Path):
         out_mask = data["mask"]
         payload_keys = set(data.files)
 
-    assert out_image.shape == (384, 384, 3)
-    assert out_mask.shape == (384, 384)
+    assert out_image.shape == (448, 448, 3)
+    assert out_mask.shape == (448, 448)
     assert "residual_noise" not in payload_keys
     assert int(out_mask.sum()) > 0
     assert set(np.unique(out_mask).tolist()).issubset({0, 1})

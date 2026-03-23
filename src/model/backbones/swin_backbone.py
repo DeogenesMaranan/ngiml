@@ -22,7 +22,7 @@ class SwinBackboneConfig:
     model_name: str = "swin_tiny_patch4_window7_224"
     pretrained: bool = True
     out_indices: Sequence[int] = (0, 1, 2, 3)
-    input_size: Union[int, Tuple[int, int], None] = 384
+    input_size: Union[int, Tuple[int, int], None] = 448
     allow_variable_input: bool = True
 
 

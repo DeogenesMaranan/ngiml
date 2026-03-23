@@ -21,7 +21,114 @@ from src.data.dataloaders import (
 from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
 from tools.train_ngiml import build_default_components
+import numpy as np
+import json
+from pathlib import Path
+import tarfile
+import io
+import matplotlib.pyplot as plt
 
+def _to_chw_rgb(image_np: np.ndarray) -> np.ndarray:
+    if image_np.ndim == 2:
+        image_np = np.stack([image_np, image_np, image_np], axis=-1)
+    if image_np.ndim == 3 and image_np.shape[0] in (1, 3) and image_np.shape[-1] not in (1, 3):
+        image_np = np.transpose(image_np, (1, 2, 0))
+    if image_np.ndim != 3:
+        raise ValueError(f'Unsupported image shape: {image_np.shape}')
+    if image_np.shape[-1] == 1:
+        image_np = np.repeat(image_np, 3, axis=-1)
+    if image_np.shape[-1] > 3:
+        image_np = image_np[..., :3]
+    return np.transpose(image_np, (2, 0, 1))
+
+def _to_hw_mask(mask_np: np.ndarray | None, h: int, w: int) -> np.ndarray:
+    if mask_np is None:
+        return np.zeros((h, w), dtype=np.uint8)
+    arr = np.asarray(mask_np)
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    arr = (arr > 0).astype(np.uint8)
+    if arr.shape != (h, w):
+        raise ValueError(f'Mask shape {arr.shape} does not match image {(h, w)}')
+    return arr
+
+def _parse_meta(raw) -> dict:
+    if raw is None:
+        return {}
+    if isinstance(raw, np.ndarray):
+        raw = raw.item()
+    if isinstance(raw, bytes):
+        raw = raw.decode('utf-8', errors='replace')
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {'metadata_raw': raw}
+    return raw if isinstance(raw, dict) else {'metadata_raw': str(raw)}
+
+def _dataset_name(sample_uri: str, meta: dict) -> str:
+    for k in ('dataset', 'dataset_name', 'source_dataset'):
+        if str(meta.get(k, '')).strip():
+            return str(meta[k]).strip()
+    parts = Path(sample_uri.split('::')[0]).parts
+    for i, part in enumerate(parts):
+        if part.lower() in {'test', 'val', 'train'} and i > 0:
+            return parts[i - 1]
+    return parts[0] if parts else 'unknown'
+
+def iter_prepared_samples(snapshot_root: Path):
+    for npz_path in sorted(snapshot_root.rglob('*.npz')):
+        with np.load(npz_path, allow_pickle=True) as blob:
+            yield str(npz_path), {k: blob[k] for k in blob.files}
+
+    for tar_path in sorted(snapshot_root.rglob('*.tar')):
+        with tarfile.open(tar_path, mode='r') as tf:
+            for m in tf.getmembers():
+                if not m.isfile() or not m.name.lower().endswith('.npz'):
+                    continue
+                fobj = tf.extractfile(m)
+                if fobj is None:
+                    continue
+                with np.load(io.BytesIO(fobj.read()), allow_pickle=True) as blob:
+                    yield f'{tar_path}::{m.name}', {k: blob[k] for k in blob.files}
+
+def compute_binary_metrics(pred_bin: np.ndarray, gt_bin: np.ndarray) -> dict[str, float]:
+    pred = pred_bin.astype(bool)
+    gt = gt_bin.astype(bool)
+    tp = float(np.logical_and(pred, gt).sum())
+    tn = float(np.logical_and(~pred, ~gt).sum())
+    fp = float(np.logical_and(pred, ~gt).sum())
+    fn = float(np.logical_and(~pred, gt).sum())
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = (2 * precision * recall) / (precision + recall + 1e-8)
+    iou = tp / (tp + fp + fn + 1e-8)
+    acc = (tp + tn) / (tp + tn + fp + fn + 1e-8)
+    return {'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn, 'precision': precision, 'recall': recall, 'f1': f1, 'iou': iou, 'accuracy': acc}
+
+def save_sample_plot(out_path: Path, image_chw: np.ndarray, gt_hw: np.ndarray, prob_hw: np.ndarray, bin05_hw: np.ndarray, title: str):
+    img = np.transpose(image_chw, (1, 2, 0)).astype(np.float32)
+    if img.max() > 1.0:
+        img = img / 255.0
+    img = np.clip(img, 0.0, 1.0)
+    alpha = 0.45 * prob_hw[..., None].astype(np.float32)
+    overlay = np.clip(img * (1.0 - alpha) + np.array([1.0, 0.0, 0.0]) * alpha, 0.0, 1.0)
+
+    fig, axes = plt.subplots(1, 5, figsize=(22, 5))
+    fig.suptitle(title, fontsize=11)
+    axes[0].imshow(img); axes[0].set_title('Image'); axes[0].axis('off')
+    axes[1].imshow(gt_hw, cmap='gray', vmin=0, vmax=1); axes[1].set_title('Ground Truth'); axes[1].axis('off')
+    axes[2].imshow(prob_hw, cmap='magma', vmin=0, vmax=1); axes[2].set_title('Pred Mask (magma)'); axes[2].axis('off')
+    axes[3].imshow(bin05_hw, cmap='gray', vmin=0, vmax=1); axes[3].set_title('Pred Mask (0.5 threshold)'); axes[3].axis('off')
+    axes[4].imshow(overlay); axes[4].set_title('Overlay'); axes[4].axis('off')
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160, bbox_inches='tight')
+    plt.close(fig)
 
 def _zero_flop_jit(_inputs, _outputs) -> Counter[str]:
     return Counter()
@@ -1121,7 +1228,7 @@ def plot_multi_strategy_inference(
 
 def get_model_complexity_stats(
     model: HybridNGIML,
-    input_size: tuple[int, int, int, int] = (1, 3, 384, 384),
+    input_size: tuple[int, int, int, int] = (1, 3, 448, 448),
 ) -> dict[str, object]:
     total_params = sum(parameter.numel() for parameter in model.parameters())
     trainable_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)

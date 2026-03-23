@@ -17,7 +17,7 @@ from PIL import Image
 
 try:
     from tqdm import tqdm
-except ImportError:  # pragma: no cover
+except ImportError:
     def tqdm(iterable: Iterable | None = None, **_: object):
         return iterable if iterable is not None else []
 
@@ -62,7 +62,7 @@ def default_specs() -> list[DatasetSpec]:
         ),
         DatasetSpec(
             name="Columbia",
-            real_dir=None,
+            real_dir=None,  # fakes + masks only
             fake_dir="fake",
             mask_dir="mask",
             mask_stem_candidates=_columbia_mask_candidates,
@@ -80,7 +80,10 @@ def default_specs() -> list[DatasetSpec]:
 def _discover_images(root: Path) -> list[Path]:
     if not root.exists():
         return []
-    return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
+    return sorted(
+        p for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    )
 
 
 def _safe_name(value: str) -> str:
@@ -97,34 +100,153 @@ def _build_mask_index(mask_dir: Path) -> dict[str, Path]:
     return index
 
 
-def _resolve_mask(fake_path: Path, mask_index: dict[str, Path], candidates_fn: Callable[[str], Sequence[str]]) -> Path | None:
+def _resolve_mask(
+    fake_path: Path,
+    mask_index: dict[str, Path],
+    candidates_fn: Callable[[str], Sequence[str]],
+) -> Path | None:
     for candidate in candidates_fn(fake_path.stem):
-        key = candidate.lower()
-        if key in mask_index:
-            return mask_index[key]
+        if candidate.lower() in mask_index:
+            return mask_index[candidate.lower()]
     return None
 
 
-def _resize_image_rgb(image_path: Path, size: int) -> tuple[np.ndarray, list[int]]:
+def _pad_to_size(arr: np.ndarray, size: int, mode: str, constant: int = 0) -> np.ndarray:
+    """Pad a HW or HWC array to size×size. Never upsamples."""
+    h, w = arr.shape[:2]
+    pad_h = max(0, size - h)
+    pad_w = max(0, size - w)
+    if pad_h == 0 and pad_w == 0:
+        return arr
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    if arr.ndim == 3:
+        padding = ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0))
+    else:
+        padding = ((pad_top, pad_bottom), (pad_left, pad_right))
+    if mode == "constant":
+        return np.pad(arr, padding, mode="constant", constant_values=constant)
+    return np.pad(arr, padding, mode=mode)
+
+
+def _process_image(image_path: Path, size: int) -> tuple[np.ndarray, tuple[int, int], str]:
+    """Load and bring image to size×size.
+
+    Cases:
+      A — both dims >= size: resize to size×size (BILINEAR). All models get
+          the same squash distortion — fair controlled comparison.
+      B — either dim < size (after any needed downscale): pad to size×size
+          with symmetric padding. No upsampling — forensic cues preserved.
+      C — one dim > size, other dim < size (extreme aspect ratio): resize
+          long side to size (downscale only), then pad short side to size.
+
+    Returns:
+        image_np: uint8 RGB array of shape (size, size, 3)
+        original_hw: (H, W) before any processing
+        preproc_mode: one of "resize", "pad", "resize_then_pad"
+    """
     image = Image.open(image_path).convert("RGB")
-    width, height = image.size
-    image = image.resize((size, size), resample=Image.BILINEAR)
-    return np.asarray(image, dtype=np.uint8), [height, width]
+    original_hw = (image.height, image.width)
+    h, w = original_hw
+
+    if h >= size and w >= size:
+        # Case A — both dims large enough, direct resize
+        if image.size != (size, size):
+            image = image.resize((size, size), resample=Image.BILINEAR)
+        return np.asarray(image, dtype=np.uint8), original_hw, "resize"
+
+    if h <= size and w <= size:
+        # Case B — both dims below size, pad only
+        arr = np.asarray(image, dtype=np.uint8)
+        arr = _pad_to_size(arr, size, mode="symmetric")
+        return arr, original_hw, "pad"
+
+    # Case C — one dim > size, other < size (extreme aspect ratio)
+    # Downscale the long side to size, then pad the short side.
+    long_side = max(h, w)
+    scale = size / long_side
+    new_h = max(1, int(round(h * scale)))
+    new_w = max(1, int(round(w * scale)))
+    image = image.resize((new_w, new_h), resample=Image.BILINEAR)
+    arr = np.asarray(image, dtype=np.uint8)
+    arr = _pad_to_size(arr, size, mode="symmetric")
+    return arr, original_hw, "resize_then_pad"
 
 
-def _resize_mask(mask_path: Path, size: int) -> np.ndarray:
+def _process_mask(mask_path: Path, size: int, original_hw: tuple[int, int], preproc_mode: str) -> np.ndarray:
+    """Load and bring mask to size×size using the same path as the image.
+
+    Mirrors _process_image exactly:
+      - resize → NEAREST resize to size×size
+      - pad → zero pad to size×size
+      - resize_then_pad → NEAREST downscale long side, then zero pad
+    Binarizes at 127 after all transforms.
+    """
     mask = Image.open(mask_path).convert("L")
-    mask = mask.resize((size, size), resample=Image.NEAREST)
-    mask_np = np.asarray(mask, dtype=np.uint8)
-    return (mask_np > 127).astype(np.uint8)
+    h, w = original_hw
+
+    if preproc_mode == "resize":
+        if mask.size != (size, size):
+            mask = mask.resize((size, size), resample=Image.NEAREST)
+        return (np.asarray(mask, dtype=np.uint8) > 127).astype(np.uint8)
+
+    if preproc_mode == "pad":
+        arr = np.asarray(mask, dtype=np.uint8)
+        arr = _pad_to_size(arr, size, mode="constant", constant=0)
+        return (arr > 127).astype(np.uint8)
+
+    # resize_then_pad
+    long_side = max(h, w)
+    scale = size / long_side
+    new_h = max(1, int(round(h * scale)))
+    new_w = max(1, int(round(w * scale)))
+    mask = mask.resize((new_w, new_h), resample=Image.NEAREST)
+    arr = np.asarray(mask, dtype=np.uint8)
+    arr = _pad_to_size(arr, size, mode="constant", constant=0)
+    return (arr > 127).astype(np.uint8)
 
 
-def _black_mask(size: int) -> np.ndarray:
-    return np.zeros((size, size), dtype=np.uint8)
+# ---------------------------------------------------------------------------
+# Storage helpers
+# ---------------------------------------------------------------------------
 
+def _save_npz(
+    npz_path: Path,
+    image_np: np.ndarray,
+    mask_np: np.ndarray | None,
+    metadata: dict[str, object],
+) -> None:
+    """Save image and optional mask to uncompressed NPZ.
+
+    mask_np is None for real images — evaluator assumes all-zero ground truth.
+    """
+    npz_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_json = json.dumps(metadata, ensure_ascii=True)
+    arrays: dict[str, np.ndarray] = {
+        "image": image_np,
+        "metadata_json": np.asarray(metadata_json),
+    }
+    if mask_np is not None:
+        arrays["mask"] = mask_np
+    # ZIP_STORED (uncompressed) — do not switch to savez_compressed.
+    np.savez(npz_path, **arrays)
+
+
+def _append_manifest_row(jsonl_path: Path, row: dict[str, object]) -> None:
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    with jsonl_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=True))
+        handle.write("\n")
+
+
+# ---------------------------------------------------------------------------
+# Tar sharding
+# ---------------------------------------------------------------------------
 
 class TarShardWriter:
-    """Utility to write NPZ payloads into sequential tar shards."""
+    """Write NPZ payloads into sequential uncompressed tar shards."""
 
     def __init__(self, out_root: Path, shard_size: int) -> None:
         self.out_root = out_root
@@ -141,7 +263,6 @@ class TarShardWriter:
         self.count_in_shard = 0
         if self.current is not None:
             self.current.close()
-        # mode="w" writes plain uncompressed tar archives.
         self.current = tarfile.open(tar_path, mode="w")
         self.current_path = tar_path
 
@@ -163,29 +284,56 @@ class TarShardWriter:
             self.current_path = None
 
 
-def _save_npz(npz_path: Path, image_np: np.ndarray, mask_np: np.ndarray, metadata: dict[str, object]) -> None:
-    npz_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_json = json.dumps(metadata, ensure_ascii=True)
-    # np.savez keeps arrays uncompressed (ZIP_STORED); do not switch to savez_compressed.
-    np.savez(npz_path, image=image_np, mask=mask_np, metadata_json=np.asarray(metadata_json))
+def _shard_records(
+    records: list[SampleRecord],
+    output_root: Path,
+    shard_size: int,
+    remove_unsharded: bool,
+) -> tuple[list[SampleRecord], int]:
+    if shard_size <= 0 or not records:
+        return records, 0
+
+    writer = TarShardWriter(output_root, shard_size)
+    sharded: list[SampleRecord] = []
+    try:
+        for idx, rec in enumerate(tqdm(records, desc="Sharding", leave=False)):
+            npz_path = Path(rec.image_path)
+            payload = npz_path.read_bytes()
+            member_name = f"{rec.dataset}/{idx:07d}_{npz_path.name}"
+            tar_path, member_name = writer.add(payload, member_name=member_name)
+            tar_spec = f"{tar_path}::{member_name}"
+
+            if rec.metadata is None:
+                rec.metadata = {}
+            rec.metadata["processed_sample_path"] = tar_spec
+            rec.metadata["storage"] = "tar_npz"
+            rec.image_path = tar_spec
+            rec.mask_path = None
+            sharded.append(rec)
+
+            if remove_unsharded and npz_path.exists():
+                npz_path.unlink()
+    finally:
+        writer.close()
+
+    if remove_unsharded:
+        for child in sorted(output_root.iterdir()):
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+        for leftover in output_root.rglob("*.npz"):
+            leftover.unlink(missing_ok=True)
+
+    return sharded, writer.shard_idx
 
 
-def _save_metadata(metadata_path: Path, metadata: dict[str, object]) -> None:
-    # Saved as .npy (object array wrapping the metadata dict) for consistency
-    # with the numpy-native pipeline; use np.load(..., allow_pickle=True).item()
-    # to reload.
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(metadata_path, np.asarray(metadata, dtype=object))
+# ---------------------------------------------------------------------------
+# Main preparation logic
+# ---------------------------------------------------------------------------
 
-
-def _append_manifest_row(jsonl_path: Path, row: dict[str, object]) -> None:
-    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    with jsonl_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, ensure_ascii=True))
-        handle.write("\n")
-
-
-def _iter_selected_specs(all_specs: Sequence[DatasetSpec], requested: str | None) -> list[DatasetSpec]:
+def _iter_selected_specs(
+    all_specs: Sequence[DatasetSpec],
+    requested: str | None,
+) -> list[DatasetSpec]:
     if not requested:
         return list(all_specs)
     requested_lower = requested.strip().lower()
@@ -194,67 +342,6 @@ def _iter_selected_specs(all_specs: Sequence[DatasetSpec], requested: str | None
         known = ", ".join(s.name for s in all_specs)
         raise ValueError(f"Unknown dataset '{requested}'. Available: {known}")
     return selected
-
-
-def _shard_records(
-    records: Sequence[SampleRecord],
-    output_root: Path,
-    shard_size: int,
-    remove_unsharded_after_shard: bool,
-) -> tuple[list[SampleRecord], int]:
-    if shard_size <= 0 or not records:
-        return list(records), 0
-
-    split_names = sorted({rec.split for rec in records})
-    by_split: dict[str, list[SampleRecord]] = {split: [] for split in split_names}
-    for rec in records:
-        by_split[rec.split].append(rec)
-
-    sharded_records: list[SampleRecord] = []
-    tar_count = 0
-
-    for split_name in split_names:
-        split_records = by_split[split_name]
-        shard_root = output_root
-        writer = TarShardWriter(shard_root, shard_size)
-        try:
-            for idx, rec in enumerate(tqdm(split_records, desc=f"Sharding {split_name}", leave=False)):
-                npz_path = Path(rec.image_path)
-                payload = npz_path.read_bytes()
-                # Store directly under dataset/ with no split subdirectory.
-                member_name = f"{rec.dataset}/{idx:07d}_{npz_path.name}"
-                tar_path, member_name = writer.add(payload, member_name=member_name)
-                tar_spec = f"{tar_path}::{member_name}"
-
-                if rec.metadata is None:
-                    rec.metadata = {}
-                rec.metadata["sharded_sample_path"] = tar_spec
-                rec.metadata["processed_sample_path"] = tar_spec
-                rec.metadata["storage"] = "tar_npz"
-
-                rec.image_path = tar_spec
-                rec.mask_path = None
-                sharded_records.append(rec)
-
-                if remove_unsharded_after_shard and npz_path.exists():
-                    npz_path.unlink()
-        finally:
-            writer.close()
-            tar_count += writer.shard_idx
-
-    if remove_unsharded_after_shard:
-        # Remove entire per-dataset subdirectories that held the unsharded NPZ
-        # files.  Only directories that are not shard tar files are removed so
-        # the freshly written shards are left untouched.
-        for child in sorted(output_root.iterdir()):
-            if child.is_dir() and not child.name.startswith("shard_"):
-                shutil.rmtree(child, ignore_errors=True)
-        # Safety sweep for any stray NPZ files that survived the directory
-        # removal (e.g. from an interrupted prior run).
-        for leftover_npz in output_root.rglob("*.npz"):
-            leftover_npz.unlink(missing_ok=True)
-
-    return sharded_records, tar_count
 
 
 def prepare_test_datasets(
@@ -283,10 +370,13 @@ def prepare_test_datasets(
     records: list[SampleRecord] = []
     skipped_missing_mask = 0
 
+    # Preprocessing mode counters for summary
+    mode_counts: dict[str, int] = {"resize": 0, "pad": 0, "resize_then_pad": 0}
+
     for spec in specs:
         dataset_root = input_root / spec.name
         if not dataset_root.exists():
-            print(f"[WARN] Missing dataset folder: {dataset_root}")
+            print(f"[WARN] Missing dataset folder: {dataset_root}", file=sys.stderr)
             continue
 
         mask_index: dict[str, Path] = {}
@@ -307,47 +397,55 @@ def prepare_test_datasets(
                     msg = f"[WARN] Missing mask for fake image: {image_path}"
                     if fail_on_missing_mask:
                         raise FileNotFoundError(msg)
-                    print(msg)
+                    print(msg, file=sys.stderr)
                     continue
                 entries.append(("fake", image_path, mask_path, 1))
 
         if max_samples > 0:
             entries = entries[:max_samples]
 
+        dataset_records: list[SampleRecord] = []
+
         for idx, (kind, image_path, mask_path, label) in enumerate(
-            tqdm(entries, desc=f"{spec.name} {split_name}", leave=False)
+            tqdm(entries, desc=f"{spec.name}", leave=False)
         ):
             rel_source = image_path.relative_to(dataset_root).as_posix()
             stem = _safe_name(Path(rel_source).with_suffix("").as_posix())
             sample_id = f"{spec.name.lower()}_{kind}_{idx:06d}_{stem}"
+            npz_path = output_root / spec.name / f"{sample_id}.npz"
 
-            npz_path = output_root / spec.name / split_name / kind / f"{sample_id}.npz"
-            # Metadata stored as .npy (pickled object array) instead of JSON.
-            metadata_path = output_root / spec.name / split_name / kind / "metadata" / f"{sample_id}.npy"
+            image_np, original_hw, preproc_mode = _process_image(image_path, size)
+            mode_counts[preproc_mode] += 1
 
-            image_np, original_size = _resize_image_rgb(image_path=image_path, size=size)
+            mask_np: np.ndarray | None = None
             if mask_path is not None:
-                mask_np = _resize_mask(mask_path=mask_path, size=size)
-            else:
-                mask_np = _black_mask(size=size)
+                mask_np = _process_mask(mask_path, size, original_hw, preproc_mode)
 
-            metadata = {
+            metadata: dict[str, object] = {
                 "dataset": spec.name,
                 "split": split_name,
                 "kind": kind,
                 "label": label,
                 "original_image_path": str(image_path),
                 "original_mask_path": str(mask_path) if mask_path is not None else None,
-                "original_size": original_size,
+                "original_size_hw": list(original_hw),
+                "processed_size_hw": [size, size],
                 "processed_sample_path": str(npz_path),
-                "processed_size": [size, size],
-                "mask_is_generated_black": bool(mask_path is None),
-                "mask_foreground_pixels": int(mask_np.sum()),
+                # How the image was brought to size×size — useful for
+                # breaking down metrics by preprocessing path.
+                "preproc_mode": preproc_mode,
+                # True for reals — evaluator assumes all-zero ground truth.
+                "mask_is_all_zero": mask_np is None,
+                "mask_foreground_pixels": int(mask_np.sum()) if mask_np is not None else 0,
                 "storage": "npz",
             }
 
-            _save_npz(npz_path=npz_path, image_np=image_np, mask_np=mask_np, metadata=metadata)
-            _save_metadata(metadata_path=metadata_path, metadata=metadata)
+            _save_npz(
+                npz_path=npz_path,
+                image_np=image_np,
+                mask_np=mask_np,
+                metadata=metadata,
+            )
 
             record = SampleRecord(
                 dataset=spec.name,
@@ -360,13 +458,22 @@ def prepare_test_datasets(
                 original_mask_path=str(mask_path) if mask_path is not None else None,
                 metadata=metadata,
             )
-            records.append(record)
+            dataset_records.append(record)
+
+        real_count = sum(1 for r in dataset_records if r.label == 0)
+        fake_count = sum(1 for r in dataset_records if r.label == 1)
+        suffix = "  (no real_dir)" if not spec.real_dir else ""
+        print(
+            f"[{spec.name}] real={real_count}  fake={fake_count}"
+            f"  total={len(dataset_records)}{suffix}"
+        )
+        records.extend(dataset_records)
 
     records, tar_count = _shard_records(
         records=records,
         output_root=output_root,
         shard_size=tar_shard_size,
-        remove_unsharded_after_shard=remove_unsharded_after_shard,
+        remove_unsharded=remove_unsharded_after_shard,
     )
 
     if row_log_path.exists():
@@ -377,31 +484,51 @@ def prepare_test_datasets(
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([rec.to_dict() for rec in records]).to_parquet(manifest_path, index=False)
 
-    print(f"Wrote manifest: {manifest_path}")
-    print(f"Wrote row log: {row_log_path}")
-    print(f"Total samples: {len(records)}")
+    print(f"\nWrote manifest:    {manifest_path}")
+    print(f"Wrote row log:     {row_log_path}")
+    print(f"Total samples:     {len(records)}")
+    print(
+        f"Preproc modes:     resize={mode_counts['resize']}"
+        f"  pad={mode_counts['pad']}"
+        f"  resize_then_pad={mode_counts['resize_then_pad']}"
+    )
     if tar_shard_size > 0:
-        print(f"Tar shards written: {tar_count}")
+        print(f"Tar shards:        {tar_count}")
     if skipped_missing_mask:
-        print(f"Skipped fake samples without masks: {skipped_missing_mask}")
+        print(f"Skipped (no mask): {skipped_missing_mask}", file=sys.stderr)
 
-    return Manifest(samples=list(records))
+    return Manifest(samples=records)
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Prepare standardized benchmark test datasets")
-    parser.add_argument("--input-root", type=str, default="./test_datasets", help="Input test dataset root")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Prepare benchmark test datasets for fair evaluation against "
+            "MantraNet, ProFact, and MVSSNet. Images >= SIZE are resized to "
+            "SIZE×SIZE. Images < SIZE are padded to SIZE×SIZE without upsampling."
+        )
+    )
+    parser.add_argument(
+        "--input-root",
+        type=str,
+        default="./test_datasets",
+        help="Root folder containing one subfolder per dataset (CASIA1/, Columbia/, COVERAGE/)",
+    )
     parser.add_argument(
         "--output-root",
         type=str,
         default="./prepared_test_datasets",
-        help="Output root for standardized samples",
+        help="Output root for prepared NPZ samples and tar shards",
     )
     parser.add_argument(
         "--manifest",
         type=str,
         default=None,
-        help="Manifest output path (default: <output-root>/manifest.parquet)",
+        help="Manifest parquet path (default: <output-root>/manifest.parquet)",
     )
     parser.add_argument(
         "--row-log",
@@ -409,8 +536,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="JSONL row log path (default: <output-root>/manifest_rows.jsonl)",
     )
-    parser.add_argument("--size", type=int, default=448, help="Square resize size")
-    parser.add_argument("--split", type=str, default="test", help="Split name to assign in manifest")
+    parser.add_argument(
+        "--size",
+        type=int,
+        default=448,
+        help="Target square size — images resized or padded to size×size (default: 448)",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="test",
+        help="Split name written into the manifest (default: test)",
+    )
     parser.add_argument(
         "--dataset",
         type=str,
@@ -421,36 +558,35 @@ def parse_args() -> argparse.Namespace:
         "--max-samples",
         type=int,
         default=0,
-        help="Cap number of samples per dataset after discovery (0 = all)",
+        help="Cap samples per dataset after discovery, 0 = all",
     )
     parser.add_argument(
         "--clean",
         action="store_true",
-        help="Remove output root before writing new samples",
+        help="Delete output root before writing (clean re-run from scratch)",
     )
     parser.add_argument(
         "--fail-on-missing-mask",
         action="store_true",
-        help="Fail immediately when a fake sample has no matching mask",
+        help="Raise immediately when a fake image has no matching mask (default: warn and skip)",
     )
     parser.add_argument(
         "--tar-shard-size",
         type=int,
         default=1024,
-        help="Samples per tar shard (0 disables sharding)",
+        help="Samples per tar shard, 0 disables sharding (default: 1024)",
     )
     parser.add_argument(
         "--remove-unsharded-after-shard",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Delete local NPZ files after they are packed into tar shards (default: true)",
+        help="Delete local NPZ files after packing into tar shards (default: true)",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-
     input_root = Path(args.input_root)
     output_root = Path(args.output_root)
     manifest_path = Path(args.manifest) if args.manifest else output_root / "manifest.parquet"
