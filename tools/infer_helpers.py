@@ -612,6 +612,49 @@ def predict_probability_map(
     return prob
 
 
+def predict_probability_maps_batch(
+    model: HybridNGIML,
+    images: Sequence[torch.Tensor],
+    device: torch.device,
+    normalization_mode: str = "zero_one",
+    residual_noises: Sequence[torch.Tensor | None] | None = None,
+) -> list[torch.Tensor]:
+    if not images:
+        return []
+
+    normalized_images: list[torch.Tensor] = []
+    resolved_residuals: list[torch.Tensor] = []
+    expected_shape: tuple[int, int, int] | None = None
+    model_uses_residual = _model_uses_residual_noise(model)
+
+    if residual_noises is not None and len(residual_noises) != len(images):
+        raise ValueError("residual_noises must match images length when provided")
+
+    for idx, image in enumerate(images):
+        if image.ndim != 3 or image.shape[0] != 3:
+            raise ValueError(f"Expected RGB CHW image tensor, got shape={tuple(image.shape)} at index={idx}")
+        if expected_shape is None:
+            expected_shape = tuple(int(v) for v in image.shape)
+        elif tuple(int(v) for v in image.shape) != expected_shape:
+            raise ValueError("All images in a direct batch must share the same CHW shape")
+
+        normalized_images.append(normalize_image_for_inference(image, normalization_mode=normalization_mode))
+        if model_uses_residual:
+            residual = residual_noises[idx] if residual_noises is not None else None
+            resolved_residuals.append((residual if residual is not None else _compute_residual_noise(image)).float())
+
+    x = torch.stack(normalized_images, dim=0).to(device, non_blocking=True)
+    hp = torch.stack(resolved_residuals, dim=0).to(device, non_blocking=True) if model_uses_residual else None
+    autocast_dtype = get_inference_autocast_dtype(model, device)
+    use_amp = device.type == "cuda" and autocast_dtype is not None
+    with torch.no_grad():
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype or torch.float16, enabled=use_amp):
+            outputs = model(x, target_size=images[0].shape[-2:], residual_noise=hp)
+            logits = _select_output_head(outputs)
+            probs = torch.sigmoid(logits[:, 0]).detach().cpu()
+    return [probs[i] for i in range(probs.shape[0])]
+
+
 def predict_binary_map(
     model: HybridNGIML,
     image: torch.Tensor,
