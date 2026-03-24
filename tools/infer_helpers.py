@@ -1,12 +1,20 @@
 ﻿from __future__ import annotations
 
+import io
+import json
 import re
+import tarfile
 from collections import Counter
 from pathlib import Path
 from typing import Sequence
 
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
+from huggingface_hub import snapshot_download
+from tqdm.auto import tqdm
 from torchvision.transforms import functional as TVF
 from torchvision.transforms.functional import InterpolationMode
 
@@ -21,12 +29,6 @@ from src.data.dataloaders import (
 from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
 from tools.train_ngiml import build_default_components
-import numpy as np
-import json
-from pathlib import Path
-import tarfile
-import io
-import matplotlib.pyplot as plt
 
 def _to_chw_rgb(image_np: np.ndarray) -> np.ndarray:
     if image_np.ndim == 2:
@@ -130,6 +132,254 @@ def save_sample_plot(out_path: Path, image_chw: np.ndarray, gt_hw: np.ndarray, p
     fig.savefig(out_path, dpi=160, bbox_inches='tight')
     plt.close(fig)
 
+
+def count_prepared_samples(snapshot_root: Path) -> int:
+    npz_files = list(snapshot_root.rglob("*.npz"))
+    tar_files = list(snapshot_root.rglob("*.tar"))
+    tar_entries = 0
+    for tar_path in tar_files:
+        with tarfile.open(tar_path, mode="r") as tf:
+            tar_entries += len([member for member in tf.getmembers() if member.isfile() and member.name.lower().endswith(".npz")])
+    return int(len(npz_files) + tar_entries)
+
+
+def _prepared_sample_to_inference_record(sample_uri: str, data: dict[str, object]) -> dict[str, object] | None:
+    if "image" not in data:
+        return None
+
+    image_chw = _to_chw_rgb(np.asarray(data["image"]))
+    h, w = int(image_chw.shape[1]), int(image_chw.shape[2])
+    mask_hw = _to_hw_mask(data.get("mask"), h, w)
+    meta = _parse_meta(data.get("metadata_json"))
+    dataset = _dataset_name(sample_uri, meta)
+
+    image_t = torch.from_numpy(image_chw).float()
+    if image_t.max() > 1.0:
+        image_t = image_t / 255.0
+
+    return {
+        "sample_uri": sample_uri,
+        "image_chw": image_chw,
+        "image_t": image_t,
+        "mask_hw": mask_hw,
+        "meta": meta,
+        "dataset": dataset,
+        "height": h,
+        "width": w,
+    }
+
+
+def _append_prepared_inference_result(
+    rows: list[dict[str, object]],
+    plot_samples: dict[str, list[dict[str, object]]],
+    sample: dict[str, object],
+    prob: torch.Tensor,
+    *,
+    threshold_for_metrics: float,
+    plot_binary_threshold: float,
+    inference_strategy: str,
+    normalization_mode: str,
+    max_plot_samples_per_dataset: int,
+) -> None:
+    prob_hw = prob.detach().cpu().numpy().astype(np.float32)
+    pred_bin_metric = (prob_hw >= float(threshold_for_metrics)).astype(np.uint8)
+    pred_bin_plot = (prob_hw >= float(plot_binary_threshold)).astype(np.uint8)
+    metrics = compute_binary_metrics(pred_bin_metric, sample["mask_hw"])
+
+    meta = sample["meta"]
+    raw_label = meta.get("label", int(sample["mask_hw"].max() > 0))
+    if isinstance(raw_label, str):
+        sample_label = 1 if raw_label.strip().lower() in {"1", "fake", "tp", "tampered", "manipulated"} else 0
+    else:
+        sample_label = int(raw_label)
+
+    row = {
+        "dataset": sample["dataset"],
+        "sample_uri": sample["sample_uri"],
+        "split": str(meta.get("split", "test")),
+        "label": sample_label,
+        "strategy": inference_strategy,
+        "normalization_mode": normalization_mode,
+        "threshold_for_metrics": float(threshold_for_metrics),
+        "plot_binary_threshold": float(plot_binary_threshold),
+        "height": int(sample["height"]),
+        "width": int(sample["width"]),
+        "mean_probability": float(prob_hw.mean()),
+        "max_probability": float(prob_hw.max()),
+        "pred_positive_ratio_threshold": float(pred_bin_metric.mean()),
+        "pred_positive_ratio_0_5": float(pred_bin_plot.mean()),
+        "gt_positive_ratio": float(sample["mask_hw"].mean()),
+    }
+    row.update(metrics)
+    rows.append(row)
+
+    if sample_label != 1:
+        return
+
+    dataset_plots = plot_samples.setdefault(str(sample["dataset"]), [])
+    if len(dataset_plots) >= int(max_plot_samples_per_dataset):
+        return
+    dataset_plots.append(
+        {
+            "sample_uri": sample["sample_uri"],
+            "image_chw": sample["image_chw"],
+            "mask_hw": sample["mask_hw"],
+            "prob_hw": prob_hw,
+            "bin05_hw": pred_bin_plot,
+        }
+    )
+
+
+def run_prepared_dataset_inference(
+    *,
+    checkpoint_path: str | Path,
+    hf_dataset_repo_id: str,
+    output_root: str | Path,
+    hf_snapshot_local_dir: str | Path,
+    inference_strategy: str = "direct",
+    threshold_for_metrics: float | None = None,
+    plot_binary_threshold: float = 0.5,
+    direct_batch_size: int = 8,
+    normalization_mode: str | None = None,
+    max_plot_samples_per_dataset: int = 5,
+) -> dict[str, object]:
+    checkpoint_path = Path(checkpoint_path)
+    output_root = Path(output_root)
+    hf_snapshot_local_dir = Path(hf_snapshot_local_dir)
+
+    csv_output_dir = output_root / "csv"
+    plot_output_dir = output_root / "plots"
+    csv_output_dir.mkdir(parents=True, exist_ok=True)
+    plot_output_dir.mkdir(parents=True, exist_ok=True)
+
+    model, device, ckpt_info = load_model_from_checkpoint(checkpoint_path)
+    resolved_normalization = (
+        resolve_normalization_mode_for_inference(checkpoint_path=checkpoint_path, default_mode="imagenet")
+        if normalization_mode is None
+        else resolve_normalization_mode_for_inference(manual_mode=normalization_mode, checkpoint_path=checkpoint_path, default_mode="imagenet")
+    )
+    resolved_threshold = float(ckpt_info.get("default_threshold", 0.5) if threshold_for_metrics is None else threshold_for_metrics)
+
+    snapshot_path = Path(
+        snapshot_download(
+            repo_id=hf_dataset_repo_id,
+            repo_type="dataset",
+            local_dir=str(hf_snapshot_local_dir),
+            local_dir_use_symlinks=False,
+        )
+    )
+    total_samples = count_prepared_samples(snapshot_path)
+
+    rows: list[dict[str, object]] = []
+    plot_samples: dict[str, list[dict[str, object]]] = {}
+    pending_direct: dict[tuple[int, int], list[dict[str, object]]] = {}
+    inference_strategy_key = str(inference_strategy).strip().lower()
+    batch_size = max(1, int(direct_batch_size)) if inference_strategy_key == "direct" else 1
+
+    def _flush_direct_batch(pending: list[dict[str, object]]) -> None:
+        if not pending:
+            return
+        probs = predict_probability_maps_batch(
+            model=model,
+            images=[sample["image_t"] for sample in pending],
+            device=device,
+            normalization_mode=resolved_normalization,
+        )
+        for sample, prob in zip(pending, probs):
+            _append_prepared_inference_result(
+                rows,
+                plot_samples,
+                sample,
+                prob.clamp(0.0, 1.0),
+                threshold_for_metrics=resolved_threshold,
+                plot_binary_threshold=plot_binary_threshold,
+                inference_strategy=inference_strategy_key,
+                normalization_mode=resolved_normalization,
+                max_plot_samples_per_dataset=max_plot_samples_per_dataset,
+            )
+
+    for sample_uri, data in tqdm(iter_prepared_samples(snapshot_path), desc="Inference", total=total_samples):
+        sample = _prepared_sample_to_inference_record(sample_uri, data)
+        if sample is None:
+            continue
+
+        if inference_strategy_key == "direct":
+            key = (int(sample["height"]), int(sample["width"]))
+            pending = pending_direct.setdefault(key, [])
+            pending.append(sample)
+            if len(pending) >= batch_size:
+                _flush_direct_batch(pending)
+                pending.clear()
+            continue
+
+        prob = predict_probability_map_by_strategy(
+            model=model,
+            image=sample["image_t"],
+            device=device,
+            strategy=inference_strategy_key,
+            normalization_mode=resolved_normalization,
+        ).clamp(0.0, 1.0)
+        _append_prepared_inference_result(
+            rows,
+            plot_samples,
+            sample,
+            prob,
+            threshold_for_metrics=resolved_threshold,
+            plot_binary_threshold=plot_binary_threshold,
+            inference_strategy=inference_strategy_key,
+            normalization_mode=resolved_normalization,
+            max_plot_samples_per_dataset=max_plot_samples_per_dataset,
+        )
+
+    for pending in pending_direct.values():
+        _flush_direct_batch(pending)
+
+    results_df = pd.DataFrame(rows).sort_values(["dataset", "sample_uri"]).reset_index(drop=True)
+    if results_df.empty:
+        raise RuntimeError("No samples processed from HF snapshot.")
+
+    results_csv = csv_output_dir / "ngiml_hf_test_inference_results.csv"
+    summary_csv = csv_output_dir / "ngiml_hf_test_inference_summary_by_dataset.csv"
+    results_df.to_csv(results_csv, index=False)
+
+    summary_df = results_df.groupby("dataset", as_index=False).agg(
+        {
+            "sample_uri": "count",
+            "f1": "mean",
+            "iou": "mean",
+            "precision": "mean",
+            "recall": "mean",
+            "accuracy": "mean",
+            "mean_probability": "mean",
+            "pred_positive_ratio_threshold": "mean",
+            "gt_positive_ratio": "mean",
+        }
+    ).rename(columns={"sample_uri": "num_samples"})
+    summary_df.to_csv(summary_csv, index=False)
+
+    for dataset_name, samples in sorted(plot_samples.items()):
+        dataset_plot_dir = plot_output_dir / dataset_name
+        for idx, sample in enumerate(samples, start=1):
+            out_png = dataset_plot_dir / f"{dataset_name}_sample_{idx:02d}.png"
+            title = f"{dataset_name} | sample {idx} | {Path(str(sample['sample_uri']).split('::')[0]).name}"
+            save_sample_plot(out_png, sample["image_chw"], sample["mask_hw"], sample["prob_hw"], sample["bin05_hw"], title)
+
+    return {
+        "model": model,
+        "device": device,
+        "checkpoint_info": ckpt_info,
+        "snapshot_path": snapshot_path,
+        "normalization_mode": resolved_normalization,
+        "threshold_for_metrics": float(resolved_threshold),
+        "plot_binary_threshold": float(plot_binary_threshold),
+        "direct_batch_size": int(batch_size),
+        "results_df": results_df,
+        "summary_df": summary_df,
+        "results_csv": results_csv,
+        "summary_csv": summary_csv,
+        "plot_output_dir": plot_output_dir,
+    }
+
 def _zero_flop_jit(_inputs, _outputs) -> Counter[str]:
     return Counter()
 
@@ -183,27 +433,6 @@ def find_latest_checkpoint(runs_root: Path) -> Path:
     if not candidates:
         raise FileNotFoundError(f"No checkpoint found under {runs_root}/**/checkpoints/checkpoint_epoch_*.pt")
     return candidates[-1]
-
-def load_default_threshold(checkpoint_path: Path, fallback: float = 0.5) -> float:
-    checkpoint_path = Path(checkpoint_path)
-    candidate_files = [
-        checkpoint_path.parent / "best_threshold.json",
-        checkpoint_path.parent.parent / "best_threshold.json",
-    ]
-    for candidate in candidate_files:
-        if not candidate.exists():
-            continue
-        try:
-            import json
-
-            with open(candidate, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            threshold = payload.get("threshold", fallback)
-            return float(threshold)
-        except Exception:
-            continue
-    return float(fallback)
-
 
 def resolve_threshold_for_checkpoint(
     checkpoint_path: Path,
@@ -276,7 +505,17 @@ def resolve_threshold_for_checkpoint(
         except Exception:
             continue
 
-    return float(load_default_threshold(checkpoint_path, fallback=fallback)), "fallback"
+    for candidate in candidate_files:
+        if not candidate.exists():
+            continue
+        try:
+            with open(candidate, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return float(payload.get("threshold", fallback)), f"{candidate.name}:fallback"
+        except Exception:
+            continue
+
+    return float(fallback), "fallback"
 
 
 def _infer_fusion_channels_from_state_dict(model_state: dict) -> tuple[int, ...] | None:
@@ -473,6 +712,7 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
         "fusion_channels": tuple(int(value) for value in model.cfg.fusion.fusion_channels),
         "default_threshold": float(resolved_threshold),
         "threshold_source": str(threshold_source),
+        "input_size": int(train_config.get("input_size", 448) or 448),
         "resize_max_side": int(train_config.get("resize_max_side", 0) or 0),
         "resize_max_side_source": "train_config" if has_train_resize_max_side else "default",
         "runtime_precision": precision_raw,
@@ -507,13 +747,6 @@ def select_manifest_sample(
         return fake_samples[0]
 
     raise RuntimeError(f"No samples available in manifest: {manifest_path}")
-
-
-def _resolve_possible_local_path(path_str: str) -> str:
-    path = Path(path_str)
-    return path.as_posix()
-
-
 def resize_for_inference(
     image: torch.Tensor,
     mask: torch.Tensor | None = None,
@@ -548,13 +781,13 @@ def load_image_mask_from_record(
     if "::" in image_path and image_path.endswith(".npz"):
         image, mask, residual_noise = _load_from_tar_npz(image_path)
     elif image_path.endswith(".npz"):
-        image, mask, residual_noise = _load_from_npz(_resolve_possible_local_path(image_path))
+        image, mask, residual_noise = _load_from_npz(Path(image_path).as_posix())
     else:
-        image = _load_image(_resolve_possible_local_path(image_path))
+        image = _load_image(Path(image_path).as_posix())
         residual_noise = None
         mask = None
         if record.mask_path is not None:
-            loaded = _load_image(_resolve_possible_local_path(record.mask_path))
+            loaded = _load_image(Path(record.mask_path).as_posix())
             mask = loaded[:1] if loaded.shape[0] > 1 else loaded
 
     image = image.float()
@@ -582,7 +815,7 @@ def load_image_mask_from_record(
     return image, mask, residual_noise
 
 
-def normalize_image_for_inference(image: torch.Tensor, normalization_mode: str = "zero_one") -> torch.Tensor:
+def normalize_image_for_inference(image: torch.Tensor, normalization_mode: str = "imagenet") -> torch.Tensor:
     image = image.float()
     if image.max() > 1.0:
         image = image / 255.0
@@ -593,7 +826,7 @@ def predict_probability_map(
     model: HybridNGIML,
     image: torch.Tensor,
     device: torch.device,
-    normalization_mode: str = "zero_one",
+    normalization_mode: str = "imagenet",
     residual_noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     normalized = normalize_image_for_inference(image, normalization_mode=normalization_mode)
@@ -616,7 +849,7 @@ def predict_probability_maps_batch(
     model: HybridNGIML,
     images: Sequence[torch.Tensor],
     device: torch.device,
-    normalization_mode: str = "zero_one",
+    normalization_mode: str = "imagenet",
     residual_noises: Sequence[torch.Tensor | None] | None = None,
 ) -> list[torch.Tensor]:
     if not images:
@@ -660,7 +893,7 @@ def predict_binary_map(
     image: torch.Tensor,
     device: torch.device,
     threshold: float | None = None,
-    normalization_mode: str = "zero_one",
+    normalization_mode: str = "imagenet",
     residual_noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     prob = predict_probability_map(
