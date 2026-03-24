@@ -214,70 +214,130 @@ def select_prepared_test_sample(
     raise RuntimeError(f'No prepared test sample matched selection: {sample_desc}')
 
 
-def _evaluate_prepared_sample(
+def _predict_probability_maps_batch_direct(
     model: HybridNGIML,
+    images: list[torch.Tensor],
     device: torch.device,
-    sample_uri: str,
-    data: dict,
-    inference_strategy: str,
-    normalization_mode: str,
-    threshold_used: float,
-    plot_binary_threshold: float,
-) -> tuple[dict[str, object], int, dict[str, object] | None]:
-    image_chw = _to_chw_rgb(np.asarray(data['image']))
-    h, w = int(image_chw.shape[1]), int(image_chw.shape[2])
-    mask_hw = _to_hw_mask(data.get('mask'), h, w)
-    meta = _parse_meta(data.get('metadata_json'))
-    dataset = _dataset_name(sample_uri, meta)
-    image_t = torch.from_numpy(image_chw).float()
-    if image_t.max() > 1.0:
-        image_t = image_t / 255.0
+    normalization_mode: str = 'zero_one',
+) -> list[torch.Tensor]:
+    if not images:
+        return []
 
-    prob = predict_probability_map_by_strategy(
-        model=model,
-        image=image_t,
-        device=device,
-        strategy=inference_strategy,
-        normalization_mode=normalization_mode,
-    ).clamp(0.0, 1.0)
+    # Preserve old direct-inference semantics by only batching images that already
+    # have identical spatial sizes. Padding mixed sizes changed model inputs and
+    # produced different scores for older checkpoints.
+    grouped_indices: dict[tuple[int, int], list[int]] = {}
+    for idx, image in enumerate(images):
+        key = (int(image.shape[-2]), int(image.shape[-1]))
+        grouped_indices.setdefault(key, []).append(idx)
 
-    prob_hw = prob.detach().cpu().numpy().astype(np.float32)
-    pred_bin_metric = (prob_hw >= threshold_used).astype(np.uint8)
-    pred_bin_plot = (prob_hw >= float(plot_binary_threshold)).astype(np.uint8)
-    metrics = compute_binary_metrics(pred_bin_metric, mask_hw)
-    sample_label = _sample_label_from_meta(meta, mask_hw)
+    results: list[torch.Tensor | None] = [None] * len(images)
+    autocast_dtype = get_inference_autocast_dtype(model, device)
+    use_amp = device.type == 'cuda' and autocast_dtype is not None
 
-    row = {
-        'dataset': dataset,
-        'sample_uri': sample_uri,
-        'split': str(meta.get('split', 'test')),
-        'label': sample_label,
-        'strategy': str(inference_strategy),
-        'normalization_mode': normalization_mode,
-        'threshold_for_metrics': threshold_used,
-        'plot_binary_threshold': float(plot_binary_threshold),
-        'height': h,
-        'width': w,
-        'mean_probability': float(prob_hw.mean()),
-        'max_probability': float(prob_hw.max()),
-        'pred_positive_ratio_threshold': float(pred_bin_metric.mean()),
-        'pred_positive_ratio_0_5': float(pred_bin_plot.mean()),
-        'gt_positive_ratio': float(mask_hw.mean()),
-    }
-    row.update(metrics)
+    for (_, _), indices in grouped_indices.items():
+        normalized_batch = [
+            normalize_image_for_inference(images[idx], normalization_mode=normalization_mode)
+            for idx in indices
+        ]
+        xb = torch.stack(normalized_batch, dim=0).to(device, non_blocking=True)
 
-    plot_record: dict[str, object] | None = None
-    if sample_label == 1:
-        plot_record = {
-            'dataset': dataset,
-            'sample_uri': sample_uri,
-            'image_chw': image_chw,
-            'mask_hw': mask_hw,
-            'prob_hw': prob_hw,
-            'bin05_hw': pred_bin_plot,
-        }
+        hb = None
+        if _model_uses_residual_noise(model):
+            residual_batch = [_compute_residual_noise(images[idx]).float() for idx in indices]
+            hb = torch.stack(residual_batch, dim=0).to(device, non_blocking=True)
 
-    return row, sample_label, plot_record
+        with torch.no_grad():
+            with torch.autocast(device_type='cuda', dtype=autocast_dtype or torch.float16, enabled=use_amp):
+                outputs = model(xb, target_size=xb.shape[-2:], residual_noise=hb)
+                logits = _select_output_head(outputs)
+                probs = torch.sigmoid(logits[:, 0]).float().cpu()
+
+        for batch_idx, image_idx in enumerate(indices):
+            results[image_idx] = probs[batch_idx].clone()
+
+    return [result for result in results if result is not None]
+
+
+def predict_probability_maps_by_strategy_batch(
+    model: HybridNGIML,
+    images: list[torch.Tensor],
+    device: torch.device,
+    strategy: str,
+    normalization_mode: str = 'imagenet',
+    infer_size: int = 448,
+    tile_size: int = 448,
+    tile_overlap: float = 0.5,
+    tile_batch_size: int = 16,
+) -> list[torch.Tensor]:
+    if not images:
+        return []
+
+    strategy_key = str(strategy).strip().lower()
+
+    if strategy_key == 'direct':
+        return _predict_probability_maps_batch_direct(
+            model=model,
+            images=images,
+            device=device,
+            normalization_mode=normalization_mode,
+        )
+
+    if strategy_key in {'resize', 'center_crop', 'resize_keep_aspect_center_crop'}:
+        prepared: list[torch.Tensor] = []
+        original_sizes: list[tuple[int, int]] = []
+        for image in images:
+            image = image.float()
+            if image.max() > 1.0:
+                image = image / 255.0
+            image = image.clamp(0.0, 1.0)
+            orig_h, orig_w = int(image.shape[-2]), int(image.shape[-1])
+            original_sizes.append((orig_h, orig_w))
+
+            if strategy_key == 'resize':
+                transformed = TVF.resize(image, [infer_size, infer_size], interpolation=InterpolationMode.BILINEAR)
+            elif strategy_key == 'center_crop':
+                crop_side = min(orig_h, orig_w)
+                top = max(0, (orig_h - crop_side) // 2)
+                left = max(0, (orig_w - crop_side) // 2)
+                cropped = TVF.crop(image, top, left, crop_side, crop_side)
+                transformed = TVF.resize(cropped, [infer_size, infer_size], interpolation=InterpolationMode.BILINEAR)
+            else:
+                scale = float(infer_size) / float(min(orig_h, orig_w))
+                new_h = max(1, int(round(orig_h * scale)))
+                new_w = max(1, int(round(orig_w * scale)))
+                resized = TVF.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
+                top = max(0, (new_h - infer_size) // 2)
+                left = max(0, (new_w - infer_size) // 2)
+                transformed = TVF.crop(resized, top, left, infer_size, infer_size)
+
+            prepared.append(transformed)
+
+        probs = _predict_probability_maps_batch_direct(
+            model=model,
+            images=prepared,
+            device=device,
+            normalization_mode=normalization_mode,
+        )
+        return [
+            _resize_prob_to_original(prob, out_h, out_w)
+            for prob, (out_h, out_w) in zip(probs, original_sizes)
+        ]
+
+    return [
+        predict_probability_map_by_strategy(
+            model=model,
+            image=image,
+            device=device,
+            strategy=strategy_key,
+            normalization_mode=normalization_mode,
+            infer_size=infer_size,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            tile_batch_size=tile_batch_size,
+        )
+        for image in images
+    ]
 
 
 def run_prepared_test_inference(
@@ -320,19 +380,63 @@ def run_prepared_test_inference(
         nonlocal pending_samples
         if not pending_samples:
             return
+        batch_records: list[tuple[str, dict, np.ndarray, np.ndarray, dict, str, int]] = []
+        batch_images: list[torch.Tensor] = []
         for pending_uri, pending_data in pending_samples:
-            row, _, plot_record = _evaluate_prepared_sample(
-                model=model,
-                device=device,
-                sample_uri=pending_uri,
-                data=pending_data,
-                inference_strategy=inference_strategy,
-                normalization_mode=normalization_mode,
-                threshold_used=threshold_used,
-                plot_binary_threshold=plot_binary_threshold,
-            )
+            image_chw = _to_chw_rgb(np.asarray(pending_data['image']))
+            h, w = int(image_chw.shape[1]), int(image_chw.shape[2])
+            mask_hw = _to_hw_mask(pending_data.get('mask'), h, w)
+            meta = _parse_meta(pending_data.get('metadata_json'))
+            dataset = _dataset_name(pending_uri, meta)
+            sample_label = _sample_label_from_meta(meta, mask_hw)
+            image_t = torch.from_numpy(image_chw).float()
+            if image_t.max() > 1.0:
+                image_t = image_t / 255.0
+            batch_records.append((pending_uri, pending_data, image_chw, mask_hw, meta, dataset, sample_label))
+            batch_images.append(image_t.clamp(0.0, 1.0))
+
+        batch_probs = predict_probability_maps_by_strategy_batch(
+            model=model,
+            images=batch_images,
+            device=device,
+            strategy=inference_strategy,
+            normalization_mode=normalization_mode,
+        )
+
+        for (pending_uri, _pending_data, image_chw, mask_hw, meta, dataset, sample_label), prob in zip(batch_records, batch_probs):
+            prob_hw = prob.detach().cpu().numpy().astype(np.float32)
+            pred_bin_metric = (prob_hw >= threshold_used).astype(np.uint8)
+            pred_bin_plot = (prob_hw >= float(plot_binary_threshold)).astype(np.uint8)
+            metrics = compute_binary_metrics(pred_bin_metric, mask_hw)
+            row = {
+                'dataset': dataset,
+                'sample_uri': pending_uri,
+                'split': str(meta.get('split', 'test')),
+                'label': sample_label,
+                'strategy': str(inference_strategy),
+                'normalization_mode': normalization_mode,
+                'threshold_for_metrics': threshold_used,
+                'plot_binary_threshold': float(plot_binary_threshold),
+                'height': int(image_chw.shape[1]),
+                'width': int(image_chw.shape[2]),
+                'mean_probability': float(prob_hw.mean()),
+                'max_probability': float(prob_hw.max()),
+                'pred_positive_ratio_threshold': float(pred_bin_metric.mean()),
+                'pred_positive_ratio_0_5': float(pred_bin_plot.mean()),
+                'gt_positive_ratio': float(mask_hw.mean()),
+            }
+            row.update(metrics)
             rows.append(row)
-            if plot_record is not None:
+
+            if sample_label == 1:
+                plot_record = {
+                    'dataset': dataset,
+                    'sample_uri': pending_uri,
+                    'image_chw': image_chw,
+                    'mask_hw': mask_hw,
+                    'prob_hw': prob_hw,
+                    'bin05_hw': pred_bin_plot,
+                }
                 ds_bucket = plot_samples.setdefault(str(plot_record['dataset']), [])
                 if len(ds_bucket) < int(max_plot_samples_per_dataset):
                     ds_bucket.append(plot_record)
@@ -459,6 +563,119 @@ def run_prepared_test_inference_from_hf_dataset(
     run['checkpoint_path'] = checkpoint_path
     run['checkpoint_info'] = ckpt_info
     return run
+
+
+def sweep_prepared_test_inference_across_checkpoints_from_hf_dataset(
+    checkpoint_dir: str | Path,
+    hf_dataset_repo_id: str,
+    snapshot_local_dir: str | Path,
+    inference_strategy: str = 'direct',
+    inference_batch_size: int = 64,
+    threshold_for_metrics: float | None = None,
+    plot_binary_threshold: float = 0.5,
+    normalization_mode: str | None = None,
+    local_dir_use_symlinks: bool = False,
+    show_progress: bool = True,
+) -> dict[str, object]:
+    import pandas as pd
+
+    checkpoint_paths = list_epoch_checkpoints(checkpoint_dir)
+    if not checkpoint_paths:
+        raise FileNotFoundError(f'No checkpoint_epoch_*.pt files found in {checkpoint_dir}')
+
+    snapshot_path = download_hf_snapshot(
+        repo_id=hf_dataset_repo_id,
+        local_dir=snapshot_local_dir,
+        repo_type='dataset',
+        local_dir_use_symlinks=local_dir_use_symlinks,
+    )
+
+    records: list[dict[str, object]] = []
+    iterator = checkpoint_paths
+    if show_progress:
+        try:
+            import importlib
+
+            tqdm_auto = importlib.import_module('tqdm.auto')
+            iterator = tqdm_auto.tqdm(checkpoint_paths, desc='Prepared test epoch sweep', leave=False)
+        except Exception:
+            iterator = checkpoint_paths
+
+    for checkpoint_path in iterator:
+        model, device, ckpt_info = load_model_from_checkpoint(checkpoint_path)
+        resolved_normalization = normalization_mode or resolve_normalization_mode_for_inference(
+            checkpoint_path=checkpoint_path,
+            default_mode='imagenet',
+        )
+        run = run_prepared_test_inference(
+            model=model,
+            device=device,
+            snapshot_root=snapshot_path,
+            inference_strategy=inference_strategy,
+            normalization_mode=resolved_normalization,
+            inference_batch_size=inference_batch_size,
+            threshold_for_metrics=threshold_for_metrics,
+            plot_binary_threshold=plot_binary_threshold,
+            csv_output_dir=None,
+            plot_output_dir=None,
+            max_plot_samples_per_dataset=0,
+            show_progress=False,
+        )
+
+        summary_df = run['summary_df']
+        for row in summary_df.to_dict(orient='records'):
+            records.append(
+                {
+                    'checkpoint_path': str(checkpoint_path),
+                    'checkpoint_epoch_from_name': _epoch_from_checkpoint_name(Path(checkpoint_path)),
+                    'checkpoint_epoch_from_state': ckpt_info.get('epoch'),
+                    'dataset': row.get('dataset'),
+                    'num_samples': int(row.get('num_samples', 0)),
+                    'f1': float(row.get('f1', 0.0)),
+                    'iou': float(row.get('iou', 0.0)),
+                    'precision': float(row.get('precision', 0.0)),
+                    'recall': float(row.get('recall', 0.0)),
+                    'accuracy': float(row.get('accuracy', 0.0)),
+                    'mean_probability': float(row.get('mean_probability', 0.0)),
+                    'pred_positive_ratio_threshold': float(row.get('pred_positive_ratio_threshold', 0.0)),
+                    'gt_positive_ratio': float(row.get('gt_positive_ratio', 0.0)),
+                    'normalization_mode': resolved_normalization,
+                    'threshold_used': float(run['threshold_used']),
+                    'strategy': str(inference_strategy),
+                    'inference_batch_size': int(run['inference_batch_size']),
+                }
+            )
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    results_df = pd.DataFrame(records).sort_values(
+        ['checkpoint_epoch_from_name', 'checkpoint_epoch_from_state', 'dataset']
+    ).reset_index(drop=True)
+    if results_df.empty:
+        raise RuntimeError('No records produced during prepared test checkpoint sweep')
+
+    pivot_f1 = results_df.pivot_table(
+        index='checkpoint_epoch_from_name',
+        columns='dataset',
+        values='f1',
+        aggfunc='first',
+    ).sort_index()
+    pivot_iou = results_df.pivot_table(
+        index='checkpoint_epoch_from_name',
+        columns='dataset',
+        values='iou',
+        aggfunc='first',
+    ).sort_index()
+
+    return {
+        'snapshot_path': snapshot_path,
+        'num_checkpoints': len(checkpoint_paths),
+        'results_df': results_df,
+        'f1_by_dataset': pivot_f1,
+        'iou_by_dataset': pivot_iou,
+    }
 
 
 def sweep_checkpoint_inference_for_prepared_sample_from_hf_dataset(
