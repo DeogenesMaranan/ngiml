@@ -130,6 +130,248 @@ def save_sample_plot(out_path: Path, image_chw: np.ndarray, gt_hw: np.ndarray, p
     fig.savefig(out_path, dpi=160, bbox_inches='tight')
     plt.close(fig)
 
+
+def count_prepared_samples(snapshot_root: Path) -> int:
+    snapshot_root = Path(snapshot_root)
+    npz_count = sum(1 for _ in snapshot_root.rglob('*.npz'))
+    tar_member_count = 0
+    for tar_path in snapshot_root.rglob('*.tar'):
+        with tarfile.open(tar_path, mode='r') as tf:
+            tar_member_count += sum(
+                1
+                for member in tf.getmembers()
+                if member.isfile() and member.name.lower().endswith('.npz')
+            )
+    return int(npz_count + tar_member_count)
+
+
+def download_hf_snapshot(
+    repo_id: str,
+    local_dir: str | Path,
+    repo_type: str = 'dataset',
+    local_dir_use_symlinks: bool = False,
+) -> Path:
+    from huggingface_hub import snapshot_download
+
+    snapshot_path = snapshot_download(
+        repo_id=repo_id,
+        repo_type=repo_type,
+        local_dir=str(local_dir),
+        local_dir_use_symlinks=local_dir_use_symlinks,
+    )
+    return Path(snapshot_path)
+
+
+def _sample_label_from_meta(meta: dict, mask_hw: np.ndarray) -> int:
+    raw_label = meta.get('label', int(mask_hw.max() > 0))
+    if isinstance(raw_label, str):
+        return 1 if raw_label.strip().lower() in {'1', 'fake', 'tp', 'tampered', 'manipulated'} else 0
+    return int(raw_label)
+
+
+def run_prepared_test_inference(
+    model: HybridNGIML,
+    device: torch.device,
+    snapshot_root: str | Path,
+    inference_strategy: str = 'direct',
+    normalization_mode: str = 'imagenet',
+    threshold_for_metrics: float | None = None,
+    plot_binary_threshold: float = 0.5,
+    csv_output_dir: str | Path | None = None,
+    plot_output_dir: str | Path | None = None,
+    max_plot_samples_per_dataset: int = 5,
+    show_progress: bool = True,
+) -> dict[str, object]:
+    import pandas as pd
+
+    snapshot_root = Path(snapshot_root)
+    total_samples = count_prepared_samples(snapshot_root)
+    rows: list[dict[str, object]] = []
+    plot_samples: dict[str, list[dict[str, object]]] = {}
+    threshold_used = float(
+        threshold_for_metrics if threshold_for_metrics is not None else getattr(model, 'default_threshold', 0.5)
+    )
+
+    iterator = iter_prepared_samples(snapshot_root)
+    if show_progress:
+        try:
+            import importlib
+
+            tqdm_auto = importlib.import_module('tqdm.auto')
+            iterator = tqdm_auto.tqdm(iterator, desc='Inference', total=total_samples)
+        except Exception:
+            iterator = iter_prepared_samples(snapshot_root)
+
+    for sample_uri, data in iterator:
+        if 'image' not in data:
+            continue
+
+        image_chw = _to_chw_rgb(np.asarray(data['image']))
+        h, w = int(image_chw.shape[1]), int(image_chw.shape[2])
+        mask_hw = _to_hw_mask(data.get('mask'), h, w)
+        meta = _parse_meta(data.get('metadata_json'))
+        dataset = _dataset_name(sample_uri, meta)
+        image_t = torch.from_numpy(image_chw).float()
+        if image_t.max() > 1.0:
+            image_t = image_t / 255.0
+
+        prob = predict_probability_map_by_strategy(
+            model=model,
+            image=image_t,
+            device=device,
+            strategy=inference_strategy,
+            normalization_mode=normalization_mode,
+        ).clamp(0.0, 1.0)
+
+        prob_hw = prob.detach().cpu().numpy().astype(np.float32)
+        pred_bin_metric = (prob_hw >= threshold_used).astype(np.uint8)
+        pred_bin_plot = (prob_hw >= float(plot_binary_threshold)).astype(np.uint8)
+        metrics = compute_binary_metrics(pred_bin_metric, mask_hw)
+        sample_label = _sample_label_from_meta(meta, mask_hw)
+
+        row = {
+            'dataset': dataset,
+            'sample_uri': sample_uri,
+            'split': str(meta.get('split', 'test')),
+            'label': sample_label,
+            'strategy': str(inference_strategy),
+            'normalization_mode': normalization_mode,
+            'threshold_for_metrics': threshold_used,
+            'plot_binary_threshold': float(plot_binary_threshold),
+            'height': h,
+            'width': w,
+            'mean_probability': float(prob_hw.mean()),
+            'max_probability': float(prob_hw.max()),
+            'pred_positive_ratio_threshold': float(pred_bin_metric.mean()),
+            'pred_positive_ratio_0_5': float(pred_bin_plot.mean()),
+            'gt_positive_ratio': float(mask_hw.mean()),
+        }
+        row.update(metrics)
+        rows.append(row)
+
+        if sample_label == 1:
+            ds_bucket = plot_samples.setdefault(dataset, [])
+            if len(ds_bucket) < int(max_plot_samples_per_dataset):
+                ds_bucket.append(
+                    {
+                        'sample_uri': sample_uri,
+                        'image_chw': image_chw,
+                        'mask_hw': mask_hw,
+                        'prob_hw': prob_hw,
+                        'bin05_hw': pred_bin_plot,
+                    }
+                )
+
+    results_df = pd.DataFrame(rows).sort_values(['dataset', 'sample_uri']).reset_index(drop=True)
+    if results_df.empty:
+        raise RuntimeError(f'No samples processed from snapshot: {snapshot_root}')
+
+    summary_df = results_df.groupby('dataset', as_index=False).agg(
+        {
+            'sample_uri': 'count',
+            'f1': 'mean',
+            'iou': 'mean',
+            'precision': 'mean',
+            'recall': 'mean',
+            'accuracy': 'mean',
+            'mean_probability': 'mean',
+            'pred_positive_ratio_threshold': 'mean',
+            'gt_positive_ratio': 'mean',
+        }
+    ).rename(columns={'sample_uri': 'num_samples'})
+
+    results_csv_path: Path | None = None
+    summary_csv_path: Path | None = None
+    if csv_output_dir is not None:
+        csv_output_dir = Path(csv_output_dir)
+        csv_output_dir.mkdir(parents=True, exist_ok=True)
+        results_csv_path = csv_output_dir / 'ngiml_hf_test_inference_results.csv'
+        summary_csv_path = csv_output_dir / 'ngiml_hf_test_inference_summary_by_dataset.csv'
+        results_df.to_csv(results_csv_path, index=False)
+        summary_df.to_csv(summary_csv_path, index=False)
+
+    if plot_output_dir is not None:
+        plot_output_dir = Path(plot_output_dir)
+        plot_output_dir.mkdir(parents=True, exist_ok=True)
+        for ds_name, samples in sorted(plot_samples.items()):
+            ds_dir = plot_output_dir / ds_name
+            for i, sample in enumerate(samples, start=1):
+                out_png = ds_dir / f'{ds_name}_sample_{i:02d}.png'
+                title = f"{ds_name} | sample {i} | {Path(str(sample['sample_uri']).split('::')[0]).name}"
+                save_sample_plot(
+                    out_png,
+                    sample['image_chw'],
+                    sample['mask_hw'],
+                    sample['prob_hw'],
+                    sample['bin05_hw'],
+                    title,
+                )
+
+    return {
+        'snapshot_path': snapshot_root,
+        'num_samples': int(len(results_df)),
+        'device': str(device),
+        'strategy': str(inference_strategy),
+        'normalization_mode': normalization_mode,
+        'threshold_used': threshold_used,
+        'plot_binary_threshold': float(plot_binary_threshold),
+        'results_df': results_df,
+        'summary_df': summary_df,
+        'results_csv': results_csv_path,
+        'summary_csv': summary_csv_path,
+        'plot_output_dir': Path(plot_output_dir) if plot_output_dir is not None else None,
+    }
+
+
+def run_prepared_test_inference_from_hf_dataset(
+    checkpoint_path: str | Path,
+    hf_dataset_repo_id: str,
+    snapshot_local_dir: str | Path,
+    output_root: str | Path,
+    inference_strategy: str = 'direct',
+    threshold_for_metrics: float | None = None,
+    plot_binary_threshold: float = 0.5,
+    normalization_mode: str | None = None,
+    max_plot_samples_per_dataset: int = 5,
+    local_dir_use_symlinks: bool = False,
+    show_progress: bool = True,
+) -> dict[str, object]:
+    checkpoint_path = Path(checkpoint_path)
+    output_root = Path(output_root)
+    csv_output_dir = output_root / 'csv'
+    plot_output_dir = output_root / 'plots'
+    csv_output_dir.mkdir(parents=True, exist_ok=True)
+    plot_output_dir.mkdir(parents=True, exist_ok=True)
+
+    model, device, ckpt_info = load_model_from_checkpoint(checkpoint_path)
+    resolved_normalization = normalization_mode or resolve_normalization_mode_for_inference(
+        checkpoint_path=checkpoint_path,
+        default_mode='imagenet',
+    )
+    snapshot_path = download_hf_snapshot(
+        repo_id=hf_dataset_repo_id,
+        local_dir=snapshot_local_dir,
+        repo_type='dataset',
+        local_dir_use_symlinks=local_dir_use_symlinks,
+    )
+
+    run = run_prepared_test_inference(
+        model=model,
+        device=device,
+        snapshot_root=snapshot_path,
+        inference_strategy=inference_strategy,
+        normalization_mode=resolved_normalization,
+        threshold_for_metrics=threshold_for_metrics,
+        plot_binary_threshold=plot_binary_threshold,
+        csv_output_dir=csv_output_dir,
+        plot_output_dir=plot_output_dir,
+        max_plot_samples_per_dataset=max_plot_samples_per_dataset,
+        show_progress=show_progress,
+    )
+    run['checkpoint_path'] = checkpoint_path
+    run['checkpoint_info'] = ckpt_info
+    return run
+
 def _zero_flop_jit(_inputs, _outputs) -> Counter[str]:
     return Counter()
 
