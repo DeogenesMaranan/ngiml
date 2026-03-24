@@ -166,6 +166,54 @@ def _sample_label_from_meta(meta: dict, mask_hw: np.ndarray) -> int:
     return int(raw_label)
 
 
+def select_prepared_test_sample(
+    snapshot_root: str | Path,
+    fake_only: bool = True,
+    sample_index: int = 0,
+    dataset_name: str | None = None,
+) -> dict[str, object]:
+    snapshot_root = Path(snapshot_root)
+    matches: list[dict[str, object]] = []
+
+    for sample_uri, data in iter_prepared_samples(snapshot_root):
+        if 'image' not in data:
+            continue
+
+        image_chw = _to_chw_rgb(np.asarray(data['image']))
+        h, w = int(image_chw.shape[1]), int(image_chw.shape[2])
+        mask_hw = _to_hw_mask(data.get('mask'), h, w)
+        meta = _parse_meta(data.get('metadata_json'))
+        sample_dataset = _dataset_name(sample_uri, meta)
+        sample_label = _sample_label_from_meta(meta, mask_hw)
+
+        if dataset_name and str(sample_dataset).strip().lower() != str(dataset_name).strip().lower():
+            continue
+        if fake_only and sample_label != 1:
+            continue
+
+        image_t = torch.from_numpy(image_chw).float()
+        if image_t.max() > 1.0:
+            image_t = image_t / 255.0
+
+        matches.append(
+            {
+                'sample_uri': sample_uri,
+                'dataset': sample_dataset,
+                'label': sample_label,
+                'image': image_t.clamp(0.0, 1.0),
+                'image_chw': image_chw,
+                'mask_hw': mask_hw,
+                'metadata': meta,
+            }
+        )
+
+        if len(matches) > sample_index:
+            return matches[sample_index]
+
+    sample_desc = f"dataset={dataset_name!r}, fake_only={fake_only}, sample_index={sample_index}"
+    raise RuntimeError(f'No prepared test sample matched selection: {sample_desc}')
+
+
 def _evaluate_prepared_sample(
     model: HybridNGIML,
     device: torch.device,
@@ -410,6 +458,56 @@ def run_prepared_test_inference_from_hf_dataset(
     )
     run['checkpoint_path'] = checkpoint_path
     run['checkpoint_info'] = ckpt_info
+    return run
+
+
+def sweep_checkpoint_inference_for_prepared_sample_from_hf_dataset(
+    checkpoint_dir: str | Path,
+    hf_dataset_repo_id: str,
+    snapshot_local_dir: str | Path,
+    normalization_mode: str = 'imagenet',
+    strategy: str = 'direct',
+    threshold: float | None = None,
+    infer_size: int = 448,
+    tile_size: int = 448,
+    tile_overlap: float = 0.5,
+    tile_batch_size: int = 16,
+    fake_only: bool = True,
+    sample_index: int = 0,
+    dataset_name: str | None = None,
+    local_dir_use_symlinks: bool = False,
+    show_progress: bool = True,
+    show_plot: bool = True,
+    plot_max_checkpoints: int | None = 8,
+) -> dict[str, object]:
+    snapshot_path = download_hf_snapshot(
+        repo_id=hf_dataset_repo_id,
+        local_dir=snapshot_local_dir,
+        repo_type='dataset',
+        local_dir_use_symlinks=local_dir_use_symlinks,
+    )
+    selected = select_prepared_test_sample(
+        snapshot_root=snapshot_path,
+        fake_only=fake_only,
+        sample_index=sample_index,
+        dataset_name=dataset_name,
+    )
+    run = sweep_checkpoint_inference_for_image(
+        checkpoint_dir=checkpoint_dir,
+        image=selected['image'],
+        normalization_mode=normalization_mode,
+        strategy=strategy,
+        threshold=threshold,
+        infer_size=infer_size,
+        tile_size=tile_size,
+        tile_overlap=tile_overlap,
+        tile_batch_size=tile_batch_size,
+        show_progress=show_progress,
+        show_plot=show_plot,
+        plot_max_checkpoints=plot_max_checkpoints,
+    )
+    run['snapshot_path'] = snapshot_path
+    run['selected_sample'] = selected
     return run
 
 def find_latest_checkpoint(runs_root: Path) -> Path:
