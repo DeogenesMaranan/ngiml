@@ -272,44 +272,12 @@ def run_prepared_dataset_inference(
 
     rows: list[dict[str, object]] = []
     plot_samples: dict[str, list[dict[str, object]]] = {}
-    pending_direct: dict[tuple[int, int], list[dict[str, object]]] = {}
     inference_strategy_key = str(inference_strategy).strip().lower()
     batch_size = max(1, int(direct_batch_size)) if inference_strategy_key == "direct" else 1
-
-    def _flush_direct_batch(pending: list[dict[str, object]]) -> None:
-        if not pending:
-            return
-        probs = predict_probability_maps_batch(
-            model=model,
-            images=[sample["image_t"] for sample in pending],
-            device=device,
-            normalization_mode=resolved_normalization,
-        )
-        for sample, prob in zip(pending, probs):
-            _append_prepared_inference_result(
-                rows,
-                plot_samples,
-                sample,
-                prob.clamp(0.0, 1.0),
-                threshold_for_metrics=resolved_threshold,
-                plot_binary_threshold=plot_binary_threshold,
-                inference_strategy=inference_strategy_key,
-                normalization_mode=resolved_normalization,
-                max_plot_samples_per_dataset=max_plot_samples_per_dataset,
-            )
 
     for sample_uri, data in tqdm(iter_prepared_samples(snapshot_path), desc="Inference", total=total_samples):
         sample = _prepared_sample_to_inference_record(sample_uri, data)
         if sample is None:
-            continue
-
-        if inference_strategy_key == "direct":
-            key = (int(sample["height"]), int(sample["width"]))
-            pending = pending_direct.setdefault(key, [])
-            pending.append(sample)
-            if len(pending) >= batch_size:
-                _flush_direct_batch(pending)
-                pending.clear()
             continue
 
         prob = predict_probability_map_by_strategy(
@@ -330,9 +298,6 @@ def run_prepared_dataset_inference(
             normalization_mode=resolved_normalization,
             max_plot_samples_per_dataset=max_plot_samples_per_dataset,
         )
-
-    for pending in pending_direct.values():
-        _flush_direct_batch(pending)
 
     results_df = pd.DataFrame(rows).sort_values(["dataset", "sample_uri"]).reset_index(drop=True)
     if results_df.empty:
