@@ -866,6 +866,12 @@ def predict_probability_maps_batch(
     for idx, image in enumerate(images):
         if image.ndim != 3 or image.shape[0] != 3:
             raise ValueError(f"Expected RGB CHW image tensor, got shape={tuple(image.shape)} at index={idx}")
+
+        image = image.float()
+        if image.max() > 1.0:
+            image = image / 255.0
+        image = image.clamp(0.0, 1.0)
+
         if expected_shape is None:
             expected_shape = tuple(int(v) for v in image.shape)
         elif tuple(int(v) for v in image.shape) != expected_shape:
