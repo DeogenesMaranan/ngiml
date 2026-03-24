@@ -98,18 +98,38 @@ def iter_prepared_samples(snapshot_root: Path):
                 with np.load(io.BytesIO(fobj.read()), allow_pickle=True) as blob:
                     yield f'{tar_path}::{m.name}', {k: blob[k] for k in blob.files}
 
-def compute_binary_metrics(pred_bin: np.ndarray, gt_bin: np.ndarray) -> dict[str, float]:
+def compute_binary_metrics(
+    pred_bin: np.ndarray,
+    gt_bin: np.ndarray,
+    *,
+    empty_score_mode: str = "strict",
+) -> dict[str, float]:
     pred = pred_bin.astype(bool)
     gt = gt_bin.astype(bool)
     tp = float(np.logical_and(pred, gt).sum())
     tn = float(np.logical_and(~pred, ~gt).sum())
     fp = float(np.logical_and(pred, ~gt).sum())
     fn = float(np.logical_and(~pred, gt).sum())
-    precision = tp / (tp + fp + 1e-8)
-    recall = tp / (tp + fn + 1e-8)
-    f1 = (2 * precision * recall) / (precision + recall + 1e-8)
-    iou = tp / (tp + fp + fn + 1e-8)
-    acc = (tp + tn) / (tp + tn + fp + fn + 1e-8)
+    mode = str(empty_score_mode).strip().lower()
+    if mode not in {"strict", "legacy"}:
+        raise ValueError(f"Unsupported empty_score_mode={empty_score_mode!r}. Use 'strict' or 'legacy'.")
+
+    precision_denom = tp + fp
+    recall_denom = tp + fn
+    f1_denom = (2 * tp) + fp + fn
+    iou_denom = tp + fp + fn
+    acc_denom = tp + tn + fp + fn
+
+    precision = tp / (precision_denom + 1e-8)
+    recall = tp / (recall_denom + 1e-8)
+    if mode == "legacy":
+        f1 = (2 * tp) / f1_denom if f1_denom > 0 else 1.0
+        iou = tp / iou_denom if iou_denom > 0 else 1.0
+        acc = (tp + tn) / acc_denom if acc_denom > 0 else 1.0
+    else:
+        f1 = (2 * precision * recall) / (precision + recall + 1e-8)
+        iou = tp / (iou_denom + 1e-8)
+        acc = (tp + tn) / (acc_denom + 1e-8)
     return {'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn, 'precision': precision, 'recall': recall, 'f1': f1, 'iou': iou, 'accuracy': acc}
 
 def save_sample_plot(out_path: Path, image_chw: np.ndarray, gt_hw: np.ndarray, prob_hw: np.ndarray, bin05_hw: np.ndarray, title: str):
@@ -184,7 +204,8 @@ def _append_prepared_inference_result(
     prob_hw = prob.detach().cpu().numpy().astype(np.float32)
     pred_bin_metric = (prob_hw >= float(threshold_for_metrics)).astype(np.uint8)
     pred_bin_plot = (prob_hw >= float(plot_binary_threshold)).astype(np.uint8)
-    metrics = compute_binary_metrics(pred_bin_metric, sample["mask_hw"])
+    metrics = compute_binary_metrics(pred_bin_metric, sample["mask_hw"], empty_score_mode="strict")
+    legacy_metrics = compute_binary_metrics(pred_bin_metric, sample["mask_hw"], empty_score_mode="legacy")
 
     meta = sample["meta"]
     raw_label = meta.get("label", int(sample["mask_hw"].max() > 0))
@@ -209,6 +230,8 @@ def _append_prepared_inference_result(
         "pred_positive_ratio_threshold": float(pred_bin_metric.mean()),
         "pred_positive_ratio_0_5": float(pred_bin_plot.mean()),
         "gt_positive_ratio": float(sample["mask_hw"].mean()),
+        "legacy_f1": float(legacy_metrics["f1"]),
+        "legacy_iou": float(legacy_metrics["iou"]),
     }
     row.update(metrics)
     rows.append(row)
@@ -274,30 +297,69 @@ def run_prepared_dataset_inference(
     plot_samples: dict[str, list[dict[str, object]]] = {}
     inference_strategy_key = str(inference_strategy).strip().lower()
     batch_size = max(1, int(direct_batch_size)) if inference_strategy_key == "direct" else 1
+    pending_batch: list[dict[str, object]] = []
+    pending_shape: tuple[int, int, int] | None = None
+
+    def _flush_pending_batch() -> None:
+        nonlocal pending_batch, pending_shape
+        if not pending_batch:
+            return
+
+        if inference_strategy_key == "direct" and len(pending_batch) > 1:
+            probs = predict_probability_maps_batch(
+                model=model,
+                images=[sample["image_t"] for sample in pending_batch],
+                device=device,
+                normalization_mode=resolved_normalization,
+            )
+        else:
+            probs = [
+                predict_probability_map_by_strategy(
+                    model=model,
+                    image=sample["image_t"],
+                    device=device,
+                    strategy=inference_strategy_key,
+                    normalization_mode=resolved_normalization,
+                ).clamp(0.0, 1.0)
+                for sample in pending_batch
+            ]
+
+        for sample, prob in zip(pending_batch, probs):
+            _append_prepared_inference_result(
+                rows,
+                plot_samples,
+                sample,
+                prob.clamp(0.0, 1.0),
+                threshold_for_metrics=resolved_threshold,
+                plot_binary_threshold=plot_binary_threshold,
+                inference_strategy=inference_strategy_key,
+                normalization_mode=resolved_normalization,
+                max_plot_samples_per_dataset=max_plot_samples_per_dataset,
+            )
+
+        pending_batch = []
+        pending_shape = None
 
     for sample_uri, data in tqdm(iter_prepared_samples(snapshot_path), desc="Inference", total=total_samples):
         sample = _prepared_sample_to_inference_record(sample_uri, data)
         if sample is None:
             continue
 
-        prob = predict_probability_map_by_strategy(
-            model=model,
-            image=sample["image_t"],
-            device=device,
-            strategy=inference_strategy_key,
-            normalization_mode=resolved_normalization,
-        ).clamp(0.0, 1.0)
-        _append_prepared_inference_result(
-            rows,
-            plot_samples,
-            sample,
-            prob,
-            threshold_for_metrics=resolved_threshold,
-            plot_binary_threshold=plot_binary_threshold,
-            inference_strategy=inference_strategy_key,
-            normalization_mode=resolved_normalization,
-            max_plot_samples_per_dataset=max_plot_samples_per_dataset,
-        )
+        if inference_strategy_key != "direct":
+            pending_batch.append(sample)
+            _flush_pending_batch()
+            continue
+
+        sample_shape = tuple(int(v) for v in sample["image_t"].shape)
+        if pending_shape is not None and sample_shape != pending_shape:
+            _flush_pending_batch()
+
+        pending_batch.append(sample)
+        pending_shape = sample_shape
+        if len(pending_batch) >= batch_size:
+            _flush_pending_batch()
+
+    _flush_pending_batch()
 
     results_df = pd.DataFrame(rows).sort_values(["dataset", "sample_uri"]).reset_index(drop=True)
     if results_df.empty:
@@ -305,6 +367,7 @@ def run_prepared_dataset_inference(
 
     results_csv = csv_output_dir / "ngiml_hf_test_inference_results.csv"
     summary_csv = csv_output_dir / "ngiml_hf_test_inference_summary_by_dataset.csv"
+    comparison_csv = csv_output_dir / "ngiml_hf_test_inference_metric_mode_comparison.csv"
     results_df.to_csv(results_csv, index=False)
 
     summary_df = results_df.groupby("dataset", as_index=False).agg(
@@ -318,9 +381,30 @@ def run_prepared_dataset_inference(
             "mean_probability": "mean",
             "pred_positive_ratio_threshold": "mean",
             "gt_positive_ratio": "mean",
+            "legacy_f1": "mean",
+            "legacy_iou": "mean",
         }
     ).rename(columns={"sample_uri": "num_samples"})
     summary_df.to_csv(summary_csv, index=False)
+    comparison_df = summary_df[
+        [
+            "dataset",
+            "num_samples",
+            "f1",
+            "legacy_f1",
+            "iou",
+            "legacy_iou",
+            "precision",
+            "recall",
+            "accuracy",
+            "mean_probability",
+            "pred_positive_ratio_threshold",
+            "gt_positive_ratio",
+        ]
+    ].copy()
+    comparison_df["f1_gap_legacy_minus_strict"] = comparison_df["legacy_f1"] - comparison_df["f1"]
+    comparison_df["iou_gap_legacy_minus_strict"] = comparison_df["legacy_iou"] - comparison_df["iou"]
+    comparison_df.to_csv(comparison_csv, index=False)
 
     for dataset_name, samples in sorted(plot_samples.items()):
         dataset_plot_dir = plot_output_dir / dataset_name
@@ -340,8 +424,10 @@ def run_prepared_dataset_inference(
         "direct_batch_size": int(batch_size),
         "results_df": results_df,
         "summary_df": summary_df,
+        "comparison_df": comparison_df,
         "results_csv": results_csv,
         "summary_csv": summary_csv,
+        "comparison_csv": comparison_csv,
         "plot_output_dir": plot_output_dir,
     }
 
