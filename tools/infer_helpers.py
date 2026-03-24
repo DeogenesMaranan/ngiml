@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 import re
-from collections import Counter
 from pathlib import Path
 from typing import Sequence
 
@@ -18,12 +17,10 @@ from src.data.dataloaders import (
     _normalize,
     load_manifest,
 )
-from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
 from tools.train_ngiml import build_default_components
 import numpy as np
 import json
-from pathlib import Path
 import tarfile
 import io
 import matplotlib.pyplot as plt
@@ -169,12 +166,79 @@ def _sample_label_from_meta(meta: dict, mask_hw: np.ndarray) -> int:
     return int(raw_label)
 
 
+def _evaluate_prepared_sample(
+    model: HybridNGIML,
+    device: torch.device,
+    sample_uri: str,
+    data: dict,
+    inference_strategy: str,
+    normalization_mode: str,
+    threshold_used: float,
+    plot_binary_threshold: float,
+) -> tuple[dict[str, object], int, dict[str, object] | None]:
+    image_chw = _to_chw_rgb(np.asarray(data['image']))
+    h, w = int(image_chw.shape[1]), int(image_chw.shape[2])
+    mask_hw = _to_hw_mask(data.get('mask'), h, w)
+    meta = _parse_meta(data.get('metadata_json'))
+    dataset = _dataset_name(sample_uri, meta)
+    image_t = torch.from_numpy(image_chw).float()
+    if image_t.max() > 1.0:
+        image_t = image_t / 255.0
+
+    prob = predict_probability_map_by_strategy(
+        model=model,
+        image=image_t,
+        device=device,
+        strategy=inference_strategy,
+        normalization_mode=normalization_mode,
+    ).clamp(0.0, 1.0)
+
+    prob_hw = prob.detach().cpu().numpy().astype(np.float32)
+    pred_bin_metric = (prob_hw >= threshold_used).astype(np.uint8)
+    pred_bin_plot = (prob_hw >= float(plot_binary_threshold)).astype(np.uint8)
+    metrics = compute_binary_metrics(pred_bin_metric, mask_hw)
+    sample_label = _sample_label_from_meta(meta, mask_hw)
+
+    row = {
+        'dataset': dataset,
+        'sample_uri': sample_uri,
+        'split': str(meta.get('split', 'test')),
+        'label': sample_label,
+        'strategy': str(inference_strategy),
+        'normalization_mode': normalization_mode,
+        'threshold_for_metrics': threshold_used,
+        'plot_binary_threshold': float(plot_binary_threshold),
+        'height': h,
+        'width': w,
+        'mean_probability': float(prob_hw.mean()),
+        'max_probability': float(prob_hw.max()),
+        'pred_positive_ratio_threshold': float(pred_bin_metric.mean()),
+        'pred_positive_ratio_0_5': float(pred_bin_plot.mean()),
+        'gt_positive_ratio': float(mask_hw.mean()),
+    }
+    row.update(metrics)
+
+    plot_record: dict[str, object] | None = None
+    if sample_label == 1:
+        plot_record = {
+            'dataset': dataset,
+            'sample_uri': sample_uri,
+            'image_chw': image_chw,
+            'mask_hw': mask_hw,
+            'prob_hw': prob_hw,
+            'bin05_hw': pred_bin_plot,
+        }
+
+    return row, sample_label, plot_record
+
+
 def run_prepared_test_inference(
     model: HybridNGIML,
     device: torch.device,
     snapshot_root: str | Path,
     inference_strategy: str = 'direct',
     normalization_mode: str = 'imagenet',
+    inference_batch_size: int = 64,
     threshold_for_metrics: float | None = None,
     plot_binary_threshold: float = 0.5,
     csv_output_dir: str | Path | None = None,
@@ -188,6 +252,8 @@ def run_prepared_test_inference(
     total_samples = count_prepared_samples(snapshot_root)
     rows: list[dict[str, object]] = []
     plot_samples: dict[str, list[dict[str, object]]] = {}
+    pending_samples: list[tuple[str, dict]] = []
+    resolved_batch_size = max(1, int(inference_batch_size))
     threshold_used = float(
         threshold_for_metrics if threshold_for_metrics is not None else getattr(model, 'default_threshold', 0.5)
     )
@@ -202,65 +268,36 @@ def run_prepared_test_inference(
         except Exception:
             iterator = iter_prepared_samples(snapshot_root)
 
+    def _flush_pending() -> None:
+        nonlocal pending_samples
+        if not pending_samples:
+            return
+        for pending_uri, pending_data in pending_samples:
+            row, _, plot_record = _evaluate_prepared_sample(
+                model=model,
+                device=device,
+                sample_uri=pending_uri,
+                data=pending_data,
+                inference_strategy=inference_strategy,
+                normalization_mode=normalization_mode,
+                threshold_used=threshold_used,
+                plot_binary_threshold=plot_binary_threshold,
+            )
+            rows.append(row)
+            if plot_record is not None:
+                ds_bucket = plot_samples.setdefault(str(plot_record['dataset']), [])
+                if len(ds_bucket) < int(max_plot_samples_per_dataset):
+                    ds_bucket.append(plot_record)
+        pending_samples = []
+
     for sample_uri, data in iterator:
         if 'image' not in data:
             continue
+        pending_samples.append((sample_uri, data))
+        if len(pending_samples) >= resolved_batch_size:
+            _flush_pending()
 
-        image_chw = _to_chw_rgb(np.asarray(data['image']))
-        h, w = int(image_chw.shape[1]), int(image_chw.shape[2])
-        mask_hw = _to_hw_mask(data.get('mask'), h, w)
-        meta = _parse_meta(data.get('metadata_json'))
-        dataset = _dataset_name(sample_uri, meta)
-        image_t = torch.from_numpy(image_chw).float()
-        if image_t.max() > 1.0:
-            image_t = image_t / 255.0
-
-        prob = predict_probability_map_by_strategy(
-            model=model,
-            image=image_t,
-            device=device,
-            strategy=inference_strategy,
-            normalization_mode=normalization_mode,
-        ).clamp(0.0, 1.0)
-
-        prob_hw = prob.detach().cpu().numpy().astype(np.float32)
-        pred_bin_metric = (prob_hw >= threshold_used).astype(np.uint8)
-        pred_bin_plot = (prob_hw >= float(plot_binary_threshold)).astype(np.uint8)
-        metrics = compute_binary_metrics(pred_bin_metric, mask_hw)
-        sample_label = _sample_label_from_meta(meta, mask_hw)
-
-        row = {
-            'dataset': dataset,
-            'sample_uri': sample_uri,
-            'split': str(meta.get('split', 'test')),
-            'label': sample_label,
-            'strategy': str(inference_strategy),
-            'normalization_mode': normalization_mode,
-            'threshold_for_metrics': threshold_used,
-            'plot_binary_threshold': float(plot_binary_threshold),
-            'height': h,
-            'width': w,
-            'mean_probability': float(prob_hw.mean()),
-            'max_probability': float(prob_hw.max()),
-            'pred_positive_ratio_threshold': float(pred_bin_metric.mean()),
-            'pred_positive_ratio_0_5': float(pred_bin_plot.mean()),
-            'gt_positive_ratio': float(mask_hw.mean()),
-        }
-        row.update(metrics)
-        rows.append(row)
-
-        if sample_label == 1:
-            ds_bucket = plot_samples.setdefault(dataset, [])
-            if len(ds_bucket) < int(max_plot_samples_per_dataset):
-                ds_bucket.append(
-                    {
-                        'sample_uri': sample_uri,
-                        'image_chw': image_chw,
-                        'mask_hw': mask_hw,
-                        'prob_hw': prob_hw,
-                        'bin05_hw': pred_bin_plot,
-                    }
-                )
+    _flush_pending()
 
     results_df = pd.DataFrame(rows).sort_values(['dataset', 'sample_uri']).reset_index(drop=True)
     if results_df.empty:
@@ -312,6 +349,7 @@ def run_prepared_test_inference(
         'num_samples': int(len(results_df)),
         'device': str(device),
         'strategy': str(inference_strategy),
+        'inference_batch_size': resolved_batch_size,
         'normalization_mode': normalization_mode,
         'threshold_used': threshold_used,
         'plot_binary_threshold': float(plot_binary_threshold),
@@ -329,6 +367,7 @@ def run_prepared_test_inference_from_hf_dataset(
     snapshot_local_dir: str | Path,
     output_root: str | Path,
     inference_strategy: str = 'direct',
+    inference_batch_size: int = 64,
     threshold_for_metrics: float | None = None,
     plot_binary_threshold: float = 0.5,
     normalization_mode: str | None = None,
@@ -361,6 +400,7 @@ def run_prepared_test_inference_from_hf_dataset(
         snapshot_root=snapshot_path,
         inference_strategy=inference_strategy,
         normalization_mode=resolved_normalization,
+        inference_batch_size=inference_batch_size,
         threshold_for_metrics=threshold_for_metrics,
         plot_binary_threshold=plot_binary_threshold,
         csv_output_dir=csv_output_dir,
@@ -371,53 +411,6 @@ def run_prepared_test_inference_from_hf_dataset(
     run['checkpoint_path'] = checkpoint_path
     run['checkpoint_info'] = ckpt_info
     return run
-
-def _zero_flop_jit(_inputs, _outputs) -> Counter[str]:
-    return Counter()
-
-
-def _build_flop_analysis(model: torch.nn.Module, sample: torch.Tensor):
-    from fvcore.nn import FlopCountAnalysis
-    from fvcore.nn.jit_handles import elementwise_flop_counter, generic_activation_jit
-
-    elementwise = elementwise_flop_counter(1, 0)
-    analysis = FlopCountAnalysis(model, sample).unsupported_ops_warnings(False)
-    analysis = analysis.set_op_handle(
-        "aten::add",
-        elementwise,
-        "aten::sub",
-        elementwise,
-        "aten::rsub",
-        elementwise,
-        "aten::mul",
-        elementwise,
-        "aten::div",
-        elementwise,
-        "aten::mean",
-        elementwise,
-        "aten::ne",
-        elementwise,
-        "aten::sigmoid",
-        generic_activation_jit("sigmoid"),
-        "aten::gelu",
-        generic_activation_jit("gelu"),
-        "aten::silu_",
-        generic_activation_jit("silu"),
-        "aten::softmax",
-        generic_activation_jit("softmax"),
-        "aten::pad",
-        _zero_flop_jit,
-        "aten::fill_",
-        _zero_flop_jit,
-        "aten::repeat",
-        _zero_flop_jit,
-        "aten::expand_as",
-        _zero_flop_jit,
-        "aten::feature_dropout",
-        _zero_flop_jit,
-    )
-    return analysis
-
 
 def find_latest_checkpoint(runs_root: Path) -> Path:
     runs_root = Path(runs_root)
@@ -727,30 +720,6 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
     return model, device, info
 
 
-def select_manifest_sample(
-    manifest_path: Path,
-    split_priority: Sequence[str] = ("test", "val", "train"),
-    fake_only: bool = True,
-) -> SampleRecord:
-    manifest = load_manifest(manifest_path)
-    samples = manifest.samples
-
-    if fake_only:
-        fake_samples = [s for s in samples if int(getattr(s, "label", 0)) == 1 or s.mask_path is not None]
-    else:
-        fake_samples = samples
-
-    for split_name in split_priority:
-        split_samples = [s for s in fake_samples if s.split == split_name]
-        if split_samples:
-            return split_samples[0]
-
-    if fake_samples:
-        return fake_samples[0]
-
-    raise RuntimeError(f"No samples available in manifest: {manifest_path}")
-
-
 def _resolve_possible_local_path(path_str: str) -> str:
     path = Path(path_str)
     return path.as_posix()
@@ -852,26 +821,6 @@ def predict_probability_map(
             logits = _select_output_head(outputs)
             prob = torch.sigmoid(logits)[0, 0].detach().cpu()
     return prob
-
-
-def predict_binary_map(
-    model: HybridNGIML,
-    image: torch.Tensor,
-    device: torch.device,
-    threshold: float | None = None,
-    normalization_mode: str = "zero_one",
-    residual_noise: torch.Tensor | None = None,
-) -> torch.Tensor:
-    prob = predict_probability_map(
-        model,
-        image,
-        device,
-        normalization_mode=normalization_mode,
-        residual_noise=residual_noise,
-    )
-    if threshold is None:
-        threshold = float(getattr(model, "default_threshold", 0.5))
-    return (prob >= float(threshold)).float()
 
 
 def resolve_normalization_mode_for_inference(
@@ -1468,80 +1417,4 @@ def plot_multi_strategy_inference(
     return fig, axes
 
 
-def get_model_complexity_stats(
-    model: HybridNGIML,
-    input_size: tuple[int, int, int, int] = (1, 3, 448, 448),
-) -> dict[str, object]:
-    total_params = sum(parameter.numel() for parameter in model.parameters())
-    trainable_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-    frozen_params = total_params - trainable_params
-
-    stats: dict[str, object] = {
-        "total_params": int(total_params),
-        "trainable_params": int(trainable_params),
-        "frozen_params": int(frozen_params),
-        "input_size": tuple(int(v) for v in input_size),
-    }
-
-    sample_device = next(model.parameters()).device
-    sample = torch.randn(*input_size, device=sample_device)
-
-    class _ProfileWrapper(torch.nn.Module):
-        def __init__(self, base_model: HybridNGIML):
-            super().__init__()
-            self.base_model = base_model
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            out = self.base_model(x, target_size=x.shape[-2:], residual_noise=None)
-            if isinstance(out, (list, tuple)):
-                return _select_output_head(out)
-            return out
-
-    profile_model = _ProfileWrapper(model).to(sample_device)
-
-    was_training = model.training
-    model.eval()
-    profile_model.eval()
-    try:
-        try:
-            with torch.no_grad():
-                analysis = _build_flop_analysis(profile_model, sample)
-                total_flops = float(analysis.total())
-                unsupported_ops = {str(name): int(count) for name, count in analysis.unsupported_ops().items()}
-            stats["flops"] = total_flops
-            stats["macs"] = total_flops / 2.0
-            stats["unsupported_ops"] = unsupported_ops
-            stats["flops_source"] = "fvcore+custom_op_handles"
-            stats["flops_error"] = (
-                None
-                if not unsupported_ops
-                else "FLOPs include custom op-handle estimates; unsupported ops remain in `unsupported_ops`."
-            )
-        except Exception as fv_error:
-            try:
-                from thop import profile as thop_profile
-
-                with torch.no_grad():
-                    macs, _ = thop_profile(profile_model, inputs=(sample,), verbose=False)
-                macs = float(macs)
-                stats["macs"] = macs
-                stats["flops"] = macs * 2.0
-                stats["unsupported_ops"] = None
-                stats["flops_source"] = "thop"
-                stats["flops_error"] = f"fvcore unavailable ({fv_error}); used thop fallback"
-            except Exception as thop_error:
-                stats["flops"] = None
-                stats["macs"] = None
-                stats["unsupported_ops"] = None
-                stats["flops_source"] = None
-                stats["flops_error"] = (
-                    "FLOPs unavailable. "
-                    f"fvcore error: {fv_error}. "
-                    f"thop error: {thop_error}. "
-                    "Try `%pip install fvcore iopath` (or `%pip install thop`) in the active notebook kernel."
-                )
-    finally:
-        model.train(was_training)
-
-    return stats
 
