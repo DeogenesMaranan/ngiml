@@ -440,7 +440,7 @@ def _build_flop_analysis(model: torch.nn.Module, sample: torch.Tensor):
     from fvcore.nn.jit_handles import elementwise_flop_counter, generic_activation_jit
 
     elementwise = elementwise_flop_counter(1, 0)
-    analysis = FlopCountAnalysis(model, sample).unsupported_ops_warnings(False)
+    analysis = FlopCountAnalysis(model, sample).unsupported_ops_warnings(False).uncalled_modules_warnings(False)
     analysis = analysis.set_op_handle(
         "aten::add",
         elementwise,
