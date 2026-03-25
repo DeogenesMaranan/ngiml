@@ -140,16 +140,17 @@ class HybridNGIML(nn.Module):
             and self.noise is not None
         )
         if self.enable_residual_attention:
-            # Project residual features to attention map (per stage)
-            res_channels = branch_channels.get("residual", [0])
-            sem_channels = branch_channels.get("low_level", [0])
-            # Use highest-resolution features for attention
-            attn_in_ch = res_channels[0] if res_channels else 0
-            attn_out_ch = sem_channels[0] if sem_channels else 0
-            self.residual_attention_proj = nn.Conv2d(attn_in_ch, attn_out_ch, kernel_size=1)
-            nn.init.zeros_(self.residual_attention_proj.weight)
-            if self.residual_attention_proj.bias is not None:
-                nn.init.zeros_(self.residual_attention_proj.bias)
+            # Build a stage-matched residual attention path so each semantic scale
+            # can be guided by the corresponding residual representation.
+            res_channels = branch_channels.get("residual", [])
+            sem_channels = branch_channels.get("low_level", [])
+            self.residual_attention_proj = nn.ModuleList()
+            for stage_idx in range(min(len(res_channels), len(sem_channels))):
+                proj = nn.Conv2d(res_channels[stage_idx], sem_channels[stage_idx], kernel_size=1)
+                nn.init.zeros_(proj.weight)
+                if proj.bias is not None:
+                    nn.init.zeros_(proj.bias)
+                self.residual_attention_proj.append(proj)
 
     def _extract_features(self, x: Tensor, residual_noise: Tensor | None = None) -> Dict[str, Optional[List[Tensor] | Tensor]]:
         low_level = self.efficientnet(x) if self.efficientnet is not None else None
@@ -158,14 +159,14 @@ class HybridNGIML(nn.Module):
 
         # Residual-guided attention (modulate semantic features before fusion)
         if self.enable_residual_attention and isinstance(low_level, list) and isinstance(residual, list):
-            # Use highest-resolution features (stage 0)
-            attn_map = torch.sigmoid(self.residual_attention_proj(residual[0]))
-            # Upsample attention map to match semantic feature spatial dims if needed
-            sem_h, sem_w = low_level[0].shape[-2:]
-            if attn_map.shape[-2:] != (sem_h, sem_w):
-                attn_map = F.interpolate(attn_map, size=(sem_h, sem_w), mode="bilinear", align_corners=False)
-            # Modulate semantic features: semantic_feat = semantic_feat * (1 + attention)
-            low_level[0] = low_level[0] * (1.0 + attn_map)
+            for stage_idx, proj in enumerate(self.residual_attention_proj):
+                if stage_idx >= len(low_level) or stage_idx >= len(residual):
+                    break
+                attn_map = torch.sigmoid(proj(residual[stage_idx]))
+                sem_h, sem_w = low_level[stage_idx].shape[-2:]
+                if attn_map.shape[-2:] != (sem_h, sem_w):
+                    attn_map = F.interpolate(attn_map, size=(sem_h, sem_w), mode="bilinear", align_corners=False)
+                low_level[stage_idx] = low_level[stage_idx] * (1.0 + attn_map)
 
         # Note: previous implementation attempted to checkpoint each child module
         # by calling them directly with the original input `x`. That is incorrect

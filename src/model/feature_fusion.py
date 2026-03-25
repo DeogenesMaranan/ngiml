@@ -43,6 +43,8 @@ class FeatureFusionConfig:
     norm: str = "bn"
     activation: str = "relu"
     fusion_refinement: bool = True  # Add Conv3x3+IN+ReLU after fusion output (enabled by default)
+    late_residual_boost_start: int = 1
+    late_residual_boost: float = 0.35
 
 
 class _AdaptiveFusionStage(nn.Module):
@@ -57,6 +59,7 @@ class _AdaptiveFusionStage(nn.Module):
         norm: str,
         activation: str,
         fusion_refinement: bool = False,
+        late_residual_boost: float = 0.0,
     ) -> None:
         super().__init__()
         # Conv only for projected features before fusion (no norm/activation)
@@ -78,6 +81,7 @@ class _AdaptiveFusionStage(nn.Module):
             _build_activation(activation),
         )
         self.fusion_refinement = fusion_refinement
+        self.late_residual_boost = max(late_residual_boost, 0.0)
         if self.fusion_refinement:
             self.refine2 = nn.Sequential(
                 nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
@@ -124,11 +128,13 @@ class _AdaptiveFusionStage(nn.Module):
         fused = None
         weight_sum = None
         eps = 1e-6
+        aligned_projections: Dict[str, Tensor] = {}
 
         for branch, tensor in features.items():
             proj = self.projections[branch](tensor)
             if proj.shape[-2:] != (align_h, align_w):
                 proj = F.interpolate(proj, size=(align_h, align_w), mode="bilinear", align_corners=False)
+            aligned_projections[branch] = proj
 
             # Bounded sigmoid gating: gate = sigmoid(param) * 0.8 + 0.1
             raw_gate = self.gate_params[branch]
@@ -153,6 +159,13 @@ class _AdaptiveFusionStage(nn.Module):
                 weight_sum = weight_sum + gate
 
         fused = fused / (weight_sum + eps)
+        if (
+            noise_branch is not None
+            and self.late_residual_boost > 0.0
+            and noise_branch in aligned_projections
+            and noise_weight > 0.0
+        ):
+            fused = fused + (aligned_projections[noise_branch] * (self.late_residual_boost * noise_weight))
         fused = self.refine(fused)
         if self.fusion_refinement:
             fused = self.refine2(fused)
@@ -189,6 +202,14 @@ class MultiStageFeatureFusion(nn.Module):
                     norm=config.norm,
                     activation=config.activation,
                     fusion_refinement=getattr(config, 'fusion_refinement', False),
+                    late_residual_boost=(
+                        getattr(config, "late_residual_boost", 0.0)
+                        if (
+                            config.noise_branch in stage_branch_channels
+                            and stage_idx >= getattr(config, "late_residual_boost_start", 1)
+                        )
+                        else 0.0
+                    ),
                 )
             )
 
