@@ -188,6 +188,7 @@ class TrainConfig:
     local_cache_dir: Optional[str] = "/cache"
     reuse_local_cache_manifest: bool = True
     views_per_sample: int = 3
+    gpu_aug_batch_chunk_size: int = 1
     resize_max_side: int = 0
     max_rotation_degrees: float = 6.0
     noise_std_max: float = 0.012
@@ -326,13 +327,21 @@ def build_training_config(
     per_dataset_aug: dict[str, AugmentationConfig],
 ) -> dict:
     """Build notebook-friendly training config dict from top-level defaults."""
+    safe_default_aug = replace(_coerce_aug(default_aug), views_per_sample=1)
+    safe_per_dataset_aug = {
+        name: replace(_coerce_aug(aug), views_per_sample=1)
+        for name, aug in per_dataset_aug.items()
+    }
+
     cfg = TrainConfig(
         manifest=str(manifest_path),
         output_dir=output_dir,
         batch_size=20,
         num_workers=0,
         prefetch_factor=2,
-        resize_max_side=896,
+        views_per_sample=1,
+        gpu_aug_batch_chunk_size=1,
+        resize_max_side=448,
         max_rotation_degrees=6.0,
         noise_std_max=0.012,
         warmup_epochs=3,
@@ -349,8 +358,9 @@ def build_training_config(
         lovasz_weight=float(getattr(loss_cfg, "lovasz_weight", 0.0)),
         use_boundary_loss=bool(getattr(loss_cfg, "use_boundary_loss", False)),
         boundary_weight=float(getattr(loss_cfg, "boundary_weight", 0.05)),
-        default_aug=default_aug,
-        per_dataset_aug=per_dataset_aug,
+        ema_enabled=False,
+        default_aug=safe_default_aug,
+        per_dataset_aug=safe_per_dataset_aug,
         model_config=model_cfg,
         loss_config=loss_cfg,
     )
@@ -467,6 +477,7 @@ def parse_args() -> TrainConfig:
         help="Reuse existing local cached manifest when available to shorten startup",
     )
     parser.add_argument("--views-per-sample", type=int, default=2, help="Number of augmented views per sample (on-the-fly)")
+    parser.add_argument("--gpu-aug-batch-chunk-size", type=int, default=1, help="Chunk size for GPU-side batched augmentations; smaller uses less memory")
     parser.add_argument("--resize-max-side", type=int, default=448, help="Cap image short side before batching (lower is faster)")
     parser.add_argument("--max-rotation-degrees", type=float, default=0.0, help="Random rotation range (+/-)")
     parser.add_argument("--noise-std-max", type=float, default=0.01, help="Max Gaussian noise std")
@@ -568,6 +579,7 @@ def parse_args() -> TrainConfig:
         local_cache_dir=args.local_cache_dir,
         reuse_local_cache_manifest=args.reuse_local_cache_manifest,
         views_per_sample=args.views_per_sample,
+        gpu_aug_batch_chunk_size=max(1, int(args.gpu_aug_batch_chunk_size)),
         resize_max_side=resolved_resize_max_side,
         max_rotation_degrees=args.max_rotation_degrees,
         noise_std_max=args.noise_std_max,
@@ -1492,6 +1504,69 @@ def _is_cudnn_engine_error(exc: RuntimeError) -> bool:
     )
 
 
+def _is_cuda_oom_error(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    return (
+        "cuda out of memory" in msg
+        or "cublas_status_alloc_failed" in msg
+        or "cuda error: out of memory" in msg
+    )
+
+
+def _build_cuda_memory_safe_cfg(cfg: TrainConfig) -> TrainConfig:
+    safe_resize = int(cfg.resize_max_side)
+    if safe_resize <= 0 or safe_resize > 448:
+        safe_resize = 448
+
+    default_aug = None
+    if cfg.default_aug is not None:
+        aug_cfg = _coerce_aug(cfg.default_aug)
+        default_aug = replace(
+            aug_cfg,
+            views_per_sample=1,
+            enable_rotations=False,
+            enable_random_crop=False,
+            enable_elastic=False,
+        )
+
+    per_dataset_aug = None
+    if cfg.per_dataset_aug:
+        per_dataset_aug = {}
+        for name, aug in cfg.per_dataset_aug.items():
+            aug_cfg = _coerce_aug(aug)
+            per_dataset_aug[name] = replace(
+                aug_cfg,
+                views_per_sample=1,
+                enable_rotations=False,
+                enable_random_crop=False,
+                enable_elastic=False,
+            )
+
+    return replace(
+        cfg,
+        amp=True,
+        precision="fp16",
+        ema_enabled=False,
+        views_per_sample=1,
+        gpu_aug_batch_chunk_size=1,
+        resize_max_side=safe_resize,
+        default_aug=default_aug,
+        per_dataset_aug=per_dataset_aug,
+    )
+
+
+def _build_cuda_runtime_safe_cfg(cfg: TrainConfig) -> TrainConfig:
+    return replace(
+        cfg,
+        channels_last=False,
+        compile_model=False,
+        flash_attention=False,
+        xformers=False,
+        amp=True,
+        precision="fp16",
+    )
+
+
 def _write_best_threshold_metadata(
     path: Path,
     *,
@@ -1857,31 +1932,32 @@ def train_one_epoch(
                             images[idxs] = images[idxs]
                         continue
 
-                    # Slice the batch and apply batched augmentations
-                    img_slice = images[idxs]
-                    mask_slice = masks[idxs]
-                    hp_slice = None
-                    if residual_noise is not None:
-                        hp_slice = residual_noise[idxs]
+                    aug_chunk = max(1, int(getattr(cfg, "gpu_aug_batch_chunk_size", 1)))
+                    for chunk_start in range(0, len(idxs), aug_chunk):
+                        chunk_idxs = idxs[chunk_start : chunk_start + aug_chunk]
+                        img_slice = images[chunk_idxs]
+                        mask_slice = masks[chunk_idxs]
+                        hp_slice = None
+                        if residual_noise is not None:
+                            hp_slice = residual_noise[chunk_idxs]
 
-                    img_out, mask_out, hp_out = _apply_gpu_augmentations_batch(
-                        img_slice,
-                        mask_slice,
-                        aug_cfg,
-                        residual_noise=hp_slice,
-                        generator=gen,
-                    )
+                        img_out, mask_out, hp_out = _apply_gpu_augmentations_batch(
+                            img_slice,
+                            mask_slice,
+                            aug_cfg,
+                            residual_noise=hp_slice,
+                            generator=gen,
+                        )
 
-                    # Apply normalization to the augmented slice
-                    if normalization_mode == "imagenet":
-                        mean = imagenet_mean.view(1, 3, 1, 1)
-                        std = imagenet_std.view(1, 3, 1, 1)
-                        img_out = (img_out - mean) / std
+                        if normalization_mode == "imagenet":
+                            mean = imagenet_mean.view(1, 3, 1, 1)
+                            std = imagenet_std.view(1, 3, 1, 1)
+                            img_out = (img_out - mean) / std
 
-                    images[idxs] = img_out
-                    masks[idxs] = mask_out
-                    if hp_out is not None and residual_noise is not None:
-                        residual_noise[idxs] = hp_out
+                        images[chunk_idxs] = img_out
+                        masks[chunk_idxs] = mask_out
+                        if hp_out is not None and residual_noise is not None:
+                            residual_noise[chunk_idxs] = hp_out
             aug_end = time.perf_counter()
         else:
             aug_end = None
@@ -2265,7 +2341,11 @@ def run_training(cfg: TrainConfig) -> None:
         model = model.to(memory_format=torch.channels_last)
     optimizer = model.build_optimizer()
     scheduler = _build_lr_scheduler(optimizer, cfg)
-    # GradScaler is only required for fp16; bf16 on A100 benefits from native autocast without scaling.
+    # Precision fallback logic: if bf16 is requested but not supported, use fp32+amp
+    requested_precision = str(cfg.precision).lower()
+    if requested_precision == "bf16" and device.type == "cuda" and not torch.cuda.is_bf16_supported():
+        print("[Warning] bf16 precision requested but not supported on this device. Falling back to fp32 with AMP enabled.")
+        cfg = replace(cfg, precision="fp32", amp=True)
     scaler = GradScaler(enabled=(str(cfg.precision).lower() == "fp16" and cfg.amp and device.type == "cuda"))
     ema_model = _init_ema_model(model, model_cfg, cfg.ema_enabled)
     if ema_model is not None:
@@ -2408,22 +2488,48 @@ def run_training(cfg: TrainConfig) -> None:
             if (not runtime_fallback_used) and _is_cudnn_engine_error(exc):
                 runtime_fallback_used = True
                 prev_precision = cfg.precision
-                cfg = replace(
-                    cfg,
-                    channels_last=False,
-                    compile_model=False,
-                    flash_attention=False,
-                    xformers=False,
-                    amp=False,
-                    precision="fp32",
-                )
+                prev_amp = cfg.amp
+                cfg = _build_cuda_runtime_safe_cfg(cfg)
                 model = model.to(memory_format=torch.contiguous_format)
                 if ema_model is not None:
                     ema_model = ema_model.to(memory_format=torch.contiguous_format)
-                scaler = GradScaler(enabled=False)
+                scaler = GradScaler(enabled=(cfg.amp and str(cfg.precision).lower() == "fp16" and device.type == "cuda"))
                 print(
                     "Encountered CUDA conv engine selection error; retrying with safe settings | "
-                    f"precision {prev_precision}->fp32, amp off, channels_last off, compile off"
+                    f"precision {prev_precision}->fp16, amp {prev_amp}->{cfg.amp}, channels_last off, compile off"
+                )
+                train_loss, global_step, train_positive_ratio = train_one_epoch(
+                    model,
+                    loaders["train"],
+                    optimizer,
+                    scaler,
+                    loss_fn,
+                    device,
+                    cfg,
+                    epoch,
+                    global_step,
+                    ema_model=ema_model,
+                    per_dataset_aug=per_dataset_aug,
+                    normalization_mode=normalization_mode,
+                )
+            elif (not runtime_fallback_used) and device.type == "cuda" and _is_cuda_oom_error(exc):
+                runtime_fallback_used = True
+                prev_cfg = cfg
+                cfg = _build_cuda_memory_safe_cfg(cfg)
+
+                if ema_model is not None:
+                    del ema_model
+                    ema_model = None
+
+                torch.cuda.empty_cache()
+                loaders, per_dataset_aug, normalization_mode = _prepare_dataloaders(cfg, device)
+                print(
+                    "Encountered CUDA OOM; retrying with memory-safe settings | "
+                    f"ema {prev_cfg.ema_enabled}->{cfg.ema_enabled}, "
+                    f"views_per_sample {prev_cfg.views_per_sample}->{cfg.views_per_sample}, "
+                    f"gpu_aug_batch_chunk_size {getattr(prev_cfg, 'gpu_aug_batch_chunk_size', 1)}->{cfg.gpu_aug_batch_chunk_size}, "
+                    f"resize_max_side {prev_cfg.resize_max_side}->{cfg.resize_max_side}, "
+                    "rotations/random_crop/elastics disabled"
                 )
                 train_loss, global_step, train_positive_ratio = train_one_epoch(
                     model,
