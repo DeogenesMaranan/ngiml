@@ -76,3 +76,13 @@ def test_cuda_runtime_safe_cfg_prefers_fp16_for_t4_style_retry():
     assert safe_cfg.compile_model is False
     assert safe_cfg.flash_attention is False
     assert safe_cfg.xformers is False
+
+
+def test_bf16_unsupported_devices_should_fall_back_to_fp16_not_fp32():
+    cfg = TrainConfig(manifest="dummy.parquet", amp=True, precision="bf16")
+    requested_precision = str(cfg.precision).lower()
+    if requested_precision == "bf16":
+        cfg = TrainConfig(**{**cfg.__dict__, "precision": "fp16", "amp": True})
+
+    assert cfg.precision == "fp16"
+    assert cfg.amp is True

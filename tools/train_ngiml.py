@@ -2255,8 +2255,6 @@ def run_training(cfg: TrainConfig) -> None:
         cfg = replace(cfg, device="cuda")
     device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
-    # Force precision to bfloat16 at runtime per user request
-    cfg = replace(cfg, precision="bf16")
     cfg = _resolve_cuda_runtime_stability(cfg, device)
 
     if device.type == "cuda":
@@ -2341,11 +2339,11 @@ def run_training(cfg: TrainConfig) -> None:
         model = model.to(memory_format=torch.channels_last)
     optimizer = model.build_optimizer()
     scheduler = _build_lr_scheduler(optimizer, cfg)
-    # Precision fallback logic: if bf16 is requested but not supported, use fp32+amp
+    # Precision fallback logic: keep T4-class GPUs on fp16 instead of forcing fp32.
     requested_precision = str(cfg.precision).lower()
     if requested_precision == "bf16" and device.type == "cuda" and not torch.cuda.is_bf16_supported():
-        print("[Warning] bf16 precision requested but not supported on this device. Falling back to fp32 with AMP enabled.")
-        cfg = replace(cfg, precision="fp32", amp=True)
+        print("[Warning] bf16 precision requested but not supported on this device. Falling back to fp16 with AMP enabled.")
+        cfg = replace(cfg, precision="fp16", amp=True)
     scaler = GradScaler(enabled=(str(cfg.precision).lower() == "fp16" and cfg.amp and device.type == "cuda"))
     ema_model = _init_ema_model(model, model_cfg, cfg.ema_enabled)
     if ema_model is not None:

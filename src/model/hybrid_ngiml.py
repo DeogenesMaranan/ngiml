@@ -175,7 +175,9 @@ class HybridNGIML(nn.Module):
         for stage_idx, proj in enumerate(projections):
             if stage_idx >= len(target_features) or stage_idx >= len(residual_features):
                 break
-            attn_map = torch.sigmoid(proj(residual_features[stage_idx]))
+            # Start from an identity modulation at zero init so residual guidance
+            # does not bias all semantic streams before learning.
+            attn_map = (2.0 * torch.sigmoid(proj(residual_features[stage_idx]))) - 1.0
             tgt_h, tgt_w = target_features[stage_idx].shape[-2:]
             if attn_map.shape[-2:] != (tgt_h, tgt_w):
                 attn_map = F.interpolate(attn_map, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)

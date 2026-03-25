@@ -44,7 +44,7 @@ class FeatureFusionConfig:
     activation: str = "relu"
     fusion_refinement: bool = True  # Add Conv3x3+IN+ReLU after fusion output (enabled by default)
     late_residual_boost_start: int = 1
-    late_residual_boost: float = 0.35
+    late_residual_boost: float = 0.0
 
 
 class _AdaptiveFusionStage(nn.Module):

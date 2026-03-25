@@ -87,10 +87,10 @@ def test_residual_attention_modulates_all_available_low_level_and_context_stages
 
     assert isinstance(features["low_level"], list)
     for stage in features["low_level"]:
-        assert torch.allclose(stage, torch.full_like(stage, 1.5))
+        assert torch.allclose(stage, torch.full_like(stage, 1.0))
     assert isinstance(features["context"], list)
     for stage in features["context"]:
-        assert torch.allclose(stage, torch.full_like(stage, 1.5))
+        assert torch.allclose(stage, torch.full_like(stage, 1.0))
 
 
 def test_hybrid_forward_passes_image_to_decoder():
