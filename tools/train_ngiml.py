@@ -651,7 +651,9 @@ def _coerce_aug(value) -> AugmentationConfig:
     if isinstance(value, AugmentationConfig):
         return replace(value)
     if isinstance(value, dict):
-        return AugmentationConfig(**value)
+        allowed_keys = set(AugmentationConfig.__dataclass_fields__.keys())
+        filtered = {key: aug_value for key, aug_value in value.items() if key in allowed_keys}
+        return AugmentationConfig(**filtered)
     raise TypeError("Augmentation config must be AugmentationConfig or dict")
 
 

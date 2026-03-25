@@ -2,6 +2,7 @@ from tools.train_ngiml import (
     TrainConfig,
     _build_cuda_memory_safe_cfg,
     _build_cuda_runtime_safe_cfg,
+    _coerce_aug,
     _is_cuda_oom_error,
 )
 from src.data.dataloaders import AugmentationConfig
@@ -86,3 +87,18 @@ def test_bf16_unsupported_devices_should_fall_back_to_fp16_not_fp32():
 
     assert cfg.precision == "fp16"
     assert cfg.amp is True
+
+
+def test_coerce_aug_ignores_training_level_keys():
+    aug = _coerce_aug(
+        {
+            "enable": True,
+            "views_per_sample": 1,
+            "enable_flips": True,
+            "gpu_aug_batch_chunk_size": 1,
+        }
+    )
+
+    assert aug.enable is True
+    assert aug.views_per_sample == 1
+    assert aug.enable_flips is True
