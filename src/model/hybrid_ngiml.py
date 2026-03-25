@@ -136,21 +136,50 @@ class HybridNGIML(nn.Module):
         self.enable_residual_attention = (
             getattr(self.cfg, 'enable_residual_attention', False)
             and self.cfg.use_residual
-            and self.cfg.use_low_level
             and self.noise is not None
+            and (self.cfg.use_low_level or self.cfg.use_context)
         )
         if self.enable_residual_attention:
-            # Build a stage-matched residual attention path so each semantic scale
-            # can be guided by the corresponding residual representation.
             res_channels = branch_channels.get("residual", [])
-            sem_channels = branch_channels.get("low_level", [])
-            self.residual_attention_proj = nn.ModuleList()
-            for stage_idx in range(min(len(res_channels), len(sem_channels))):
-                proj = nn.Conv2d(res_channels[stage_idx], sem_channels[stage_idx], kernel_size=1)
-                nn.init.zeros_(proj.weight)
-                if proj.bias is not None:
-                    nn.init.zeros_(proj.bias)
-                self.residual_attention_proj.append(proj)
+            self.low_level_residual_attention_proj = self._build_residual_attention_proj(
+                res_channels,
+                branch_channels.get("low_level", []),
+            )
+            self.context_residual_attention_proj = self._build_residual_attention_proj(
+                res_channels,
+                branch_channels.get("context", []),
+            )
+
+    @staticmethod
+    def _build_residual_attention_proj(
+        residual_channels: List[int],
+        target_channels: List[int],
+    ) -> nn.ModuleList:
+        projections = nn.ModuleList()
+        for stage_idx in range(min(len(residual_channels), len(target_channels))):
+            proj = nn.Conv2d(residual_channels[stage_idx], target_channels[stage_idx], kernel_size=1)
+            nn.init.zeros_(proj.weight)
+            if proj.bias is not None:
+                nn.init.zeros_(proj.bias)
+            projections.append(proj)
+        return projections
+
+    @staticmethod
+    def _apply_residual_attention(
+        target_features: Optional[List[Tensor]],
+        residual_features: Optional[List[Tensor]],
+        projections: nn.ModuleList,
+    ) -> None:
+        if not isinstance(target_features, list) or not isinstance(residual_features, list):
+            return
+        for stage_idx, proj in enumerate(projections):
+            if stage_idx >= len(target_features) or stage_idx >= len(residual_features):
+                break
+            attn_map = torch.sigmoid(proj(residual_features[stage_idx]))
+            tgt_h, tgt_w = target_features[stage_idx].shape[-2:]
+            if attn_map.shape[-2:] != (tgt_h, tgt_w):
+                attn_map = F.interpolate(attn_map, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
+            target_features[stage_idx] = target_features[stage_idx] * (1.0 + attn_map)
 
     def _extract_features(self, x: Tensor, residual_noise: Tensor | None = None) -> Dict[str, Optional[List[Tensor] | Tensor]]:
         low_level = self.efficientnet(x) if self.efficientnet is not None else None
@@ -158,15 +187,17 @@ class HybridNGIML(nn.Module):
         residual = self.noise(x, residual_noise=residual_noise) if self.noise is not None else None
 
         # Residual-guided attention (modulate semantic features before fusion)
-        if self.enable_residual_attention and isinstance(low_level, list) and isinstance(residual, list):
-            for stage_idx, proj in enumerate(self.residual_attention_proj):
-                if stage_idx >= len(low_level) or stage_idx >= len(residual):
-                    break
-                attn_map = torch.sigmoid(proj(residual[stage_idx]))
-                sem_h, sem_w = low_level[stage_idx].shape[-2:]
-                if attn_map.shape[-2:] != (sem_h, sem_w):
-                    attn_map = F.interpolate(attn_map, size=(sem_h, sem_w), mode="bilinear", align_corners=False)
-                low_level[stage_idx] = low_level[stage_idx] * (1.0 + attn_map)
+        if self.enable_residual_attention and isinstance(residual, list):
+            self._apply_residual_attention(
+                low_level,
+                residual,
+                getattr(self, "low_level_residual_attention_proj", nn.ModuleList()),
+            )
+            self._apply_residual_attention(
+                context,
+                residual,
+                getattr(self, "context_residual_attention_proj", nn.ModuleList()),
+            )
 
         # Note: previous implementation attempted to checkpoint each child module
         # by calling them directly with the original input `x`. That is incorrect
@@ -204,7 +235,7 @@ class HybridNGIML(nn.Module):
         residual_noise: Tensor | None = None,
     ) -> List[Tensor]:
         fused = self.forward_features(x, target_size=None, residual_noise=residual_noise)
-        preds = self.decoder(fused)
+        preds = self.decoder(fused, image=x)
         if target_size is None:
             return preds
         return [

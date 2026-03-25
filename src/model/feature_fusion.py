@@ -69,12 +69,23 @@ class _AdaptiveFusionStage(nn.Module):
                 for branch, in_ch in branch_channels.items()
             }
         )
-        num_branches = len(branch_channels)
-        # Initialize fusion gates equally across branches
-        self.gate_params = nn.ParameterDict({
-            branch: nn.Parameter(torch.full((1, 1, 1, 1), 1.0 / num_branches))
-            for branch in branch_channels
-        })
+        gate_hidden = max(8, out_channels // 4)
+        self.gate_generators = nn.ModuleDict(
+            {
+                branch: nn.Sequential(
+                    nn.Conv2d(out_channels, gate_hidden, kernel_size=1, bias=True),
+                    _build_activation(activation),
+                    nn.Conv2d(gate_hidden, out_channels, kernel_size=1, bias=True),
+                )
+                for branch in branch_channels
+            }
+        )
+        self.gate_bias = nn.ParameterDict(
+            {
+                branch: nn.Parameter(torch.zeros((1, out_channels, 1, 1)))
+                for branch in branch_channels
+            }
+        )
         self.refine = nn.Sequential(
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
             _build_norm(norm, out_channels),
@@ -136,11 +147,9 @@ class _AdaptiveFusionStage(nn.Module):
                 proj = F.interpolate(proj, size=(align_h, align_w), mode="bilinear", align_corners=False)
             aligned_projections[branch] = proj
 
-            # Bounded sigmoid gating: gate = sigmoid(param) * 0.8 + 0.1
-            raw_gate = self.gate_params[branch]
+            # Feature-conditioned gating lets each branch adapt by region and channel.
+            raw_gate = self.gate_generators[branch](proj) + self.gate_bias[branch]
             gate = torch.sigmoid(raw_gate) * 0.8 + 0.1
-            # Broadcast gate to proj shape
-            gate = gate.expand_as(proj)
             if noise_branch is not None and branch == noise_branch:
                 # weight noise branch by the configured noise weight
                 gate = gate * noise_weight
