@@ -11,12 +11,17 @@ from tools.train_ngiml import (
 )
 
 
-def _cfg_update(config, values: dict) -> None:
+def _cfg_update(config, values: dict, *, overwrite: bool = True) -> None:
     if isinstance(config, dict):
-        config.update(values)
+        if overwrite:
+            config.update(values)
+        else:
+            for key, value in values.items():
+                config.setdefault(key, value)
         return
     for key, value in values.items():
-        setattr(config, key, value)
+        if overwrite or not hasattr(config, key):
+            setattr(config, key, value)
 
 
 def _cfg_as_dict(config) -> dict:
@@ -47,7 +52,7 @@ def apply_colab_runtime_settings(
         "balance_sampling": bool(balance_sampling),
     }
 
-    _cfg_update(training_config, updates)
+    _cfg_update(training_config, updates, overwrite=False)
     return _cfg_as_dict(training_config)
 
 

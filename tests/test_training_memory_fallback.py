@@ -1,9 +1,12 @@
+import torch
+
 from tools.train_ngiml import (
     TrainConfig,
     _build_cuda_memory_safe_cfg,
     _build_cuda_runtime_safe_cfg,
     _coerce_aug,
     _is_cuda_oom_error,
+    _should_disable_compile_for_device,
 )
 from src.data.dataloaders import AugmentationConfig
 
@@ -102,3 +105,16 @@ def test_coerce_aug_ignores_training_level_keys():
     assert aug.enable is True
     assert aug.views_per_sample == 1
     assert aug.enable_flips is True
+
+
+def test_low_vram_cuda_devices_disable_compile():
+    class _DeviceProps:
+        total_memory = 14 * 1024**3
+
+    original = torch.cuda.get_device_properties
+    try:
+        torch.cuda.get_device_properties = lambda device: _DeviceProps()
+        cfg = TrainConfig(manifest="dummy.parquet", compile_model=True)
+        assert _should_disable_compile_for_device(cfg, torch.device("cuda")) is True
+    finally:
+        torch.cuda.get_device_properties = original

@@ -1569,6 +1569,18 @@ def _build_cuda_runtime_safe_cfg(cfg: TrainConfig) -> TrainConfig:
     )
 
 
+def _should_disable_compile_for_device(cfg: TrainConfig, device: torch.device) -> bool:
+    if not bool(getattr(cfg, "compile_model", False)):
+        return False
+    if device.type != "cuda":
+        return False
+    try:
+        total_memory = int(torch.cuda.get_device_properties(device).total_memory)
+    except Exception:
+        return False
+    return total_memory <= (16 * 1024**3)
+
+
 def _write_best_threshold_metadata(
     path: Path,
     *,
@@ -2258,6 +2270,16 @@ def run_training(cfg: TrainConfig) -> None:
     device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
     cfg = _resolve_cuda_runtime_stability(cfg, device)
+    if _should_disable_compile_for_device(cfg, device):
+        try:
+            total_gib = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+        except Exception:
+            total_gib = 0.0
+        cfg = replace(cfg, compile_model=False)
+        print(
+            "torch.compile disabled on this CUDA device to avoid long warmup and high host RAM usage | "
+            f"detected_vram={total_gib:.1f} GiB"
+        )
 
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high" if cfg.use_tf32 else "highest")
