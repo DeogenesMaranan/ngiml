@@ -62,6 +62,7 @@ class _AdaptiveFusionStage(nn.Module):
         late_residual_boost: float = 0.0,
     ) -> None:
         super().__init__()
+        self.branch_order = tuple(branch_channels.keys())
         # Conv only for projected features before fusion (no norm/activation)
         self.projections = nn.ModuleDict(
             {
@@ -79,6 +80,12 @@ class _AdaptiveFusionStage(nn.Module):
                 )
                 for branch in branch_channels
             }
+        )
+        joint_in_channels = out_channels * len(self.branch_order)
+        self.joint_gate_generator = nn.Sequential(
+            nn.Conv2d(joint_in_channels, gate_hidden, kernel_size=1, bias=True),
+            _build_activation(activation),
+            nn.Conv2d(gate_hidden, out_channels * len(self.branch_order), kernel_size=1, bias=True),
         )
         self.gate_bias = nn.ParameterDict(
             {
@@ -147,8 +154,25 @@ class _AdaptiveFusionStage(nn.Module):
                 proj = F.interpolate(proj, size=(align_h, align_w), mode="bilinear", align_corners=False)
             aligned_projections[branch] = proj
 
+        joint_gate_tensor = self.joint_gate_generator(
+            torch.cat([aligned_projections[branch] for branch in self.branch_order], dim=1)
+        )
+        joint_gate_chunks = joint_gate_tensor.chunk(len(self.branch_order), dim=1)
+        joint_gate_map = {
+            branch: gate_chunk
+            for branch, gate_chunk in zip(self.branch_order, joint_gate_chunks)
+        }
+
+        for branch in self.branch_order:
+            if branch not in aligned_projections:
+                continue
+            proj = aligned_projections[branch]
             # Feature-conditioned gating lets each branch adapt by region and channel.
-            raw_gate = self.gate_generators[branch](proj) + self.gate_bias[branch]
+            raw_gate = (
+                self.gate_generators[branch](proj)
+                + joint_gate_map[branch]
+                + self.gate_bias[branch]
+            )
             gate = torch.sigmoid(raw_gate) * 0.8 + 0.1
             if noise_branch is not None and branch == noise_branch:
                 # weight noise branch by the configured noise weight

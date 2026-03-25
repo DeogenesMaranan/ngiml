@@ -29,7 +29,7 @@ from src.data.dataloaders import (
 )
 from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
-from tools.train_ngiml import build_default_components
+from tools.train_ngiml import _coerce_model_config, build_default_components
 
 def _to_chw_rgb(image_np: np.ndarray) -> np.ndarray:
     if image_np.ndim == 2:
@@ -601,46 +601,7 @@ def _build_model_config_from_checkpoint(checkpoint: dict) -> tuple[object, str]:
     model_config = train_config.get("model_config") if isinstance(train_config, dict) else None
 
     if isinstance(model_config, dict):
-        fusion_cfg = model_config.get("fusion")
-        if isinstance(fusion_cfg, dict):
-            fusion_channels = fusion_cfg.get("fusion_channels")
-            if isinstance(fusion_channels, (list, tuple)) and fusion_channels:
-                model_cfg.fusion.fusion_channels = tuple(int(value) for value in fusion_channels)
-            for attr in ("noise_branch", "noise_skip_stage", "noise_decay", "norm", "activation", "fusion_refinement"):
-                if attr in fusion_cfg and hasattr(model_cfg.fusion, attr):
-                    setattr(model_cfg.fusion, attr, fusion_cfg[attr])
-
-        decoder_cfg = model_config.get("decoder")
-        if isinstance(decoder_cfg, dict):
-            for attr in (
-                "decoder_channels",
-                "out_channels",
-                "norm",
-                "activation",
-                "per_stage_heads",
-                "enable_edge_guidance",
-                "use_dropout",
-                "dropout_p",
-                "enable_boundary_refinement",
-                "boundary_refine_channels",
-                "boundary_refine_scale",
-            ):
-                if attr in decoder_cfg and hasattr(model_cfg.decoder, attr):
-                    setattr(model_cfg.decoder, attr, decoder_cfg[attr])
-
-        for attr in (
-            "use_low_level",
-            "use_context",
-            "use_residual",
-            "enable_residual_attention",
-            "gradient_checkpointing",
-            "flash_attention",
-            "xformers",
-        ):
-            if attr in model_config and hasattr(model_cfg, attr):
-                setattr(model_cfg, attr, model_config[attr])
-
-        return model_cfg, "train_config.model_config"
+        return _coerce_model_config(model_config), "train_config.model_config"
 
     inferred_channels = _infer_fusion_channels_from_state_dict(checkpoint.get("model_state", {}))
     if inferred_channels:
@@ -663,6 +624,36 @@ def _disable_pretrained_backbones(model_cfg: object) -> object:
     except Exception:
         pass
     return model_cfg
+
+
+def _normalize_profile_input_size(value: object) -> int | None:
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, (tuple, list)) and value:
+        try:
+            if len(value) >= 2:
+                return int(max(value[-2], value[-1]))
+            return int(value[0])
+        except Exception:
+            return None
+    return None
+
+
+def _resolve_checkpoint_profile_input_size(train_config: dict, model_cfg: object) -> tuple[int, str]:
+    train_value = _normalize_profile_input_size(train_config.get("input_size"))
+    if train_value is not None:
+        return train_value, "train_config.input_size"
+
+    cfg_candidates = [
+        getattr(getattr(model_cfg, "swin", None), "input_size", None),
+        getattr(getattr(model_cfg, "efficientnet", None), "input_size", None),
+    ]
+    for candidate in cfg_candidates:
+        resolved = _normalize_profile_input_size(candidate)
+        if resolved is not None:
+            return resolved, "model_config"
+
+    return 448, "default"
 
 
 def _select_output_head(outputs: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -742,13 +733,14 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
     checkpoint_epoch = int(checkpoint.get("epoch", -1))
     model_cfg, config_source = _build_model_config_from_checkpoint(checkpoint)
     model_cfg = _disable_pretrained_backbones(model_cfg)
-    model = HybridNGIML(model_cfg).to(device)
+    model = HybridNGIML(model_cfg)
 
     missing, unexpected, skipped_mismatched = _load_state_dict_with_fallback(model, checkpoint["model_state"])
+    model = model.to(device)
     model.eval()
     resolved_threshold, threshold_source = resolve_threshold_for_checkpoint(
         Path(checkpoint_path),
@@ -757,6 +749,7 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
     )
 
     train_config = checkpoint.get("train_config") or {}
+    profile_input_size, profile_input_size_source = _resolve_checkpoint_profile_input_size(train_config, model_cfg)
 
     has_train_resize_max_side = "resize_max_side" in train_config
     autocast_dtype, autocast_source = _resolve_checkpoint_autocast_dtype(train_config, device)
@@ -770,7 +763,8 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
         "fusion_channels": tuple(int(value) for value in model.cfg.fusion.fusion_channels),
         "default_threshold": float(resolved_threshold),
         "threshold_source": str(threshold_source),
-        "input_size": int(train_config.get("input_size", 448) or 448),
+        "input_size": int(profile_input_size),
+        "input_size_source": str(profile_input_size_source),
         "resize_max_side": int(train_config.get("resize_max_side", 0) or 0),
         "resize_max_side_source": "train_config" if has_train_resize_max_side else "default",
         "runtime_precision": precision_raw,
@@ -1355,7 +1349,7 @@ def list_epoch_checkpoints(checkpoint_dir: str | Path) -> list[Path]:
 def sweep_checkpoint_inference_for_image(
     checkpoint_dir: str | Path,
     image: torch.Tensor,
-    normalization_mode: str = "imagenet",
+    normalization_mode: str | None = "imagenet",
     strategy: str = "direct",
     threshold: float | None = None,
     infer_size: int = 448,
@@ -1394,11 +1388,16 @@ def sweep_checkpoint_inference_for_image(
 
     for checkpoint_path in iterator:
         model, device, ckpt_info = load_model_from_checkpoint(checkpoint_path)
+        resolved_normalization = resolve_normalization_mode_for_inference(
+            manual_mode=normalization_mode,
+            checkpoint_path=checkpoint_path,
+            default_mode="imagenet",
+        )
         run = run_multi_strategy_inference(
             model=model,
             image=image,
             device=device,
-            normalization_mode=normalization_mode,
+            normalization_mode=resolved_normalization,
             threshold=threshold,
             infer_size=infer_size,
             tile_size=tile_size,
@@ -1416,7 +1415,7 @@ def sweep_checkpoint_inference_for_image(
                 "checkpoint_epoch_from_name": _epoch_from_checkpoint_name(checkpoint_path),
                 "checkpoint_epoch_from_state": ckpt_info.get("epoch"),
                 "strategy": strategy_key,
-                "normalization_mode": normalization_mode,
+                "normalization_mode": resolved_normalization,
                 "threshold_used": float(run["threshold"]),
                 "mean_probability": float(summary["mean_probability"]),
                 "max_probability": float(summary["max_probability"]),

@@ -194,3 +194,48 @@ def test_feature_conditioned_gate_can_vary_spatially():
 
     assert raw_gate.shape == proj.shape
     assert raw_gate[0, 0, 0, 1] > raw_gate[0, 0, 0, 0]
+
+
+def test_joint_gate_responds_to_other_branch_features():
+    fusion = MultiStageFeatureFusion(
+        {"low_level": (1,), "context": (1,)},
+        FeatureFusionConfig(
+            fusion_channels=(1,),
+            fusion_refinement=False,
+        ),
+    )
+    stage = fusion.stages[0]
+
+    for projection in stage.projections.values():
+        projection.weight.data.fill_(1.0)
+    for gate in stage.gate_generators.values():
+        for layer in gate:
+            if isinstance(layer, nn.Conv2d):
+                layer.weight.data.zero_()
+                if layer.bias is not None:
+                    layer.bias.data.zero_()
+    for gate_bias in stage.gate_bias.values():
+        gate_bias.data.zero_()
+
+    first = stage.joint_gate_generator[0]
+    second = stage.joint_gate_generator[2]
+    first.weight.data.zero_()
+    first.bias.data.zero_()
+    second.weight.data.zero_()
+    second.bias.data.zero_()
+
+    # Make the low-level branch gate depend only on the context branch signal.
+    first.weight.data[0, 1, 0, 0] = 1.0
+    second.weight.data[0, 0, 0, 0] = 2.0
+
+    low_level = torch.zeros((1, 1, 2, 2), dtype=torch.float32)
+    context_weak = torch.zeros((1, 1, 2, 2), dtype=torch.float32)
+    context_strong = torch.ones((1, 1, 2, 2), dtype=torch.float32)
+
+    weak_joint = stage.joint_gate_generator(torch.cat([low_level, context_weak], dim=1))
+    strong_joint = stage.joint_gate_generator(torch.cat([low_level, context_strong], dim=1))
+
+    weak_low_level_gate = weak_joint.chunk(2, dim=1)[0]
+    strong_low_level_gate = strong_joint.chunk(2, dim=1)[0]
+
+    assert strong_low_level_gate.mean() > weak_low_level_gate.mean()

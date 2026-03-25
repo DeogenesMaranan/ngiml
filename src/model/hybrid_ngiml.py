@@ -226,7 +226,7 @@ class HybridNGIML(nn.Module):
             fusion_inputs["context"] = backbone_feats["context"]
         if self.cfg.use_residual and backbone_feats["residual"] is not None:
             fusion_inputs["residual"] = backbone_feats["residual"]
-        return self.fusion(fusion_inputs, target_size=None)
+        return self.fusion(fusion_inputs, target_size=target_size)
 
     def forward(
         self,
