@@ -1091,10 +1091,18 @@ def load_checkpoint(
     # Attempt to load the requested checkpoint; if it's corrupt/unreadable,
     # try earlier "checkpoint_epoch_*.pt" files in the same directory as fallbacks.
     original_exc: Exception | None = None
+    checkpoint_map_location: str | torch.device = "cpu"
+
+    def _move_optimizer_state_to_device(opt: torch.optim.Optimizer, target_device: torch.device) -> None:
+        for state in opt.state.values():
+            if isinstance(state, dict):
+                for key, value in state.items():
+                    if torch.is_tensor(value):
+                        state[key] = value.to(device=target_device, non_blocking=(target_device.type == "cuda"))
 
     def _attempt_load(p: Path):
         try:
-            return torch.load(p, map_location=device), p
+            return torch.load(p, map_location=checkpoint_map_location), p
         except Exception as exc:
             return exc, p
 
@@ -1133,6 +1141,7 @@ def load_checkpoint(
         else:
             ema_model.load_state_dict(model.state_dict())
     optimizer.load_state_dict(data["optimizer_state"])
+    _move_optimizer_state_to_device(optimizer, device)
     if scheduler is not None and data.get("scheduler_state") is not None:
         scheduler.load_state_dict(data["scheduler_state"])
     if data.get("scaler_state") and scaler.is_enabled():
@@ -2179,8 +2188,6 @@ def run_training(cfg: TrainConfig) -> None:
         cfg = replace(cfg, device="cuda")
     device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
-    # Force precision to bfloat16 at runtime per user request
-    cfg = replace(cfg, precision="bf16")
     cfg = _resolve_cuda_runtime_stability(cfg, device)
 
     if device.type == "cuda":
@@ -2414,16 +2421,16 @@ def run_training(cfg: TrainConfig) -> None:
                     compile_model=False,
                     flash_attention=False,
                     xformers=False,
-                    amp=False,
-                    precision="fp32",
+                    amp=True,
+                    precision="fp16",
                 )
                 model = model.to(memory_format=torch.contiguous_format)
                 if ema_model is not None:
                     ema_model = ema_model.to(memory_format=torch.contiguous_format)
-                scaler = GradScaler(enabled=False)
+                scaler = GradScaler(enabled=(device.type == "cuda"))
                 print(
                     "Encountered CUDA conv engine selection error; retrying with safe settings | "
-                    f"precision {prev_precision}->fp32, amp off, channels_last off, compile off"
+                    f"precision {prev_precision}->fp16, amp on, channels_last off, compile off"
                 )
                 train_loss, global_step, train_positive_ratio = train_one_epoch(
                     model,
