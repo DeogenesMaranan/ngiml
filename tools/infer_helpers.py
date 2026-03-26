@@ -144,6 +144,7 @@ def compute_binary_metrics(
     return {'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn, 'precision': precision, 'recall': recall, 'f1': f1, 'iou': iou, 'accuracy': acc}
 
 def save_sample_plot(out_path: Path, image_chw: np.ndarray, gt_hw: np.ndarray, prob_hw: np.ndarray, bin05_hw: np.ndarray, title: str):
+    _require_matplotlib()
     img = np.transpose(image_chw, (1, 2, 0)).astype(np.float32)
     if img.max() > 1.0:
         img = img / 255.0
