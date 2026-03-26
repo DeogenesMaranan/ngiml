@@ -61,9 +61,12 @@ def test_build_training_config_uses_fixed_threshold_iou_early_stopping_defaults(
     assert cfg["optimize_threshold"] is False
 
 
-def test_further_lite_defaults_disable_residual_attention_and_joint_gating():
+def test_further_lite_defaults_enable_low_level_only_residual_attention_and_disable_joint_gating():
     model_cfg = HybridNGIMLConfig()
     fusion_cfg = FeatureFusionConfig(fusion_channels=(64, 128, 192, 256))
 
-    assert model_cfg.enable_residual_attention is False
+    assert model_cfg.enable_residual_attention is True
+    assert model_cfg.enable_low_level_residual_attention is True
+    assert model_cfg.enable_context_residual_attention is False
+    assert model_cfg.residual_attention_init_scale == 0.0
     assert fusion_cfg.enable_joint_gating is False

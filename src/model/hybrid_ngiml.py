@@ -74,7 +74,10 @@ class HybridNGIMLConfig:
     use_low_level: bool = True
     use_context: bool = True
     use_residual: bool = True
-    enable_residual_attention: bool = False  # Keep off by default for controlled decoder/detail ablations
+    enable_residual_attention: bool = True
+    enable_low_level_residual_attention: bool = True
+    enable_context_residual_attention: bool = False
+    residual_attention_init_scale: float = 0.0
     gradient_checkpointing: bool = True  # Enable gradient checkpointing for memory savings
     flash_attention: bool = True  # Enable flash attention by default
     xformers: bool = True  # Enable xformers by default
@@ -141,14 +144,38 @@ class HybridNGIML(nn.Module):
         )
         if self.enable_residual_attention:
             res_channels = branch_channels.get("residual", [])
-            self.low_level_residual_attention_proj = self._build_residual_attention_proj(
-                res_channels,
-                branch_channels.get("low_level", []),
-            )
-            self.context_residual_attention_proj = self._build_residual_attention_proj(
-                res_channels,
-                branch_channels.get("context", []),
-            )
+            if getattr(self.cfg, "enable_low_level_residual_attention", True):
+                self.low_level_residual_attention_proj = self._build_residual_attention_proj(
+                    res_channels,
+                    branch_channels.get("low_level", []),
+                )
+                self.low_level_residual_attention_scale = nn.ParameterList(
+                    [
+                        nn.Parameter(
+                            torch.full(
+                                (1,),
+                                float(getattr(self.cfg, "residual_attention_init_scale", 0.0)),
+                            )
+                        )
+                        for _ in range(len(self.low_level_residual_attention_proj))
+                    ]
+                )
+            if getattr(self.cfg, "enable_context_residual_attention", False):
+                self.context_residual_attention_proj = self._build_residual_attention_proj(
+                    res_channels,
+                    branch_channels.get("context", []),
+                )
+                self.context_residual_attention_scale = nn.ParameterList(
+                    [
+                        nn.Parameter(
+                            torch.full(
+                                (1,),
+                                float(getattr(self.cfg, "residual_attention_init_scale", 0.0)),
+                            )
+                        )
+                        for _ in range(len(self.context_residual_attention_proj))
+                    ]
+                )
 
     @staticmethod
     def _build_residual_attention_proj(
@@ -169,6 +196,7 @@ class HybridNGIML(nn.Module):
         target_features: Optional[List[Tensor]],
         residual_features: Optional[List[Tensor]],
         projections: nn.ModuleList,
+        scales: Optional[nn.ParameterList] = None,
     ) -> None:
         if not isinstance(target_features, list) or not isinstance(residual_features, list):
             return
@@ -178,6 +206,8 @@ class HybridNGIML(nn.Module):
             # Start from an identity modulation at zero init so residual guidance
             # does not bias all semantic streams before learning.
             attn_map = (2.0 * torch.sigmoid(proj(residual_features[stage_idx]))) - 1.0
+            if scales is not None and stage_idx < len(scales):
+                attn_map = attn_map * scales[stage_idx].view(1, 1, 1, 1)
             tgt_h, tgt_w = target_features[stage_idx].shape[-2:]
             if attn_map.shape[-2:] != (tgt_h, tgt_w):
                 attn_map = F.interpolate(attn_map, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
@@ -194,11 +224,13 @@ class HybridNGIML(nn.Module):
                 low_level,
                 residual,
                 getattr(self, "low_level_residual_attention_proj", nn.ModuleList()),
+                getattr(self, "low_level_residual_attention_scale", None),
             )
             self._apply_residual_attention(
                 context,
                 residual,
                 getattr(self, "context_residual_attention_proj", nn.ModuleList()),
+                getattr(self, "context_residual_attention_scale", None),
             )
 
         # Note: previous implementation attempted to checkpoint each child module

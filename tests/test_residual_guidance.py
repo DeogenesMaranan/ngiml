@@ -72,12 +72,18 @@ def test_residual_attention_modulates_all_available_low_level_and_context_stages
             nn.Conv2d(7, 8, kernel_size=1),
         ]
     )
+    model.low_level_residual_attention_scale = nn.ParameterList(
+        [nn.Parameter(torch.ones(1)) for _ in range(3)]
+    )
     model.context_residual_attention_proj = nn.ModuleList(
         [
             nn.Conv2d(3, 6, kernel_size=1),
             nn.Conv2d(5, 10, kernel_size=1),
             nn.Conv2d(7, 12, kernel_size=1),
         ]
+    )
+    model.context_residual_attention_scale = nn.ParameterList(
+        [nn.Parameter(torch.ones(1)) for _ in range(3)]
     )
     for proj in list(model.low_level_residual_attention_proj) + list(model.context_residual_attention_proj):
         proj.weight.data.zero_()
@@ -91,6 +97,17 @@ def test_residual_attention_modulates_all_available_low_level_and_context_stages
     assert isinstance(features["context"], list)
     for stage in features["context"]:
         assert torch.allclose(stage, torch.full_like(stage, 1.0))
+
+
+def test_residual_attention_zero_init_scale_starts_as_identity():
+    target = [torch.ones((1, 2, 8, 8), dtype=torch.float32)]
+    residual = [torch.randn((1, 3, 8, 8), dtype=torch.float32)]
+    projections = nn.ModuleList([nn.Conv2d(3, 2, kernel_size=1)])
+    scales = nn.ParameterList([nn.Parameter(torch.zeros(1))])
+
+    HybridNGIML._apply_residual_attention(target, residual, projections, scales)
+
+    assert torch.allclose(target[0], torch.ones_like(target[0]))
 
 
 def test_hybrid_forward_passes_image_to_decoder():
@@ -202,6 +219,7 @@ def test_joint_gate_responds_to_other_branch_features():
         FeatureFusionConfig(
             fusion_channels=(1,),
             fusion_refinement=False,
+            enable_joint_gating=True,
         ),
     )
     stage = fusion.stages[0]
