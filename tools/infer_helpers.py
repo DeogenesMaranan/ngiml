@@ -1601,41 +1601,41 @@ def get_model_complexity_stats(
     profile_model.eval()
     try:
         try:
-            with torch.no_grad():
-                analysis = _build_flop_analysis(profile_model, sample)
-                total_flops = float(analysis.total())
-                unsupported_ops = {str(name): int(count) for name, count in analysis.unsupported_ops().items()}
-            stats["flops"] = total_flops
-            stats["macs"] = total_flops / 2.0
-            stats["unsupported_ops"] = unsupported_ops
-            stats["flops_source"] = "fvcore+custom_op_handles"
-            stats["flops_error"] = (
-                None
-                if not unsupported_ops
-                else "FLOPs include custom op-handle estimates; unsupported ops remain in `unsupported_ops`."
-            )
-        except Exception as fv_error:
-            try:
-                from thop import profile as thop_profile
+            from thop import profile as thop_profile
 
+            with torch.no_grad():
+                macs, _ = thop_profile(profile_model, inputs=(sample,), verbose=False)
+            macs = float(macs)
+            stats["macs"] = macs
+            stats["flops"] = macs * 2.0
+            stats["unsupported_ops"] = None
+            stats["flops_source"] = "thop"
+            stats["flops_error"] = None
+        except Exception as thop_error:
+            try:
                 with torch.no_grad():
-                    macs, _ = thop_profile(profile_model, inputs=(sample,), verbose=False)
-                macs = float(macs)
-                stats["macs"] = macs
-                stats["flops"] = macs * 2.0
-                stats["unsupported_ops"] = None
-                stats["flops_source"] = "thop"
-                stats["flops_error"] = f"fvcore unavailable ({fv_error}); used thop fallback"
-            except Exception as thop_error:
+                    analysis = _build_flop_analysis(profile_model, sample)
+                    total_flops = float(analysis.total())
+                    unsupported_ops = {str(name): int(count) for name, count in analysis.unsupported_ops().items()}
+                stats["flops"] = total_flops
+                stats["macs"] = total_flops / 2.0
+                stats["unsupported_ops"] = unsupported_ops
+                stats["flops_source"] = "fvcore+custom_op_handles"
+                stats["flops_error"] = (
+                    None
+                    if not unsupported_ops
+                    else "THOP unavailable; fvcore fallback may undercount unsupported ops listed in `unsupported_ops`."
+                )
+            except Exception as fv_error:
                 stats["flops"] = None
                 stats["macs"] = None
                 stats["unsupported_ops"] = None
                 stats["flops_source"] = None
                 stats["flops_error"] = (
                     "FLOPs unavailable. "
-                    f"fvcore error: {fv_error}. "
                     f"thop error: {thop_error}. "
-                    "Try `%pip install fvcore iopath` (or `%pip install thop`) in the active notebook kernel."
+                    f"fvcore error: {fv_error}. "
+                    "Try `%pip install thop` (or `%pip install fvcore iopath`) in the active notebook kernel."
                 )
     finally:
         model.train(was_training)
