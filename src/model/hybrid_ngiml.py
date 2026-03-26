@@ -74,7 +74,7 @@ class HybridNGIMLConfig:
     use_low_level: bool = True
     use_context: bool = True
     use_residual: bool = True
-    enable_residual_attention: bool = True  # Residual-guided attention (enabled by default)
+    enable_residual_attention: bool = False  # Keep off by default for controlled decoder/detail ablations
     gradient_checkpointing: bool = True  # Enable gradient checkpointing for memory savings
     flash_attention: bool = True  # Enable flash attention by default
     xformers: bool = True  # Enable xformers by default

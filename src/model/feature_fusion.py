@@ -43,6 +43,7 @@ class FeatureFusionConfig:
     norm: str = "bn"
     activation: str = "relu"
     fusion_refinement: bool = True  # Add Conv3x3+IN+ReLU after fusion output (enabled by default)
+    enable_joint_gating: bool = False
     late_residual_boost_start: int = 1
     late_residual_boost: float = 0.0
 
@@ -59,6 +60,7 @@ class _AdaptiveFusionStage(nn.Module):
         norm: str,
         activation: str,
         fusion_refinement: bool = False,
+        enable_joint_gating: bool = False,
         late_residual_boost: float = 0.0,
     ) -> None:
         super().__init__()
@@ -81,12 +83,16 @@ class _AdaptiveFusionStage(nn.Module):
                 for branch in branch_channels
             }
         )
-        joint_in_channels = out_channels * len(self.branch_order)
-        self.joint_gate_generator = nn.Sequential(
-            nn.Conv2d(joint_in_channels, gate_hidden, kernel_size=1, bias=True),
-            _build_activation(activation),
-            nn.Conv2d(gate_hidden, out_channels * len(self.branch_order), kernel_size=1, bias=True),
-        )
+        self.enable_joint_gating = bool(enable_joint_gating) and len(self.branch_order) > 1
+        if self.enable_joint_gating:
+            joint_in_channels = out_channels * len(self.branch_order)
+            self.joint_gate_generator = nn.Sequential(
+                nn.Conv2d(joint_in_channels, gate_hidden, kernel_size=1, bias=True),
+                _build_activation(activation),
+                nn.Conv2d(gate_hidden, out_channels * len(self.branch_order), kernel_size=1, bias=True),
+            )
+        else:
+            self.joint_gate_generator = None
         self.gate_bias = nn.ParameterDict(
             {
                 branch: nn.Parameter(torch.zeros((1, out_channels, 1, 1)))
@@ -154,14 +160,20 @@ class _AdaptiveFusionStage(nn.Module):
                 proj = F.interpolate(proj, size=(align_h, align_w), mode="bilinear", align_corners=False)
             aligned_projections[branch] = proj
 
-        joint_gate_tensor = self.joint_gate_generator(
-            torch.cat([aligned_projections[branch] for branch in self.branch_order], dim=1)
-        )
-        joint_gate_chunks = joint_gate_tensor.chunk(len(self.branch_order), dim=1)
-        joint_gate_map = {
-            branch: gate_chunk
-            for branch, gate_chunk in zip(self.branch_order, joint_gate_chunks)
-        }
+        if len(self.branch_order) > 1 and hasattr(self, "joint_gate_generator") and self.joint_gate_generator is not None:
+            joint_gate_tensor = self.joint_gate_generator(
+                torch.cat([aligned_projections[branch] for branch in self.branch_order], dim=1)
+            )
+            joint_gate_chunks = joint_gate_tensor.chunk(len(self.branch_order), dim=1)
+            joint_gate_map = {
+                branch: gate_chunk
+                for branch, gate_chunk in zip(self.branch_order, joint_gate_chunks)
+            }
+        else:
+            joint_gate_map = {
+                branch: torch.zeros_like(proj)
+                for branch, proj in aligned_projections.items()
+            }
 
         for branch in self.branch_order:
             if branch not in aligned_projections:
@@ -235,6 +247,7 @@ class MultiStageFeatureFusion(nn.Module):
                     norm=config.norm,
                     activation=config.activation,
                     fusion_refinement=getattr(config, 'fusion_refinement', False),
+                    enable_joint_gating=getattr(config, "enable_joint_gating", False),
                     late_residual_boost=(
                         getattr(config, "late_residual_boost", 0.0)
                         if (

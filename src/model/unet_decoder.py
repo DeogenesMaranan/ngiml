@@ -61,6 +61,9 @@ class UNetDecoderConfig:
     enable_boundary_refinement: bool = True  # Sobel-guided residual correction after final logits
     boundary_refine_channels: int = 8  # Lightweight hidden width for post-logit correction
     boundary_refine_scale: float = 1.0  # Multiplicative scale for residual correction
+    enable_detail_refinement: bool = True  # Final-stage detail correction for small/low-res regions
+    detail_refine_channels: int = 16  # Lightweight hidden width for final detail refinement
+    detail_refine_scale: float = 1.0  # Multiplicative scale for final residual correction
 
 
 class UNetDecoder(nn.Module):
@@ -140,6 +143,22 @@ class UNetDecoder(nn.Module):
             ]
         )
 
+        self.enable_detail_refinement = bool(getattr(self.cfg, "enable_detail_refinement", False))
+        self.detail_refine_scale = float(getattr(self.cfg, "detail_refine_scale", 1.0))
+        if self.enable_detail_refinement:
+            refine_channels = int(max(1, getattr(self.cfg, "detail_refine_channels", 16)))
+            detail_in_channels = (self.decoder_channels[0] * 2) + self.cfg.out_channels
+            self.detail_refine_head = nn.Sequential(
+                nn.Conv2d(detail_in_channels, refine_channels, kernel_size=3, padding=1, bias=False),
+                _build_norm(self.cfg.norm, refine_channels),
+                _build_activation(self.cfg.activation),
+                nn.Conv2d(refine_channels, self.cfg.out_channels, kernel_size=1, bias=True),
+            )
+            # Preserve identity behavior at initialization.
+            nn.init.zeros_(self.detail_refine_head[-1].weight)
+            if self.detail_refine_head[-1].bias is not None:
+                nn.init.zeros_(self.detail_refine_head[-1].bias)
+
         # Lightweight post-logit boundary refinement (optional).
         self.enable_boundary_refinement = bool(getattr(self.cfg, "enable_boundary_refinement", False))
         self.boundary_refine_scale = float(getattr(self.cfg, "boundary_refine_scale", 1.0))
@@ -193,6 +212,30 @@ class UNetDecoder(nn.Module):
         residual = self.boundary_refine_head(refine_in)
         return logits + self.boundary_refine_scale * residual
 
+    def _refine_small_detail_logits(
+        self,
+        logits: Tensor,
+        final_feature: Tensor,
+        finest_skip: Tensor,
+        coarse_logits: Tensor | None = None,
+    ) -> Tensor:
+        if not self.enable_detail_refinement:
+            return logits
+
+        if coarse_logits is None:
+            coarse_logits = logits
+        elif coarse_logits.shape[-2:] != logits.shape[-2:]:
+            coarse_logits = F.interpolate(
+                coarse_logits,
+                size=logits.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        refine_in = torch.cat([final_feature, finest_skip, coarse_logits], dim=1)
+        residual = self.detail_refine_head(refine_in)
+        return logits + self.detail_refine_scale * residual
+
     def forward(self, features: List[Tensor], image: Tensor = None, postprocess: Optional[str] = None) -> List[Tensor]:
         if len(features) != len(self.stage_channels):
             raise ValueError("Feature list length must match number of decoder stages")
@@ -241,6 +284,13 @@ class UNetDecoder(nn.Module):
             if self.use_dropout and out_preds:
                 out_preds[0] = self.dropout(out_preds[0])
             if out_preds:
+                coarse_logits = out_preds[1] if len(out_preds) > 1 else None
+                out_preds[0] = self._refine_small_detail_logits(
+                    out_preds[0],
+                    x,
+                    projected[0],
+                    coarse_logits=coarse_logits,
+                )
                 out_preds[0] = self._refine_final_logits(out_preds[0])
             if postprocess is not None:
                 if postprocess.lower() == 'sigmoid':
@@ -252,6 +302,7 @@ class UNetDecoder(nn.Module):
         final = self.predictors[0](x)
         if self.use_dropout:
             final = self.dropout(final)
+        final = self._refine_small_detail_logits(final, x, projected[0], coarse_logits=None)
         final = self._refine_final_logits(final)
         if postprocess is not None:
             if postprocess.lower() == 'sigmoid':

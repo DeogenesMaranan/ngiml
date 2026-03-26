@@ -1,5 +1,7 @@
 from tools.colab_train_helpers import apply_colab_runtime_settings
 from tools.train_ngiml import build_default_components, build_training_config
+from src.model.hybrid_ngiml import HybridNGIMLConfig
+from src.model.feature_fusion import FeatureFusionConfig
 
 
 def test_apply_colab_runtime_settings_preserves_explicit_compile_choice():
@@ -37,3 +39,11 @@ def test_build_training_config_uses_fixed_threshold_iou_early_stopping_defaults(
     assert cfg["early_stopping_monitor"] == "iou"
     assert cfg["metric_threshold"] == 0.5
     assert cfg["optimize_threshold"] is False
+
+
+def test_further_lite_defaults_disable_residual_attention_and_joint_gating():
+    model_cfg = HybridNGIMLConfig()
+    fusion_cfg = FeatureFusionConfig(fusion_channels=(64, 128, 192, 256))
+
+    assert model_cfg.enable_residual_attention is False
+    assert fusion_cfg.enable_joint_gating is False
