@@ -23,6 +23,26 @@ def test_apply_colab_runtime_settings_preserves_explicit_compile_choice():
     assert updated["local_cache_dir"] == "/content/cache"
 
 
+def test_apply_colab_runtime_settings_caps_excessive_num_workers():
+    cfg = {
+        "num_workers": 6,
+    }
+    import tools.colab_train_helpers as helpers
+
+    original_cpu_count = helpers.os.cpu_count
+    try:
+        helpers.os.cpu_count = lambda: 2
+        updated = apply_colab_runtime_settings(
+            cfg,
+            balance_sampling=False,
+            local_cache_dir="/content/cache",
+        )
+    finally:
+        helpers.os.cpu_count = original_cpu_count
+
+    assert updated["num_workers"] == 2
+
+
 def test_build_training_config_uses_fixed_threshold_iou_early_stopping_defaults():
     model_cfg, loss_cfg, default_aug, per_dataset_aug = build_default_components()
     cfg = build_training_config(

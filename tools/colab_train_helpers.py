@@ -53,7 +53,11 @@ def apply_colab_runtime_settings(
     }
 
     _cfg_update(training_config, updates, overwrite=False)
-    return _cfg_as_dict(training_config)
+    cfg_out = _cfg_as_dict(training_config)
+    current_workers = int(cfg_out.get("num_workers", recommended_workers) or 0)
+    if current_workers > recommended_workers:
+        cfg_out["num_workers"] = recommended_workers
+    return cfg_out
 
 
 def stage_persistent_cache_to_runtime(
