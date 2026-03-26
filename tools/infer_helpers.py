@@ -9,7 +9,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Sequence
 
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 import numpy as np
 import pandas as pd
 import torch
@@ -30,6 +33,13 @@ from src.data.dataloaders import (
 from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
 from tools.train_ngiml import _coerce_model_config, build_default_components
+
+
+def _require_matplotlib() -> None:
+    if plt is None:
+        raise ImportError(
+            "matplotlib is required for plotting helpers but is not installed in this environment."
+        )
 
 def _to_chw_rgb(image_np: np.ndarray) -> np.ndarray:
     if image_np.ndim == 2:
