@@ -1243,6 +1243,79 @@ def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
             param.requires_grad = bool(trainable)
 
 
+def _backbone_trainable_groups(module: nn.Module) -> list[nn.Module]:
+    """Return progressively-unfreezable groups for a backbone wrapper."""
+    if hasattr(module, "backbone"):
+        backbone = getattr(module, "backbone")
+        blocks = getattr(backbone, "blocks", None)
+        if isinstance(blocks, (list, nn.ModuleList)) and len(blocks) > 0:
+            groups: list[nn.Module] = []
+            stem_modules = [
+                child
+                for name, child in backbone.named_children()
+                if name != "blocks"
+            ]
+            if stem_modules:
+                groups.append(nn.ModuleList(stem_modules))
+            groups.extend(list(blocks))
+            return groups
+    stages = getattr(module, "stages", None)
+    if isinstance(stages, (list, nn.ModuleList)) and len(stages) > 0:
+        groups = []
+        patch_embed = getattr(module, "patch_embed", None)
+        if isinstance(patch_embed, nn.Module):
+            groups.append(patch_embed)
+        groups.extend(list(stages))
+        return groups
+    return [module]
+
+
+def _set_backbone_trainability_for_epoch(
+    model: HybridNGIML,
+    epoch: int,
+    freeze_backbone_epochs: int,
+    progressive_unfreeze_epochs: int = 3,
+) -> str:
+    """Apply a smoother staged backbone unfreeze schedule and describe it."""
+    progressive_unfreeze_epochs = max(1, int(progressive_unfreeze_epochs))
+    if epoch < freeze_backbone_epochs:
+        _set_backbone_trainable(model, trainable=False)
+        return "frozen"
+
+    groups_by_backbone: list[tuple[str, list[nn.Module]]] = []
+    total_groups = 0
+    for module_name in ("efficientnet", "swin"):
+        module = getattr(model, module_name, None)
+        if module is None:
+            continue
+        groups = _backbone_trainable_groups(module)
+        groups_by_backbone.append((module_name, groups))
+        total_groups += len(groups)
+
+    if total_groups == 0:
+        return "all-trainable"
+
+    for _, groups in groups_by_backbone:
+        for group in groups:
+            for param in group.parameters():
+                param.requires_grad = False
+
+    unfreeze_progress = min(epoch - freeze_backbone_epochs + 1, progressive_unfreeze_epochs)
+    progress_ratio = float(unfreeze_progress) / float(progressive_unfreeze_epochs)
+
+    trainable_groups = 0
+    for _, groups in groups_by_backbone:
+        groups_to_enable = max(1, math.ceil(len(groups) * progress_ratio))
+        for group in groups[-groups_to_enable:]:
+            for param in group.parameters():
+                param.requires_grad = True
+        trainable_groups += groups_to_enable
+
+    if trainable_groups >= total_groups:
+        return "all-trainable"
+    return f"progressive {trainable_groups}/{total_groups}"
+
+
 def _sample_has_mask(record) -> bool:
     has_mask = bool(record.mask_path)
     image_path = str(record.image_path)
@@ -1791,51 +1864,6 @@ def train_one_epoch(
     normalization_mode: Optional[str] = None,
 ):
     model.train()
-    # --- Staged freezing/unfreezing for resume-based fine-tuning ---
-    is_finetune = bool(getattr(cfg, "resume", None))
-
-    if is_finetune:
-        freeze_backbone_epochs = getattr(getattr(cfg, 'model_config', None), 'optimizer', None)
-        if freeze_backbone_epochs is not None:
-            freeze_backbone_epochs = getattr(freeze_backbone_epochs, 'freeze_backbone_epochs', 3)
-        else:
-            freeze_backbone_epochs = 3
-
-        def set_backbone_blocks_trainable(model, epoch):
-            # Freeze all backbone layers for first N epochs
-            if epoch < freeze_backbone_epochs:
-                for module_name in ("efficientnet", "swin"):
-                    module = getattr(model, module_name, None)
-                    if module is not None:
-                        for param in module.parameters():
-                            param.requires_grad = False
-            # Gradually unfreeze only the last block of each backbone after freeze_backbone_epochs
-            elif freeze_backbone_epochs <= epoch < 11:
-                for module_name in ("efficientnet", "swin"):
-                    module = getattr(model, module_name, None)
-                    if module is not None:
-                        if hasattr(module, 'blocks') and isinstance(module.blocks, (list, nn.ModuleList)):
-                            for i, block in enumerate(module.blocks):
-                                requires_grad = (i == len(module.blocks) - 1)
-                                for param in block.parameters():
-                                    param.requires_grad = requires_grad
-                        else:
-                            for param in module.parameters():
-                                param.requires_grad = True
-            else:
-                for module_name in ("efficientnet", "swin"):
-                    module = getattr(model, module_name, None)
-                    if module is not None:
-                        if hasattr(module, 'blocks') and isinstance(module.blocks, (list, nn.ModuleList)):
-                            for i, block in enumerate(module.blocks):
-                                requires_grad = (i == len(module.blocks) - 1)
-                                for param in block.parameters():
-                                    param.requires_grad = requires_grad
-                        else:
-                            for param in module.parameters():
-                                param.requires_grad = False
-
-        set_backbone_blocks_trainable(model, epoch)
     running_loss = 0.0
     num_batches = 0
     sampled_pos = 0.0
@@ -2479,21 +2507,29 @@ def run_training(cfg: TrainConfig) -> None:
     best_threshold_path = checkpoint_dir / "best_threshold.json"
 
     freeze_backbone_epochs = int(max(0, getattr(model_cfg.optimizer, "freeze_backbone_epochs", 0)))
-    backbone_was_frozen = False
+    backbone_phase: Optional[str] = None
 
     runtime_fallback_used = False
     for epoch in range(start_epoch, cfg.epochs):
-        should_freeze_backbone = epoch < freeze_backbone_epochs
-        _set_backbone_trainable(model, trainable=not should_freeze_backbone)
-        if should_freeze_backbone and not backbone_was_frozen:
-            print(
-                "Backbone freeze enabled: freezing EfficientNet/Swin "
-                f"for first {freeze_backbone_epochs} epochs"
-            )
-            backbone_was_frozen = True
-        elif (not should_freeze_backbone) and backbone_was_frozen:
-            print("Backbone freeze finished: unfreezing EfficientNet/Swin")
-            backbone_was_frozen = False
+        current_backbone_phase = _set_backbone_trainability_for_epoch(
+            model,
+            epoch=epoch,
+            freeze_backbone_epochs=freeze_backbone_epochs,
+        )
+        if current_backbone_phase != backbone_phase:
+            if current_backbone_phase == "frozen":
+                print(
+                    "Backbone freeze enabled: freezing EfficientNet/Swin "
+                    f"for first {freeze_backbone_epochs} epochs"
+                )
+            elif current_backbone_phase == "all-trainable":
+                print("Backbone freeze finished: fully unfreezing EfficientNet/Swin")
+            else:
+                print(
+                    "Backbone staged unfreeze: "
+                    f"{current_backbone_phase} backbone groups trainable"
+                )
+            backbone_phase = current_backbone_phase
 
         start_time = time.time()
         try:
