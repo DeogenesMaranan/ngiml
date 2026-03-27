@@ -6,6 +6,8 @@ from tools.train_ngiml import (
     _build_cuda_runtime_safe_cfg,
     _coerce_aug,
     _is_cuda_oom_error,
+    _resolve_gpu_aug_chunk_size,
+    _should_chunk_gpu_aug,
     _should_disable_compile_for_device,
 )
 from src.data.dataloaders import AugmentationConfig
@@ -118,3 +120,16 @@ def test_low_vram_cuda_devices_disable_compile():
         assert _should_disable_compile_for_device(cfg, torch.device("cuda")) is True
     finally:
         torch.cuda.get_device_properties = original
+
+
+def test_gpu_aug_chunking_is_skipped_when_chunk_covers_group():
+    assert _should_chunk_gpu_aug(group_size=8, chunk_size=8) is False
+    assert _should_chunk_gpu_aug(group_size=8, chunk_size=16) is False
+    assert _should_chunk_gpu_aug(group_size=8, chunk_size=4) is True
+    assert _should_chunk_gpu_aug(group_size=8, chunk_size=0) is False
+
+
+def test_gpu_aug_chunk_size_zero_means_auto_full_group():
+    assert _resolve_gpu_aug_chunk_size(group_size=8, chunk_size=0) == 8
+    assert _resolve_gpu_aug_chunk_size(group_size=8, chunk_size=-1) == 8
+    assert _resolve_gpu_aug_chunk_size(group_size=8, chunk_size=4) == 4

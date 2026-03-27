@@ -188,7 +188,7 @@ class TrainConfig:
     local_cache_dir: Optional[str] = "/cache"
     reuse_local_cache_manifest: bool = True
     views_per_sample: int = 3
-    gpu_aug_batch_chunk_size: int = 1
+    gpu_aug_batch_chunk_size: int = 0
     resize_max_side: int = 0
     max_rotation_degrees: float = 6.0
     noise_std_max: float = 0.012
@@ -340,7 +340,7 @@ def build_training_config(
         num_workers=0,
         prefetch_factor=2,
         views_per_sample=1,
-        gpu_aug_batch_chunk_size=1,
+        gpu_aug_batch_chunk_size=0,
         resize_max_side=448,
         max_rotation_degrees=6.0,
         noise_std_max=0.012,
@@ -586,7 +586,7 @@ def parse_args() -> TrainConfig:
         local_cache_dir=args.local_cache_dir,
         reuse_local_cache_manifest=args.reuse_local_cache_manifest,
         views_per_sample=args.views_per_sample,
-        gpu_aug_batch_chunk_size=max(1, int(args.gpu_aug_batch_chunk_size)),
+        gpu_aug_batch_chunk_size=int(args.gpu_aug_batch_chunk_size),
         resize_max_side=resolved_resize_max_side,
         max_rotation_degrees=args.max_rotation_degrees,
         noise_std_max=args.noise_std_max,
@@ -1239,6 +1239,18 @@ def _initial_best_for_monitor(monitor: str) -> float:
 def _format_status_flags(flags: Sequence[str]) -> str:
     compact = [str(flag).strip() for flag in flags if str(flag).strip()]
     return " | ".join(compact) if compact else "none"
+
+
+def _should_chunk_gpu_aug(group_size: int, chunk_size: int) -> bool:
+    if int(chunk_size) <= 0:
+        return False
+    return int(chunk_size) < int(group_size)
+
+
+def _resolve_gpu_aug_chunk_size(group_size: int, chunk_size: int) -> int:
+    if int(chunk_size) <= 0:
+        return int(group_size)
+    return max(1, int(chunk_size))
 
 
 def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
@@ -1986,14 +1998,18 @@ def train_one_epoch(
                             images[idxs] = images[idxs]
                         continue
 
-                    aug_chunk = max(1, int(getattr(cfg, "gpu_aug_batch_chunk_size", 1)))
-                    for chunk_start in range(0, len(idxs), aug_chunk):
-                        chunk_idxs = idxs[chunk_start : chunk_start + aug_chunk]
-                        img_slice = images[chunk_idxs]
-                        mask_slice = masks[chunk_idxs]
+                    aug_chunk = _resolve_gpu_aug_chunk_size(
+                        len(idxs),
+                        int(getattr(cfg, "gpu_aug_batch_chunk_size", 0)),
+                    )
+                    use_chunking = _should_chunk_gpu_aug(len(idxs), aug_chunk)
+
+                    if not use_chunking:
+                        img_slice = images[idxs]
+                        mask_slice = masks[idxs]
                         hp_slice = None
                         if residual_noise is not None:
-                            hp_slice = residual_noise[chunk_idxs]
+                            hp_slice = residual_noise[idxs]
 
                         img_out, mask_out, hp_out = _apply_gpu_augmentations_batch(
                             img_slice,
@@ -2008,10 +2024,36 @@ def train_one_epoch(
                             std = imagenet_std.view(1, 3, 1, 1)
                             img_out = (img_out - mean) / std
 
-                        images[chunk_idxs] = img_out
-                        masks[chunk_idxs] = mask_out
+                        images[idxs] = img_out
+                        masks[idxs] = mask_out
                         if hp_out is not None and residual_noise is not None:
-                            residual_noise[chunk_idxs] = hp_out
+                            residual_noise[idxs] = hp_out
+                    else:
+                        for chunk_start in range(0, len(idxs), aug_chunk):
+                            chunk_idxs = idxs[chunk_start : chunk_start + aug_chunk]
+                            img_slice = images[chunk_idxs]
+                            mask_slice = masks[chunk_idxs]
+                            hp_slice = None
+                            if residual_noise is not None:
+                                hp_slice = residual_noise[chunk_idxs]
+
+                            img_out, mask_out, hp_out = _apply_gpu_augmentations_batch(
+                                img_slice,
+                                mask_slice,
+                                aug_cfg,
+                                residual_noise=hp_slice,
+                                generator=gen,
+                            )
+
+                            if normalization_mode == "imagenet":
+                                mean = imagenet_mean.view(1, 3, 1, 1)
+                                std = imagenet_std.view(1, 3, 1, 1)
+                                img_out = (img_out - mean) / std
+
+                            images[chunk_idxs] = img_out
+                            masks[chunk_idxs] = mask_out
+                            if hp_out is not None and residual_noise is not None:
+                                residual_noise[chunk_idxs] = hp_out
             aug_end = time.perf_counter()
         else:
             aug_end = None
