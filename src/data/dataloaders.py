@@ -152,6 +152,8 @@ def _load_from_npz(
             if mask.max() > 1.0:
                 mask = mask / 255.0
             mask = mask.float()
+            if mask.shape[-2:] != image.shape[-2:]:
+                mask = F.resize(mask, list(image.shape[-2:]), interpolation=InterpolationMode.NEAREST)
 
         residual_noise = _compute_residual_noise(image)
 
