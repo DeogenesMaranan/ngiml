@@ -1236,6 +1236,11 @@ def _initial_best_for_monitor(monitor: str) -> float:
     return float("-inf")
 
 
+def _format_status_flags(flags: Sequence[str]) -> str:
+    compact = [str(flag).strip() for flag in flags if str(flag).strip()]
+    return " | ".join(compact) if compact else "none"
+
+
 def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
     for module_name in ("efficientnet", "swin"):
         module = getattr(model, module_name, None)
@@ -2618,13 +2623,14 @@ def run_training(cfg: TrainConfig) -> None:
             scheduler.step()
             current_lr = optimizer.param_groups[0]["lr"]
             print(
-                f"Epoch {epoch:03d} done | loss {train_loss:.4f} | "
-                f"sample_pos_ratio {train_positive_ratio:.3f} | lr {current_lr:.6e} | time {elapsed:.1f}s"
+                f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} Train | "
+                f"loss {train_loss:.4f} | pos_ratio {train_positive_ratio:.3f} | "
+                f"lr {current_lr:.6e} | time {elapsed:.1f}s"
             )
         else:
             print(
-                f"Epoch {epoch:03d} done | loss {train_loss:.4f} | "
-                f"sample_pos_ratio {train_positive_ratio:.3f} | time {elapsed:.1f}s"
+                f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} Train | "
+                f"loss {train_loss:.4f} | pos_ratio {train_positive_ratio:.3f} | time {elapsed:.1f}s"
             )
 
         val_loss = None
@@ -2635,6 +2641,7 @@ def run_training(cfg: TrainConfig) -> None:
         val_accuracy = None
         val_threshold = None
         val_size_bins = None
+        epoch_status_flags: list[str] = []
         if "val" in loaders and (epoch + 1) % cfg.val_every == 0:
             eval_model = ema_model if ema_model is not None else model
             metrics = evaluate(eval_model, loaders["val"], loss_fn, device, cfg, normalization_mode=normalization_mode)
@@ -2646,18 +2653,22 @@ def run_training(cfg: TrainConfig) -> None:
             val_accuracy = float(metrics["accuracy"])
             val_threshold = float(metrics["threshold"])
             val_size_bins = metrics.get("size_bins")
+            val_summary = (
+                f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} Val   | "
+                f"loss {val_loss:.4f} | iou {val_iou:.4f} | f1 {val_f1:.4f} | "
+                f"prec {val_precision:.4f} | rec {val_recall:.4f} | acc {val_accuracy:.4f} | "
+                f"thr {val_threshold:.2f}"
+            )
             print(
-                f"Val | loss {val_loss:.4f} | iou {val_iou:.4f} | f1 {val_f1:.4f} "
-                f"| precision {val_precision:.4f} | recall {val_recall:.4f} | accuracy {val_accuracy:.4f} "
-                f"| threshold {val_threshold:.2f}"
+                val_summary
             )
             if isinstance(val_size_bins, dict):
                 small_iou = float(val_size_bins.get("small", {}).get("iou", 0.0))
                 medium_iou = float(val_size_bins.get("medium", {}).get("iou", 0.0))
                 large_iou = float(val_size_bins.get("large", {}).get("iou", 0.0))
                 print(
-                    "Val bins | "
-                    f"small_iou {small_iou:.4f} | medium_iou {medium_iou:.4f} | large_iou {large_iou:.4f}"
+                    "               bins | "
+                    f"small {small_iou:.4f} | medium {medium_iou:.4f} | large {large_iou:.4f}"
                 )
 
             iou_improved = val_iou > (best_val_iou + cfg.early_stopping_min_delta)
@@ -2682,10 +2693,7 @@ def run_training(cfg: TrainConfig) -> None:
                     ema_model=ema_model,
                     use_ema_for_model_state=(ema_model is not None),
                 )
-                print(
-                    f"New best overlap metrics | iou {best_val_iou:.4f} | f1 {best_val_f1:.4f}; "
-                    f"saved to {best_f1_iou_path}"
-                )
+                epoch_status_flags.append(f"best-overlap -> {best_f1_iou_path.name}")
 
             # Use the configured early-stopping monitor to determine when to reset patience
             monitor_value = _metric_for_monitor(metrics, cfg.early_stopping_monitor)
@@ -2733,23 +2741,21 @@ def run_training(cfg: TrainConfig) -> None:
                         "best_val_iou": best_threshold_payload["val_iou"],
                     },
                 )
-                print(
-                    f"New best {monitor_for_metadata} {monitor_value_for_metadata:.4f}; "
-                    f"saved to {best_alias_path} (threshold metadata: {best_threshold_path})"
+                epoch_status_flags.append(
+                    f"best-{monitor_for_metadata} {monitor_value_for_metadata:.4f} -> {best_alias_path.name}"
                 )
 
             if monitor_improved:
                 # Update recorded bests and reset patience
                 best_monitor_value = monitor_value
                 no_improve_epochs = 0
-                print(f"New best {cfg.early_stopping_monitor} {monitor_value:.4f}")
+                epoch_status_flags.append(f"monitor improved ({cfg.early_stopping_monitor}={monitor_value:.4f})")
             else:
                 # Update monitor-based counter
                 if early_stopping_enabled:
                     no_improve_epochs += 1
-                    print(
-                        f"Early stopping patience: {no_improve_epochs}/{cfg.early_stopping_patience} "
-                        f"without {cfg.early_stopping_monitor} improvement"
+                    epoch_status_flags.append(
+                        f"patience {no_improve_epochs}/{cfg.early_stopping_patience}"
                     )
 
         should_checkpoint = ((epoch + 1) % cfg.checkpoint_every == 0) or (epoch + 1 == cfg.epochs)
@@ -2786,7 +2792,10 @@ def run_training(cfg: TrainConfig) -> None:
                     "checkpoint_path": str(ckpt_path),
                 },
             )
-            print(f"Saved checkpoint to {ckpt_path}")
+            epoch_status_flags.append(f"checkpoint {ckpt_path.name}")
+
+        if epoch_status_flags:
+            print(f"               status | {_format_status_flags(epoch_status_flags)}")
 
         if early_stopping_enabled and "val" in loaders and (epoch + 1) % cfg.val_every == 0:
             if no_improve_epochs >= cfg.early_stopping_patience:
