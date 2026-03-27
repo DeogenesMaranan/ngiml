@@ -345,6 +345,8 @@ def build_training_config(
         max_rotation_degrees=6.0,
         noise_std_max=0.012,
         warmup_epochs=3,
+        resume=None,
+        auto_resume=True,
         early_stopping_patience=5,
         early_stopping_min_delta=3e-3,
         early_stopping_monitor="iou",
