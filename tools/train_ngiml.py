@@ -354,6 +354,7 @@ def build_training_config(
         optimize_threshold=False,
         foreground_ratio_max_batches=20,
         short_side_probe_samples=0,
+        pos_weight_max=20.0,
         loss_hybrid_mode=str(getattr(loss_cfg, "hybrid_mode", "dice_bce")),
         dice_weight=float(getattr(loss_cfg, "dice_weight", 1.0)),
         bce_weight=float(getattr(loss_cfg, "bce_weight", 1.0)),
