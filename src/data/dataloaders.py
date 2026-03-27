@@ -950,7 +950,8 @@ def _collate_impl(
                 if collect_residual_noise and i < len(residual_noisees):
                     residual_noisees[i] = F.resize(residual_noisees[i], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
 
-    need_pad = any(s != images[0].shape for s in [img.shape for img in images])
+    shapes = [img.shape for img in images]
+    need_pad = any(s != images[0].shape for s in shapes)
 
     if need_pad:
         max_c = max(s[0] for s in shapes)
@@ -974,9 +975,9 @@ def _collate_impl(
             if m is None:
                 m = torch.zeros((1, h, w), dtype=torch.float32, device=img.device)
             else:
-                mc, mh, mw = m.shape
+                _mc, mh, mw = m.shape
                 if (mh != max_h) or (mw != max_w):
-                    m = NN_F.pad(m, (0, pad_w, 0, pad_h), value=0)
+                    m = NN_F.pad(m, (0, max_w - mw, 0, max_h - mh), value=0)
 
             padded_images.append(img)
             padded_masks.append(m)
