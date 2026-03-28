@@ -862,6 +862,17 @@ def _collate_impl(
     aug_seed: int | None,
     batch: List[dict[str, object]],
 ) -> dict[str, object]:
+    def _pad_or_crop_to_shape(tensor: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+        _, cur_h, cur_w = tensor.shape
+        if cur_h > target_h or cur_w > target_w:
+            tensor = tensor[:, :target_h, :target_w]
+            _, cur_h, cur_w = tensor.shape
+        pad_h = max(0, target_h - cur_h)
+        pad_w = max(0, target_w - cur_w)
+        if pad_h or pad_w:
+            tensor = NN_F.pad(tensor, (0, pad_w, 0, pad_h), value=0)
+        return tensor
+
     imagenet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
     imagenet_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
@@ -950,7 +961,17 @@ def _collate_impl(
                 if collect_residual_noise and i < len(residual_noisees):
                     residual_noisees[i] = F.resize(residual_noisees[i], [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
 
-    need_pad = any(s != images[0].shape for s in [img.shape for img in images])
+    shapes = [img.shape for img in images]
+    need_pad = any(s != images[0].shape for s in shapes)
+    if not need_pad:
+        target_h, target_w = images[0].shape[-2:]
+        need_pad = any(
+            m is None or m.shape[-2:] != (target_h, target_w)
+            for m in masks
+        )
+    if not need_pad and collect_residual_noise and residual_noisees:
+        target_h, target_w = images[0].shape[-2:]
+        need_pad = any(hp.shape[-2:] != (target_h, target_w) for hp in residual_noisees)
 
     if need_pad:
         max_c = max(s[0] for s in shapes)
@@ -974,9 +995,8 @@ def _collate_impl(
             if m is None:
                 m = torch.zeros((1, h, w), dtype=torch.float32, device=img.device)
             else:
-                mc, mh, mw = m.shape
-                if (mh != max_h) or (mw != max_w):
-                    m = NN_F.pad(m, (0, pad_w, 0, pad_h), value=0)
+                m = _pad_or_crop_to_shape(m, h, w)
+            m = _pad_or_crop_to_shape(m, max_h, max_w)
 
             padded_images.append(img)
             padded_masks.append(m)
@@ -987,11 +1007,7 @@ def _collate_impl(
         if collect_residual_noise and residual_noisees:
             padded_high: List[torch.Tensor] = []
             for hp in residual_noisees:
-                hc, hh, hw = hp.shape
-                ph = max_h - hh
-                pw = max_w - hw
-                if ph or pw:
-                    hp = NN_F.pad(hp, (0, pw, 0, ph), value=0)
+                hp = _pad_or_crop_to_shape(hp, max_h, max_w)
                 padded_high.append(hp)
             residual_noisees = padded_high
 
