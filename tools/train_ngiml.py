@@ -249,6 +249,7 @@ class Checkpoint:
     scheduler_state: Optional[dict]
     scaler_state: Optional[dict]
     train_config: dict
+    training_state: Optional[dict] = None
 
 
 def build_default_components() -> tuple[HybridNGIMLConfig, MultiStageLossConfig, AugmentationConfig, dict[str, AugmentationConfig]]:
@@ -1025,6 +1026,7 @@ def save_checkpoint(
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     ema_model: Optional[HybridNGIML] = None,
     use_ema_for_model_state: bool = False,
+    training_state: Optional[dict] = None,
 ) -> None:
     model_state = ema_model.state_dict() if (use_ema_for_model_state and ema_model is not None) else model.state_dict()
     ckpt = Checkpoint(
@@ -1037,6 +1039,7 @@ def save_checkpoint(
         scheduler_state=scheduler.state_dict() if scheduler is not None else None,
         scaler_state=scaler.state_dict() if scaler.is_enabled() else None,
         train_config=asdict(cfg),
+        training_state=training_state,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(ckpt.__dict__, path)
@@ -1109,7 +1112,7 @@ def load_checkpoint(
     device: torch.device,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     ema_model: Optional[HybridNGIML] = None,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, dict]:
     # Attempt to load the requested checkpoint; if it's corrupt/unreadable,
     # try earlier "checkpoint_epoch_*.pt" files in the same directory as fallbacks.
     original_exc: Exception | None = None
@@ -1176,7 +1179,11 @@ def load_checkpoint(
         # If global_step missing, try to infer from filename or leave as 0.
         pass
 
-    return start_epoch, global_step
+    training_state = data.get("training_state")
+    if not isinstance(training_state, dict):
+        training_state = {}
+
+    return start_epoch, global_step, training_state
 
 
 def _checkpoint_epoch(path: Path) -> int:
@@ -2504,9 +2511,10 @@ def run_training(cfg: TrainConfig) -> None:
     checkpoint_dir = out_dir / "checkpoints"
     checkpoint_log_path = checkpoint_dir / "checkpoint_metrics.json"
 
+    restored_training_state: dict = {}
     if resume_path:
         if resume_path.is_file():
-            start_epoch, global_step = load_checkpoint(
+            start_epoch, global_step, restored_training_state = load_checkpoint(
                 resume_path,
                 model,
                 optimizer,
@@ -2549,10 +2557,15 @@ def run_training(cfg: TrainConfig) -> None:
         chosen_threshold=None,
     )
 
-    best_monitor_value = _initial_best_for_monitor(cfg.early_stopping_monitor)
-    best_val_iou = float("-inf")
-    best_val_f1 = float("-inf")
-    no_improve_epochs = 0
+    best_monitor_value = float(
+        restored_training_state.get(
+            "best_monitor_value",
+            _initial_best_for_monitor(cfg.early_stopping_monitor),
+        )
+    )
+    best_val_iou = float(restored_training_state.get("best_val_iou", float("-inf")))
+    best_val_f1 = float(restored_training_state.get("best_val_f1", float("-inf")))
+    no_improve_epochs = int(restored_training_state.get("no_improve_epochs", 0))
     early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
     best_threshold_path = checkpoint_dir / "best_threshold.json"
 
@@ -2735,6 +2748,12 @@ def run_training(cfg: TrainConfig) -> None:
                     scheduler=scheduler,
                     ema_model=ema_model,
                     use_ema_for_model_state=(ema_model is not None),
+                    training_state={
+                        "best_monitor_value": best_monitor_value,
+                        "best_val_iou": best_val_iou,
+                        "best_val_f1": best_val_f1,
+                        "no_improve_epochs": no_improve_epochs,
+                    },
                 )
                 epoch_status_flags.append(f"best-overlap -> {best_f1_iou_path.name}")
 
@@ -2762,6 +2781,12 @@ def run_training(cfg: TrainConfig) -> None:
                     scheduler=scheduler,
                     ema_model=ema_model,
                     use_ema_for_model_state=(ema_model is not None),
+                    training_state={
+                        "best_monitor_value": best_monitor_value,
+                        "best_val_iou": best_val_iou,
+                        "best_val_f1": best_val_f1,
+                        "no_improve_epochs": no_improve_epochs,
+                    },
                 )
                 best_threshold_payload = _write_best_threshold_metadata(
                     best_threshold_path,
@@ -2815,6 +2840,12 @@ def run_training(cfg: TrainConfig) -> None:
                 scheduler=scheduler,
                 ema_model=ema_model,
                 use_ema_for_model_state=False,
+                training_state={
+                    "best_monitor_value": best_monitor_value,
+                    "best_val_iou": best_val_iou,
+                    "best_val_f1": best_val_f1,
+                    "no_improve_epochs": no_improve_epochs,
+                },
             )
             append_checkpoint_log(
                 checkpoint_log_path,
