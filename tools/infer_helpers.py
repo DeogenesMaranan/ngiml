@@ -15,6 +15,7 @@ except Exception:
     plt = None
 import numpy as np
 import pandas as pd
+from PIL import Image
 import torch
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
@@ -82,6 +83,113 @@ def _parse_meta(raw) -> dict:
         except Exception:
             return {'metadata_raw': raw}
     return raw if isinstance(raw, dict) else {'metadata_raw': str(raw)}
+
+
+def _coerce_hw(value, fallback_hw: tuple[int, int]) -> tuple[int, int]:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        try:
+            h = int(value[0])
+            w = int(value[1])
+            if h > 0 and w > 0:
+                return h, w
+        except Exception:
+            pass
+    return fallback_hw
+
+
+def _resize_array_hw(arr: np.ndarray, target_hw: tuple[int, int], *, mode: str) -> np.ndarray:
+    tensor = torch.from_numpy(np.asarray(arr)).float()
+    squeeze = False
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(0).unsqueeze(0)
+        squeeze = True
+    elif tensor.ndim == 3:
+        tensor = tensor.unsqueeze(0)
+    else:
+        raise ValueError(f"Unsupported array rank for resize: {tensor.ndim}")
+
+    interpolation = "nearest" if mode == "nearest" else "bilinear"
+    if interpolation == "nearest":
+        resized = F.interpolate(tensor, size=list(target_hw), mode=interpolation)
+    else:
+        resized = F.interpolate(tensor, size=list(target_hw), mode=interpolation, align_corners=False)
+
+    resized = resized.squeeze(0).cpu().numpy()
+    if squeeze:
+        resized = resized[0]
+    return resized
+
+
+def _restore_processed_array_to_original(
+    arr: np.ndarray,
+    meta: dict,
+    original_hw: tuple[int, int],
+    *,
+    mode: str,
+) -> np.ndarray:
+    source = np.asarray(arr)
+    if source.ndim != 2:
+        raise ValueError(f"Expected 2D array for restore, got shape {source.shape}")
+
+    processed_h, processed_w = int(source.shape[0]), int(source.shape[1])
+    orig_h, orig_w = original_hw
+    preproc_mode = str(meta.get("preproc_mode", "")).strip().lower()
+
+    if preproc_mode == "pad":
+        top = max(0, (processed_h - orig_h) // 2)
+        left = max(0, (processed_w - orig_w) // 2)
+        return source[top:top + orig_h, left:left + orig_w]
+
+    if preproc_mode == "resize_then_pad":
+        long_side = max(orig_h, orig_w)
+        if long_side <= 0:
+            return source
+        size = max(processed_h, processed_w)
+        scale = float(size) / float(long_side)
+        resized_h = max(1, int(round(orig_h * scale)))
+        resized_w = max(1, int(round(orig_w * scale)))
+        top = max(0, (processed_h - resized_h) // 2)
+        left = max(0, (processed_w - resized_w) // 2)
+        cropped = source[top:top + resized_h, left:left + resized_w]
+        return _resize_array_hw(cropped, original_hw, mode=mode)
+
+    if preproc_mode == "resize":
+        return _resize_array_hw(source, original_hw, mode=mode)
+
+    if (processed_h, processed_w) == original_hw:
+        return source
+    return _resize_array_hw(source, original_hw, mode=mode)
+
+
+def _load_original_mask_from_path(mask_path: str | None, original_hw: tuple[int, int]) -> np.ndarray | None:
+    if not mask_path:
+        return None
+    path = Path(mask_path)
+    if not path.exists():
+        return None
+    mask = Image.open(path).convert("L")
+    mask_np = (np.asarray(mask, dtype=np.uint8) > 127).astype(np.uint8)
+    if mask_np.shape != original_hw:
+        mask_np = _resize_array_hw(mask_np, original_hw, mode="nearest")
+        mask_np = (mask_np > 0.5).astype(np.uint8)
+    return mask_np
+
+
+def _original_space_ground_truth(mask_hw: np.ndarray, meta: dict) -> np.ndarray:
+    original_hw = _coerce_hw(meta.get("original_size_hw"), tuple(mask_hw.shape))
+    if bool(meta.get("mask_is_all_zero", False)):
+        return np.zeros(original_hw, dtype=np.uint8)
+    original_mask = _load_original_mask_from_path(meta.get("original_mask_path"), original_hw)
+    if original_mask is not None:
+        return original_mask.astype(np.uint8)
+    restored = _restore_processed_array_to_original(mask_hw.astype(np.float32), meta, original_hw, mode="nearest")
+    return (restored > 0.5).astype(np.uint8)
+
+
+def _original_space_probability(prob_hw: np.ndarray, meta: dict) -> np.ndarray:
+    original_hw = _coerce_hw(meta.get("original_size_hw"), tuple(prob_hw.shape))
+    restored = _restore_processed_array_to_original(prob_hw.astype(np.float32), meta, original_hw, mode="bilinear")
+    return np.clip(restored, 0.0, 1.0).astype(np.float32)
 
 def _dataset_name(sample_uri: str, meta: dict) -> str:
     for k in ('dataset', 'dataset_name', 'source_dataset'):
@@ -213,18 +321,20 @@ def _append_prepared_inference_result(
     normalization_mode: str,
     max_plot_samples_per_dataset: int,
 ) -> None:
-    prob_hw = prob.detach().cpu().numpy().astype(np.float32)
+    prob_hw = _original_space_probability(prob.detach().cpu().numpy().astype(np.float32), sample["meta"])
+    gt_hw = _original_space_ground_truth(sample["mask_hw"], sample["meta"])
     pred_bin_metric = (prob_hw >= float(threshold_for_metrics)).astype(np.uint8)
     pred_bin_plot = (prob_hw >= float(plot_binary_threshold)).astype(np.uint8)
-    metrics = compute_binary_metrics(pred_bin_metric, sample["mask_hw"], empty_score_mode="strict")
-    legacy_metrics = compute_binary_metrics(pred_bin_metric, sample["mask_hw"], empty_score_mode="legacy")
+    metrics = compute_binary_metrics(pred_bin_metric, gt_hw, empty_score_mode="strict")
+    legacy_metrics = compute_binary_metrics(pred_bin_metric, gt_hw, empty_score_mode="legacy")
 
     meta = sample["meta"]
-    raw_label = meta.get("label", int(sample["mask_hw"].max() > 0))
+    raw_label = meta.get("label", int(gt_hw.max() > 0))
     if isinstance(raw_label, str):
         sample_label = 1 if raw_label.strip().lower() in {"1", "fake", "tp", "tampered", "manipulated"} else 0
     else:
         sample_label = int(raw_label)
+    original_h, original_w = _coerce_hw(meta.get("original_size_hw"), (int(sample["height"]), int(sample["width"])))
 
     row = {
         "dataset": sample["dataset"],
@@ -235,13 +345,13 @@ def _append_prepared_inference_result(
         "normalization_mode": normalization_mode,
         "threshold_for_metrics": float(threshold_for_metrics),
         "plot_binary_threshold": float(plot_binary_threshold),
-        "height": int(sample["height"]),
-        "width": int(sample["width"]),
+        "height": int(original_h),
+        "width": int(original_w),
         "mean_probability": float(prob_hw.mean()),
         "max_probability": float(prob_hw.max()),
         "pred_positive_ratio_threshold": float(pred_bin_metric.mean()),
         "pred_positive_ratio_0_5": float(pred_bin_plot.mean()),
-        "gt_positive_ratio": float(sample["mask_hw"].mean()),
+        "gt_positive_ratio": float(gt_hw.mean()),
         "legacy_f1": float(legacy_metrics["f1"]),
         "legacy_iou": float(legacy_metrics["iou"]),
     }
@@ -258,7 +368,7 @@ def _append_prepared_inference_result(
         {
             "sample_uri": sample["sample_uri"],
             "image_chw": sample["image_chw"],
-            "mask_hw": sample["mask_hw"],
+            "mask_hw": gt_hw,
             "prob_hw": prob_hw,
             "bin05_hw": pred_bin_plot,
         }
