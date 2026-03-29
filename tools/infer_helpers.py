@@ -191,6 +191,17 @@ def _original_space_probability(prob_hw: np.ndarray, meta: dict) -> np.ndarray:
     restored = _restore_processed_array_to_original(prob_hw.astype(np.float32), meta, original_hw, mode="bilinear")
     return np.clip(restored, 0.0, 1.0).astype(np.float32)
 
+
+def _original_space_image(image_chw: np.ndarray, meta: dict) -> np.ndarray:
+    image_hwc = np.transpose(np.asarray(image_chw), (1, 2, 0)).astype(np.float32)
+    original_hw = _coerce_hw(meta.get("original_size_hw"), tuple(image_hwc.shape[:2]))
+    restored_channels = [
+        _restore_processed_array_to_original(image_hwc[..., ch], meta, original_hw, mode="bilinear")
+        for ch in range(image_hwc.shape[-1])
+    ]
+    restored_hwc = np.stack(restored_channels, axis=-1)
+    return np.transpose(np.clip(restored_hwc, 0.0, 255.0), (2, 0, 1))
+
 def _dataset_name(sample_uri: str, meta: dict) -> str:
     for k in ('dataset', 'dataset_name', 'source_dataset'):
         if str(meta.get(k, '')).strip():
@@ -367,7 +378,7 @@ def _append_prepared_inference_result(
     dataset_plots.append(
         {
             "sample_uri": sample["sample_uri"],
-            "image_chw": sample["image_chw"],
+            "image_chw": _original_space_image(sample["image_chw"], meta),
             "mask_hw": gt_hw,
             "prob_hw": prob_hw,
             "bin05_hw": pred_bin_plot,
