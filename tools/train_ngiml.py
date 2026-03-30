@@ -188,6 +188,7 @@ class TrainConfig:
     local_cache_dir: Optional[str] = "/cache"
     reuse_local_cache_manifest: bool = True
     views_per_sample: int = 3
+    gpu_aug_batch_chunk_size: int = 0
     resize_max_side: int = 0
     max_rotation_degrees: float = 6.0
     noise_std_max: float = 0.012
@@ -248,6 +249,7 @@ class Checkpoint:
     scheduler_state: Optional[dict]
     scaler_state: Optional[dict]
     train_config: dict
+    training_state: Optional[dict] = None
 
 
 def build_default_components() -> tuple[HybridNGIMLConfig, MultiStageLossConfig, AugmentationConfig, dict[str, AugmentationConfig]]:
@@ -326,18 +328,34 @@ def build_training_config(
     per_dataset_aug: dict[str, AugmentationConfig],
 ) -> dict:
     """Build notebook-friendly training config dict from top-level defaults."""
+    safe_default_aug = replace(_coerce_aug(default_aug), views_per_sample=1)
+    safe_per_dataset_aug = {
+        name: replace(_coerce_aug(aug), views_per_sample=1)
+        for name, aug in per_dataset_aug.items()
+    }
+
     cfg = TrainConfig(
         manifest=str(manifest_path),
         output_dir=output_dir,
         batch_size=20,
         num_workers=0,
         prefetch_factor=2,
-        resize_max_side=896,
+        views_per_sample=1,
+        gpu_aug_batch_chunk_size=0,
+        resize_max_side=448,
         max_rotation_degrees=6.0,
         noise_std_max=0.012,
         warmup_epochs=3,
+        resume=None,
+        auto_resume=True,
+        early_stopping_patience=5,
+        early_stopping_min_delta=3e-3,
+        early_stopping_monitor="iou",
+        metric_threshold=0.5,
+        optimize_threshold=False,
         foreground_ratio_max_batches=20,
         short_side_probe_samples=0,
+        pos_weight_max=20.0,
         loss_hybrid_mode=str(getattr(loss_cfg, "hybrid_mode", "dice_bce")),
         dice_weight=float(getattr(loss_cfg, "dice_weight", 1.0)),
         bce_weight=float(getattr(loss_cfg, "bce_weight", 1.0)),
@@ -349,8 +367,9 @@ def build_training_config(
         lovasz_weight=float(getattr(loss_cfg, "lovasz_weight", 0.0)),
         use_boundary_loss=bool(getattr(loss_cfg, "use_boundary_loss", False)),
         boundary_weight=float(getattr(loss_cfg, "boundary_weight", 0.05)),
-        default_aug=default_aug,
-        per_dataset_aug=per_dataset_aug,
+        ema_enabled=False,
+        default_aug=safe_default_aug,
+        per_dataset_aug=safe_per_dataset_aug,
         model_config=model_cfg,
         loss_config=loss_cfg,
     )
@@ -467,6 +486,7 @@ def parse_args() -> TrainConfig:
         help="Reuse existing local cached manifest when available to shorten startup",
     )
     parser.add_argument("--views-per-sample", type=int, default=2, help="Number of augmented views per sample (on-the-fly)")
+    parser.add_argument("--gpu-aug-batch-chunk-size", type=int, default=1, help="Chunk size for GPU-side batched augmentations; smaller uses less memory")
     parser.add_argument("--resize-max-side", type=int, default=448, help="Cap image short side before batching (lower is faster)")
     parser.add_argument("--max-rotation-degrees", type=float, default=0.0, help="Random rotation range (+/-)")
     parser.add_argument("--noise-std-max", type=float, default=0.01, help="Max Gaussian noise std")
@@ -568,6 +588,7 @@ def parse_args() -> TrainConfig:
         local_cache_dir=args.local_cache_dir,
         reuse_local_cache_manifest=args.reuse_local_cache_manifest,
         views_per_sample=args.views_per_sample,
+        gpu_aug_batch_chunk_size=int(args.gpu_aug_batch_chunk_size),
         resize_max_side=resolved_resize_max_side,
         max_rotation_degrees=args.max_rotation_degrees,
         noise_std_max=args.noise_std_max,
@@ -639,7 +660,9 @@ def _coerce_aug(value) -> AugmentationConfig:
     if isinstance(value, AugmentationConfig):
         return replace(value)
     if isinstance(value, dict):
-        return AugmentationConfig(**value)
+        allowed_keys = set(AugmentationConfig.__dataclass_fields__.keys())
+        filtered = {key: aug_value for key, aug_value in value.items() if key in allowed_keys}
+        return AugmentationConfig(**filtered)
     raise TypeError("Augmentation config must be AugmentationConfig or dict")
 
 
@@ -1003,6 +1026,7 @@ def save_checkpoint(
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     ema_model: Optional[HybridNGIML] = None,
     use_ema_for_model_state: bool = False,
+    training_state: Optional[dict] = None,
 ) -> None:
     model_state = ema_model.state_dict() if (use_ema_for_model_state and ema_model is not None) else model.state_dict()
     ckpt = Checkpoint(
@@ -1015,6 +1039,7 @@ def save_checkpoint(
         scheduler_state=scheduler.state_dict() if scheduler is not None else None,
         scaler_state=scaler.state_dict() if scaler.is_enabled() else None,
         train_config=asdict(cfg),
+        training_state=training_state,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(ckpt.__dict__, path)
@@ -1087,7 +1112,7 @@ def load_checkpoint(
     device: torch.device,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     ema_model: Optional[HybridNGIML] = None,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, dict]:
     # Attempt to load the requested checkpoint; if it's corrupt/unreadable,
     # try earlier "checkpoint_epoch_*.pt" files in the same directory as fallbacks.
     original_exc: Exception | None = None
@@ -1163,7 +1188,11 @@ def load_checkpoint(
         # If global_step missing, try to infer from filename or leave as 0.
         pass
 
-    return start_epoch, global_step
+    training_state = data.get("training_state")
+    if not isinstance(training_state, dict):
+        training_state = {}
+
+    return start_epoch, global_step, training_state
 
 
 def _checkpoint_epoch(path: Path) -> int:
@@ -1224,6 +1253,23 @@ def _initial_best_for_monitor(monitor: str) -> float:
     return float("-inf")
 
 
+def _format_status_flags(flags: Sequence[str]) -> str:
+    compact = [str(flag).strip() for flag in flags if str(flag).strip()]
+    return " | ".join(compact) if compact else "none"
+
+
+def _should_chunk_gpu_aug(group_size: int, chunk_size: int) -> bool:
+    if int(chunk_size) <= 0:
+        return False
+    return int(chunk_size) < int(group_size)
+
+
+def _resolve_gpu_aug_chunk_size(group_size: int, chunk_size: int) -> int:
+    if int(chunk_size) <= 0:
+        return int(group_size)
+    return max(1, int(chunk_size))
+
+
 def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
     for module_name in ("efficientnet", "swin"):
         module = getattr(model, module_name, None)
@@ -1231,6 +1277,79 @@ def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
             continue
         for param in module.parameters():
             param.requires_grad = bool(trainable)
+
+
+def _backbone_trainable_groups(module: nn.Module) -> list[nn.Module]:
+    """Return progressively-unfreezable groups for a backbone wrapper."""
+    if hasattr(module, "backbone"):
+        backbone = getattr(module, "backbone")
+        blocks = getattr(backbone, "blocks", None)
+        if isinstance(blocks, (list, nn.ModuleList)) and len(blocks) > 0:
+            groups: list[nn.Module] = []
+            stem_modules = [
+                child
+                for name, child in backbone.named_children()
+                if name != "blocks"
+            ]
+            if stem_modules:
+                groups.append(nn.ModuleList(stem_modules))
+            groups.extend(list(blocks))
+            return groups
+    stages = getattr(module, "stages", None)
+    if isinstance(stages, (list, nn.ModuleList)) and len(stages) > 0:
+        groups = []
+        patch_embed = getattr(module, "patch_embed", None)
+        if isinstance(patch_embed, nn.Module):
+            groups.append(patch_embed)
+        groups.extend(list(stages))
+        return groups
+    return [module]
+
+
+def _set_backbone_trainability_for_epoch(
+    model: HybridNGIML,
+    epoch: int,
+    freeze_backbone_epochs: int,
+    progressive_unfreeze_epochs: int = 3,
+) -> str:
+    """Apply a smoother staged backbone unfreeze schedule and describe it."""
+    progressive_unfreeze_epochs = max(1, int(progressive_unfreeze_epochs))
+    if epoch < freeze_backbone_epochs:
+        _set_backbone_trainable(model, trainable=False)
+        return "frozen"
+
+    groups_by_backbone: list[tuple[str, list[nn.Module]]] = []
+    total_groups = 0
+    for module_name in ("efficientnet", "swin"):
+        module = getattr(model, module_name, None)
+        if module is None:
+            continue
+        groups = _backbone_trainable_groups(module)
+        groups_by_backbone.append((module_name, groups))
+        total_groups += len(groups)
+
+    if total_groups == 0:
+        return "all-trainable"
+
+    for _, groups in groups_by_backbone:
+        for group in groups:
+            for param in group.parameters():
+                param.requires_grad = False
+
+    unfreeze_progress = min(epoch - freeze_backbone_epochs + 1, progressive_unfreeze_epochs)
+    progress_ratio = float(unfreeze_progress) / float(progressive_unfreeze_epochs)
+
+    trainable_groups = 0
+    for _, groups in groups_by_backbone:
+        groups_to_enable = max(1, math.ceil(len(groups) * progress_ratio))
+        for group in groups[-groups_to_enable:]:
+            for param in group.parameters():
+                param.requires_grad = True
+        trainable_groups += groups_to_enable
+
+    if trainable_groups >= total_groups:
+        return "all-trainable"
+    return f"progressive {trainable_groups}/{total_groups}"
 
 
 def _sample_has_mask(record) -> bool:
@@ -1501,6 +1620,81 @@ def _is_cudnn_engine_error(exc: RuntimeError) -> bool:
     )
 
 
+def _is_cuda_oom_error(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    return (
+        "cuda out of memory" in msg
+        or "cublas_status_alloc_failed" in msg
+        or "cuda error: out of memory" in msg
+    )
+
+
+def _build_cuda_memory_safe_cfg(cfg: TrainConfig) -> TrainConfig:
+    safe_resize = int(cfg.resize_max_side)
+    if safe_resize <= 0 or safe_resize > 448:
+        safe_resize = 448
+
+    default_aug = None
+    if cfg.default_aug is not None:
+        aug_cfg = _coerce_aug(cfg.default_aug)
+        default_aug = replace(
+            aug_cfg,
+            views_per_sample=1,
+            enable_rotations=False,
+            enable_random_crop=False,
+            enable_elastic=False,
+        )
+
+    per_dataset_aug = None
+    if cfg.per_dataset_aug:
+        per_dataset_aug = {}
+        for name, aug in cfg.per_dataset_aug.items():
+            aug_cfg = _coerce_aug(aug)
+            per_dataset_aug[name] = replace(
+                aug_cfg,
+                views_per_sample=1,
+                enable_rotations=False,
+                enable_random_crop=False,
+                enable_elastic=False,
+            )
+
+    return replace(
+        cfg,
+        amp=True,
+        precision="fp16",
+        ema_enabled=False,
+        views_per_sample=1,
+        gpu_aug_batch_chunk_size=1,
+        resize_max_side=safe_resize,
+        default_aug=default_aug,
+        per_dataset_aug=per_dataset_aug,
+    )
+
+
+def _build_cuda_runtime_safe_cfg(cfg: TrainConfig) -> TrainConfig:
+    return replace(
+        cfg,
+        channels_last=False,
+        compile_model=False,
+        flash_attention=False,
+        xformers=False,
+        amp=True,
+        precision="fp16",
+    )
+
+
+def _should_disable_compile_for_device(cfg: TrainConfig, device: torch.device) -> bool:
+    if not bool(getattr(cfg, "compile_model", False)):
+        return False
+    if device.type != "cuda":
+        return False
+    try:
+        total_memory = int(torch.cuda.get_device_properties(device).total_memory)
+    except Exception:
+        return False
+    return total_memory <= (16 * 1024**3)
+
+
 def _write_best_threshold_metadata(
     path: Path,
     *,
@@ -1706,51 +1900,6 @@ def train_one_epoch(
     normalization_mode: Optional[str] = None,
 ):
     model.train()
-    # --- Staged freezing/unfreezing for resume-based fine-tuning ---
-    is_finetune = bool(getattr(cfg, "resume", None))
-
-    if is_finetune:
-        freeze_backbone_epochs = getattr(getattr(cfg, 'model_config', None), 'optimizer', None)
-        if freeze_backbone_epochs is not None:
-            freeze_backbone_epochs = getattr(freeze_backbone_epochs, 'freeze_backbone_epochs', 3)
-        else:
-            freeze_backbone_epochs = 3
-
-        def set_backbone_blocks_trainable(model, epoch):
-            # Freeze all backbone layers for first N epochs
-            if epoch < freeze_backbone_epochs:
-                for module_name in ("efficientnet", "swin"):
-                    module = getattr(model, module_name, None)
-                    if module is not None:
-                        for param in module.parameters():
-                            param.requires_grad = False
-            # Gradually unfreeze only the last block of each backbone after freeze_backbone_epochs
-            elif freeze_backbone_epochs <= epoch < 11:
-                for module_name in ("efficientnet", "swin"):
-                    module = getattr(model, module_name, None)
-                    if module is not None:
-                        if hasattr(module, 'blocks') and isinstance(module.blocks, (list, nn.ModuleList)):
-                            for i, block in enumerate(module.blocks):
-                                requires_grad = (i == len(module.blocks) - 1)
-                                for param in block.parameters():
-                                    param.requires_grad = requires_grad
-                        else:
-                            for param in module.parameters():
-                                param.requires_grad = True
-            else:
-                for module_name in ("efficientnet", "swin"):
-                    module = getattr(model, module_name, None)
-                    if module is not None:
-                        if hasattr(module, 'blocks') and isinstance(module.blocks, (list, nn.ModuleList)):
-                            for i, block in enumerate(module.blocks):
-                                requires_grad = (i == len(module.blocks) - 1)
-                                for param in block.parameters():
-                                    param.requires_grad = requires_grad
-                        else:
-                            for param in module.parameters():
-                                param.requires_grad = False
-
-        set_backbone_blocks_trainable(model, epoch)
     running_loss = 0.0
     num_batches = 0
     sampled_pos = 0.0
@@ -1866,31 +2015,62 @@ def train_one_epoch(
                             images[idxs] = images[idxs]
                         continue
 
-                    # Slice the batch and apply batched augmentations
-                    img_slice = images[idxs]
-                    mask_slice = masks[idxs]
-                    hp_slice = None
-                    if residual_noise is not None:
-                        hp_slice = residual_noise[idxs]
-
-                    img_out, mask_out, hp_out = _apply_gpu_augmentations_batch(
-                        img_slice,
-                        mask_slice,
-                        aug_cfg,
-                        residual_noise=hp_slice,
-                        generator=gen,
+                    aug_chunk = _resolve_gpu_aug_chunk_size(
+                        len(idxs),
+                        int(getattr(cfg, "gpu_aug_batch_chunk_size", 0)),
                     )
+                    use_chunking = _should_chunk_gpu_aug(len(idxs), aug_chunk)
 
-                    # Apply normalization to the augmented slice
-                    if normalization_mode == "imagenet":
-                        mean = imagenet_mean.view(1, 3, 1, 1)
-                        std = imagenet_std.view(1, 3, 1, 1)
-                        img_out = (img_out - mean) / std
+                    if not use_chunking:
+                        img_slice = images[idxs]
+                        mask_slice = masks[idxs]
+                        hp_slice = None
+                        if residual_noise is not None:
+                            hp_slice = residual_noise[idxs]
 
-                    images[idxs] = img_out
-                    masks[idxs] = mask_out
-                    if hp_out is not None and residual_noise is not None:
-                        residual_noise[idxs] = hp_out
+                        img_out, mask_out, hp_out = _apply_gpu_augmentations_batch(
+                            img_slice,
+                            mask_slice,
+                            aug_cfg,
+                            residual_noise=hp_slice,
+                            generator=gen,
+                        )
+
+                        if normalization_mode == "imagenet":
+                            mean = imagenet_mean.view(1, 3, 1, 1)
+                            std = imagenet_std.view(1, 3, 1, 1)
+                            img_out = (img_out - mean) / std
+
+                        images[idxs] = img_out
+                        masks[idxs] = mask_out
+                        if hp_out is not None and residual_noise is not None:
+                            residual_noise[idxs] = hp_out
+                    else:
+                        for chunk_start in range(0, len(idxs), aug_chunk):
+                            chunk_idxs = idxs[chunk_start : chunk_start + aug_chunk]
+                            img_slice = images[chunk_idxs]
+                            mask_slice = masks[chunk_idxs]
+                            hp_slice = None
+                            if residual_noise is not None:
+                                hp_slice = residual_noise[chunk_idxs]
+
+                            img_out, mask_out, hp_out = _apply_gpu_augmentations_batch(
+                                img_slice,
+                                mask_slice,
+                                aug_cfg,
+                                residual_noise=hp_slice,
+                                generator=gen,
+                            )
+
+                            if normalization_mode == "imagenet":
+                                mean = imagenet_mean.view(1, 3, 1, 1)
+                                std = imagenet_std.view(1, 3, 1, 1)
+                                img_out = (img_out - mean) / std
+
+                            images[chunk_idxs] = img_out
+                            masks[chunk_idxs] = mask_out
+                            if hp_out is not None and residual_noise is not None:
+                                residual_noise[chunk_idxs] = hp_out
             aug_end = time.perf_counter()
         else:
             aug_end = None
@@ -2189,6 +2369,16 @@ def run_training(cfg: TrainConfig) -> None:
     device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
     cfg = _resolve_cuda_runtime_stability(cfg, device)
+    if _should_disable_compile_for_device(cfg, device):
+        try:
+            total_gib = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+        except Exception:
+            total_gib = 0.0
+        cfg = replace(cfg, compile_model=False)
+        print(
+            "torch.compile disabled on this CUDA device to avoid long warmup and high host RAM usage | "
+            f"detected_vram={total_gib:.1f} GiB"
+        )
 
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high" if cfg.use_tf32 else "highest")
@@ -2272,7 +2462,11 @@ def run_training(cfg: TrainConfig) -> None:
         model = model.to(memory_format=torch.channels_last)
     optimizer = model.build_optimizer()
     scheduler = _build_lr_scheduler(optimizer, cfg)
-    # GradScaler is only required for fp16; bf16 on A100 benefits from native autocast without scaling.
+    # Precision fallback logic: keep T4-class GPUs on fp16 instead of forcing fp32.
+    requested_precision = str(cfg.precision).lower()
+    if requested_precision == "bf16" and device.type == "cuda" and not torch.cuda.is_bf16_supported():
+        print("[Warning] bf16 precision requested but not supported on this device. Falling back to fp16 with AMP enabled.")
+        cfg = replace(cfg, precision="fp16", amp=True)
     scaler = GradScaler(enabled=(str(cfg.precision).lower() == "fp16" and cfg.amp and device.type == "cuda"))
     ema_model = _init_ema_model(model, model_cfg, cfg.ema_enabled)
     if ema_model is not None:
@@ -2326,9 +2520,10 @@ def run_training(cfg: TrainConfig) -> None:
     checkpoint_dir = out_dir / "checkpoints"
     checkpoint_log_path = checkpoint_dir / "checkpoint_metrics.json"
 
+    restored_training_state: dict = {}
     if resume_path:
         if resume_path.is_file():
-            start_epoch, global_step = load_checkpoint(
+            start_epoch, global_step, restored_training_state = load_checkpoint(
                 resume_path,
                 model,
                 optimizer,
@@ -2371,29 +2566,42 @@ def run_training(cfg: TrainConfig) -> None:
         chosen_threshold=None,
     )
 
-    best_monitor_value = _initial_best_for_monitor(cfg.early_stopping_monitor)
-    best_val_iou = float("-inf")
-    best_val_f1 = float("-inf")
-    no_improve_epochs = 0
+    best_monitor_value = float(
+        restored_training_state.get(
+            "best_monitor_value",
+            _initial_best_for_monitor(cfg.early_stopping_monitor),
+        )
+    )
+    best_val_iou = float(restored_training_state.get("best_val_iou", float("-inf")))
+    best_val_f1 = float(restored_training_state.get("best_val_f1", float("-inf")))
+    no_improve_epochs = int(restored_training_state.get("no_improve_epochs", 0))
     early_stopping_enabled = "val" in loaders and cfg.early_stopping_patience > 0
     best_threshold_path = checkpoint_dir / "best_threshold.json"
 
     freeze_backbone_epochs = int(max(0, getattr(model_cfg.optimizer, "freeze_backbone_epochs", 0)))
-    backbone_was_frozen = False
+    backbone_phase: Optional[str] = None
 
     runtime_fallback_used = False
     for epoch in range(start_epoch, cfg.epochs):
-        should_freeze_backbone = epoch < freeze_backbone_epochs
-        _set_backbone_trainable(model, trainable=not should_freeze_backbone)
-        if should_freeze_backbone and not backbone_was_frozen:
-            print(
-                "Backbone freeze enabled: freezing EfficientNet/Swin "
-                f"for first {freeze_backbone_epochs} epochs"
-            )
-            backbone_was_frozen = True
-        elif (not should_freeze_backbone) and backbone_was_frozen:
-            print("Backbone freeze finished: unfreezing EfficientNet/Swin")
-            backbone_was_frozen = False
+        current_backbone_phase = _set_backbone_trainability_for_epoch(
+            model,
+            epoch=epoch,
+            freeze_backbone_epochs=freeze_backbone_epochs,
+        )
+        if current_backbone_phase != backbone_phase:
+            if current_backbone_phase == "frozen":
+                print(
+                    "Backbone freeze enabled: freezing EfficientNet/Swin "
+                    f"for first {freeze_backbone_epochs} epochs"
+                )
+            elif current_backbone_phase == "all-trainable":
+                print("Backbone freeze finished: fully unfreezing EfficientNet/Swin")
+            else:
+                print(
+                    "Backbone staged unfreeze: "
+                    f"{current_backbone_phase} backbone groups trainable"
+                )
+            backbone_phase = current_backbone_phase
 
         start_time = time.time()
         try:
@@ -2415,22 +2623,48 @@ def run_training(cfg: TrainConfig) -> None:
             if (not runtime_fallback_used) and _is_cudnn_engine_error(exc):
                 runtime_fallback_used = True
                 prev_precision = cfg.precision
-                cfg = replace(
-                    cfg,
-                    channels_last=False,
-                    compile_model=False,
-                    flash_attention=False,
-                    xformers=False,
-                    amp=True,
-                    precision="fp16",
-                )
+                prev_amp = cfg.amp
+                cfg = _build_cuda_runtime_safe_cfg(cfg)
                 model = model.to(memory_format=torch.contiguous_format)
                 if ema_model is not None:
                     ema_model = ema_model.to(memory_format=torch.contiguous_format)
-                scaler = GradScaler(enabled=(device.type == "cuda"))
+                scaler = GradScaler(enabled=(cfg.amp and str(cfg.precision).lower() == "fp16" and device.type == "cuda"))
                 print(
                     "Encountered CUDA conv engine selection error; retrying with safe settings | "
-                    f"precision {prev_precision}->fp16, amp on, channels_last off, compile off"
+                    f"precision {prev_precision}->fp16, amp {prev_amp}->{cfg.amp}, channels_last off, compile off"
+                )
+                train_loss, global_step, train_positive_ratio = train_one_epoch(
+                    model,
+                    loaders["train"],
+                    optimizer,
+                    scaler,
+                    loss_fn,
+                    device,
+                    cfg,
+                    epoch,
+                    global_step,
+                    ema_model=ema_model,
+                    per_dataset_aug=per_dataset_aug,
+                    normalization_mode=normalization_mode,
+                )
+            elif (not runtime_fallback_used) and device.type == "cuda" and _is_cuda_oom_error(exc):
+                runtime_fallback_used = True
+                prev_cfg = cfg
+                cfg = _build_cuda_memory_safe_cfg(cfg)
+
+                if ema_model is not None:
+                    del ema_model
+                    ema_model = None
+
+                torch.cuda.empty_cache()
+                loaders, per_dataset_aug, normalization_mode = _prepare_dataloaders(cfg, device)
+                print(
+                    "Encountered CUDA OOM; retrying with memory-safe settings | "
+                    f"ema {prev_cfg.ema_enabled}->{cfg.ema_enabled}, "
+                    f"views_per_sample {prev_cfg.views_per_sample}->{cfg.views_per_sample}, "
+                    f"gpu_aug_batch_chunk_size {getattr(prev_cfg, 'gpu_aug_batch_chunk_size', 1)}->{cfg.gpu_aug_batch_chunk_size}, "
+                    f"resize_max_side {prev_cfg.resize_max_side}->{cfg.resize_max_side}, "
+                    "rotations/random_crop/elastics disabled"
                 )
                 train_loss, global_step, train_positive_ratio = train_one_epoch(
                     model,
@@ -2454,13 +2688,14 @@ def run_training(cfg: TrainConfig) -> None:
             scheduler.step()
             current_lr = optimizer.param_groups[0]["lr"]
             print(
-                f"Epoch {epoch:03d} done | loss {train_loss:.4f} | "
-                f"sample_pos_ratio {train_positive_ratio:.3f} | lr {current_lr:.6e} | time {elapsed:.1f}s"
+                f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} Train | "
+                f"loss {train_loss:.4f} | pos_ratio {train_positive_ratio:.3f} | "
+                f"lr {current_lr:.6e} | time {elapsed:.1f}s"
             )
         else:
             print(
-                f"Epoch {epoch:03d} done | loss {train_loss:.4f} | "
-                f"sample_pos_ratio {train_positive_ratio:.3f} | time {elapsed:.1f}s"
+                f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} Train | "
+                f"loss {train_loss:.4f} | pos_ratio {train_positive_ratio:.3f} | time {elapsed:.1f}s"
             )
 
         val_loss = None
@@ -2471,6 +2706,7 @@ def run_training(cfg: TrainConfig) -> None:
         val_accuracy = None
         val_threshold = None
         val_size_bins = None
+        epoch_status_flags: list[str] = []
         if "val" in loaders and (epoch + 1) % cfg.val_every == 0:
             eval_model = ema_model if ema_model is not None else model
             metrics = evaluate(eval_model, loaders["val"], loss_fn, device, cfg, normalization_mode=normalization_mode)
@@ -2482,18 +2718,22 @@ def run_training(cfg: TrainConfig) -> None:
             val_accuracy = float(metrics["accuracy"])
             val_threshold = float(metrics["threshold"])
             val_size_bins = metrics.get("size_bins")
+            val_summary = (
+                f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} Val   | "
+                f"loss {val_loss:.4f} | iou {val_iou:.4f} | f1 {val_f1:.4f} | "
+                f"prec {val_precision:.4f} | rec {val_recall:.4f} | acc {val_accuracy:.4f} | "
+                f"thr {val_threshold:.2f}"
+            )
             print(
-                f"Val | loss {val_loss:.4f} | iou {val_iou:.4f} | f1 {val_f1:.4f} "
-                f"| precision {val_precision:.4f} | recall {val_recall:.4f} | accuracy {val_accuracy:.4f} "
-                f"| threshold {val_threshold:.2f}"
+                val_summary
             )
             if isinstance(val_size_bins, dict):
                 small_iou = float(val_size_bins.get("small", {}).get("iou", 0.0))
                 medium_iou = float(val_size_bins.get("medium", {}).get("iou", 0.0))
                 large_iou = float(val_size_bins.get("large", {}).get("iou", 0.0))
                 print(
-                    "Val bins | "
-                    f"small_iou {small_iou:.4f} | medium_iou {medium_iou:.4f} | large_iou {large_iou:.4f}"
+                    "               bins | "
+                    f"small {small_iou:.4f} | medium {medium_iou:.4f} | large {large_iou:.4f}"
                 )
 
             iou_improved = val_iou > (best_val_iou + cfg.early_stopping_min_delta)
@@ -2517,11 +2757,14 @@ def run_training(cfg: TrainConfig) -> None:
                     scheduler=scheduler,
                     ema_model=ema_model,
                     use_ema_for_model_state=(ema_model is not None),
+                    training_state={
+                        "best_monitor_value": best_monitor_value,
+                        "best_val_iou": best_val_iou,
+                        "best_val_f1": best_val_f1,
+                        "no_improve_epochs": no_improve_epochs,
+                    },
                 )
-                print(
-                    f"New best overlap metrics | iou {best_val_iou:.4f} | f1 {best_val_f1:.4f}; "
-                    f"saved to {best_f1_iou_path}"
-                )
+                epoch_status_flags.append(f"best-overlap -> {best_f1_iou_path.name}")
 
             # Use the configured early-stopping monitor to determine when to reset patience
             monitor_value = _metric_for_monitor(metrics, cfg.early_stopping_monitor)
@@ -2547,6 +2790,12 @@ def run_training(cfg: TrainConfig) -> None:
                     scheduler=scheduler,
                     ema_model=ema_model,
                     use_ema_for_model_state=(ema_model is not None),
+                    training_state={
+                        "best_monitor_value": best_monitor_value,
+                        "best_val_iou": best_val_iou,
+                        "best_val_f1": best_val_f1,
+                        "no_improve_epochs": no_improve_epochs,
+                    },
                 )
                 best_threshold_payload = _write_best_threshold_metadata(
                     best_threshold_path,
@@ -2569,23 +2818,21 @@ def run_training(cfg: TrainConfig) -> None:
                         "best_val_iou": best_threshold_payload["val_iou"],
                     },
                 )
-                print(
-                    f"New best {monitor_for_metadata} {monitor_value_for_metadata:.4f}; "
-                    f"saved to {best_alias_path} (threshold metadata: {best_threshold_path})"
+                epoch_status_flags.append(
+                    f"best-{monitor_for_metadata} {monitor_value_for_metadata:.4f} -> {best_alias_path.name}"
                 )
 
             if monitor_improved:
                 # Update recorded bests and reset patience
                 best_monitor_value = monitor_value
                 no_improve_epochs = 0
-                print(f"New best {cfg.early_stopping_monitor} {monitor_value:.4f}")
+                epoch_status_flags.append(f"monitor improved ({cfg.early_stopping_monitor}={monitor_value:.4f})")
             else:
                 # Update monitor-based counter
                 if early_stopping_enabled:
                     no_improve_epochs += 1
-                    print(
-                        f"Early stopping patience: {no_improve_epochs}/{cfg.early_stopping_patience} "
-                        f"without {cfg.early_stopping_monitor} improvement"
+                    epoch_status_flags.append(
+                        f"patience {no_improve_epochs}/{cfg.early_stopping_patience}"
                     )
 
         should_checkpoint = ((epoch + 1) % cfg.checkpoint_every == 0) or (epoch + 1 == cfg.epochs)
@@ -2602,6 +2849,12 @@ def run_training(cfg: TrainConfig) -> None:
                 scheduler=scheduler,
                 ema_model=ema_model,
                 use_ema_for_model_state=False,
+                training_state={
+                    "best_monitor_value": best_monitor_value,
+                    "best_val_iou": best_val_iou,
+                    "best_val_f1": best_val_f1,
+                    "no_improve_epochs": no_improve_epochs,
+                },
             )
             append_checkpoint_log(
                 checkpoint_log_path,
@@ -2622,7 +2875,10 @@ def run_training(cfg: TrainConfig) -> None:
                     "checkpoint_path": str(ckpt_path),
                 },
             )
-            print(f"Saved checkpoint to {ckpt_path}")
+            epoch_status_flags.append(f"checkpoint {ckpt_path.name}")
+
+        if epoch_status_flags:
+            print(f"               status | {_format_status_flags(epoch_status_flags)}")
 
         if early_stopping_enabled and "val" in loaders and (epoch + 1) % cfg.val_every == 0:
             if no_improve_epochs >= cfg.early_stopping_patience:

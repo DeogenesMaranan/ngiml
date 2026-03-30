@@ -9,9 +9,13 @@ from collections import Counter
 from pathlib import Path
 from typing import Sequence
 
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 import numpy as np
 import pandas as pd
+from PIL import Image
 import torch
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
@@ -29,7 +33,14 @@ from src.data.dataloaders import (
 )
 from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
-from tools.train_ngiml import build_default_components
+from tools.train_ngiml import _coerce_model_config, build_default_components
+
+
+def _require_matplotlib() -> None:
+    if plt is None:
+        raise ImportError(
+            "matplotlib is required for plotting helpers but is not installed in this environment."
+        )
 
 def _to_chw_rgb(image_np: np.ndarray) -> np.ndarray:
     if image_np.ndim == 2:
@@ -72,6 +83,124 @@ def _parse_meta(raw) -> dict:
         except Exception:
             return {'metadata_raw': raw}
     return raw if isinstance(raw, dict) else {'metadata_raw': str(raw)}
+
+
+def _coerce_hw(value, fallback_hw: tuple[int, int]) -> tuple[int, int]:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        try:
+            h = int(value[0])
+            w = int(value[1])
+            if h > 0 and w > 0:
+                return h, w
+        except Exception:
+            pass
+    return fallback_hw
+
+
+def _resize_array_hw(arr: np.ndarray, target_hw: tuple[int, int], *, mode: str) -> np.ndarray:
+    tensor = torch.from_numpy(np.asarray(arr)).float()
+    squeeze = False
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(0).unsqueeze(0)
+        squeeze = True
+    elif tensor.ndim == 3:
+        tensor = tensor.unsqueeze(0)
+    else:
+        raise ValueError(f"Unsupported array rank for resize: {tensor.ndim}")
+
+    interpolation = "nearest" if mode == "nearest" else "bilinear"
+    if interpolation == "nearest":
+        resized = F.interpolate(tensor, size=list(target_hw), mode=interpolation)
+    else:
+        resized = F.interpolate(tensor, size=list(target_hw), mode=interpolation, align_corners=False)
+
+    resized = resized.squeeze(0).cpu().numpy()
+    if squeeze:
+        resized = resized[0]
+    return resized
+
+
+def _restore_processed_array_to_original(
+    arr: np.ndarray,
+    meta: dict,
+    original_hw: tuple[int, int],
+    *,
+    mode: str,
+) -> np.ndarray:
+    source = np.asarray(arr)
+    if source.ndim != 2:
+        raise ValueError(f"Expected 2D array for restore, got shape {source.shape}")
+
+    processed_h, processed_w = int(source.shape[0]), int(source.shape[1])
+    orig_h, orig_w = original_hw
+    preproc_mode = str(meta.get("preproc_mode", "")).strip().lower()
+
+    if preproc_mode == "pad":
+        top = max(0, (processed_h - orig_h) // 2)
+        left = max(0, (processed_w - orig_w) // 2)
+        return source[top:top + orig_h, left:left + orig_w]
+
+    if preproc_mode == "resize_then_pad":
+        long_side = max(orig_h, orig_w)
+        if long_side <= 0:
+            return source
+        size = max(processed_h, processed_w)
+        scale = float(size) / float(long_side)
+        resized_h = max(1, int(round(orig_h * scale)))
+        resized_w = max(1, int(round(orig_w * scale)))
+        top = max(0, (processed_h - resized_h) // 2)
+        left = max(0, (processed_w - resized_w) // 2)
+        cropped = source[top:top + resized_h, left:left + resized_w]
+        return _resize_array_hw(cropped, original_hw, mode=mode)
+
+    if preproc_mode == "resize":
+        return _resize_array_hw(source, original_hw, mode=mode)
+
+    if (processed_h, processed_w) == original_hw:
+        return source
+    return _resize_array_hw(source, original_hw, mode=mode)
+
+
+def _load_original_mask_from_path(mask_path: str | None, original_hw: tuple[int, int]) -> np.ndarray | None:
+    if not mask_path:
+        return None
+    path = Path(mask_path)
+    if not path.exists():
+        return None
+    mask = Image.open(path).convert("L")
+    mask_np = (np.asarray(mask, dtype=np.uint8) > 127).astype(np.uint8)
+    if mask_np.shape != original_hw:
+        mask_np = _resize_array_hw(mask_np, original_hw, mode="nearest")
+        mask_np = (mask_np > 0.5).astype(np.uint8)
+    return mask_np
+
+
+def _original_space_ground_truth(mask_hw: np.ndarray, meta: dict) -> np.ndarray:
+    original_hw = _coerce_hw(meta.get("original_size_hw"), tuple(mask_hw.shape))
+    if bool(meta.get("mask_is_all_zero", False)):
+        return np.zeros(original_hw, dtype=np.uint8)
+    original_mask = _load_original_mask_from_path(meta.get("original_mask_path"), original_hw)
+    if original_mask is not None:
+        return original_mask.astype(np.uint8)
+    restored = _restore_processed_array_to_original(mask_hw.astype(np.float32), meta, original_hw, mode="nearest")
+    return (restored > 0.5).astype(np.uint8)
+
+
+def _original_space_probability(prob_hw: np.ndarray, meta: dict) -> np.ndarray:
+    original_hw = _coerce_hw(meta.get("original_size_hw"), tuple(prob_hw.shape))
+    restored = _restore_processed_array_to_original(prob_hw.astype(np.float32), meta, original_hw, mode="bilinear")
+    return np.clip(restored, 0.0, 1.0).astype(np.float32)
+
+
+def _original_space_image(image_chw: np.ndarray, meta: dict) -> np.ndarray:
+    image_hwc = np.transpose(np.asarray(image_chw), (1, 2, 0)).astype(np.float32)
+    original_hw = _coerce_hw(meta.get("original_size_hw"), tuple(image_hwc.shape[:2]))
+    restored_channels = [
+        _restore_processed_array_to_original(image_hwc[..., ch], meta, original_hw, mode="bilinear")
+        for ch in range(image_hwc.shape[-1])
+    ]
+    restored_hwc = np.stack(restored_channels, axis=-1)
+    return np.transpose(np.clip(restored_hwc, 0.0, 255.0), (2, 0, 1))
 
 def _dataset_name(sample_uri: str, meta: dict) -> str:
     for k in ('dataset', 'dataset_name', 'source_dataset'):
@@ -134,6 +263,7 @@ def compute_binary_metrics(
     return {'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn, 'precision': precision, 'recall': recall, 'f1': f1, 'iou': iou, 'accuracy': acc}
 
 def save_sample_plot(out_path: Path, image_chw: np.ndarray, gt_hw: np.ndarray, prob_hw: np.ndarray, bin05_hw: np.ndarray, title: str):
+    _require_matplotlib()
     img = np.transpose(image_chw, (1, 2, 0)).astype(np.float32)
     if img.max() > 1.0:
         img = img / 255.0
@@ -202,18 +332,20 @@ def _append_prepared_inference_result(
     normalization_mode: str,
     max_plot_samples_per_dataset: int,
 ) -> None:
-    prob_hw = prob.detach().cpu().numpy().astype(np.float32)
+    prob_hw = _original_space_probability(prob.detach().cpu().numpy().astype(np.float32), sample["meta"])
+    gt_hw = _original_space_ground_truth(sample["mask_hw"], sample["meta"])
     pred_bin_metric = (prob_hw >= float(threshold_for_metrics)).astype(np.uint8)
     pred_bin_plot = (prob_hw >= float(plot_binary_threshold)).astype(np.uint8)
-    metrics = compute_binary_metrics(pred_bin_metric, sample["mask_hw"], empty_score_mode="strict")
-    legacy_metrics = compute_binary_metrics(pred_bin_metric, sample["mask_hw"], empty_score_mode="legacy")
+    metrics = compute_binary_metrics(pred_bin_metric, gt_hw, empty_score_mode="strict")
+    legacy_metrics = compute_binary_metrics(pred_bin_metric, gt_hw, empty_score_mode="legacy")
 
     meta = sample["meta"]
-    raw_label = meta.get("label", int(sample["mask_hw"].max() > 0))
+    raw_label = meta.get("label", int(gt_hw.max() > 0))
     if isinstance(raw_label, str):
         sample_label = 1 if raw_label.strip().lower() in {"1", "fake", "tp", "tampered", "manipulated"} else 0
     else:
         sample_label = int(raw_label)
+    original_h, original_w = _coerce_hw(meta.get("original_size_hw"), (int(sample["height"]), int(sample["width"])))
 
     row = {
         "dataset": sample["dataset"],
@@ -224,13 +356,13 @@ def _append_prepared_inference_result(
         "normalization_mode": normalization_mode,
         "threshold_for_metrics": float(threshold_for_metrics),
         "plot_binary_threshold": float(plot_binary_threshold),
-        "height": int(sample["height"]),
-        "width": int(sample["width"]),
+        "height": int(original_h),
+        "width": int(original_w),
         "mean_probability": float(prob_hw.mean()),
         "max_probability": float(prob_hw.max()),
         "pred_positive_ratio_threshold": float(pred_bin_metric.mean()),
         "pred_positive_ratio_0_5": float(pred_bin_plot.mean()),
-        "gt_positive_ratio": float(sample["mask_hw"].mean()),
+        "gt_positive_ratio": float(gt_hw.mean()),
         "legacy_f1": float(legacy_metrics["f1"]),
         "legacy_iou": float(legacy_metrics["iou"]),
     }
@@ -246,8 +378,8 @@ def _append_prepared_inference_result(
     dataset_plots.append(
         {
             "sample_uri": sample["sample_uri"],
-            "image_chw": sample["image_chw"],
-            "mask_hw": sample["mask_hw"],
+            "image_chw": _original_space_image(sample["image_chw"], meta),
+            "mask_hw": gt_hw,
             "prob_hw": prob_hw,
             "bin05_hw": pred_bin_plot,
         }
@@ -601,46 +733,7 @@ def _build_model_config_from_checkpoint(checkpoint: dict) -> tuple[object, str]:
     model_config = train_config.get("model_config") if isinstance(train_config, dict) else None
 
     if isinstance(model_config, dict):
-        fusion_cfg = model_config.get("fusion")
-        if isinstance(fusion_cfg, dict):
-            fusion_channels = fusion_cfg.get("fusion_channels")
-            if isinstance(fusion_channels, (list, tuple)) and fusion_channels:
-                model_cfg.fusion.fusion_channels = tuple(int(value) for value in fusion_channels)
-            for attr in ("noise_branch", "noise_skip_stage", "noise_decay", "norm", "activation", "fusion_refinement"):
-                if attr in fusion_cfg and hasattr(model_cfg.fusion, attr):
-                    setattr(model_cfg.fusion, attr, fusion_cfg[attr])
-
-        decoder_cfg = model_config.get("decoder")
-        if isinstance(decoder_cfg, dict):
-            for attr in (
-                "decoder_channels",
-                "out_channels",
-                "norm",
-                "activation",
-                "per_stage_heads",
-                "enable_edge_guidance",
-                "use_dropout",
-                "dropout_p",
-                "enable_boundary_refinement",
-                "boundary_refine_channels",
-                "boundary_refine_scale",
-            ):
-                if attr in decoder_cfg and hasattr(model_cfg.decoder, attr):
-                    setattr(model_cfg.decoder, attr, decoder_cfg[attr])
-
-        for attr in (
-            "use_low_level",
-            "use_context",
-            "use_residual",
-            "enable_residual_attention",
-            "gradient_checkpointing",
-            "flash_attention",
-            "xformers",
-        ):
-            if attr in model_config and hasattr(model_cfg, attr):
-                setattr(model_cfg, attr, model_config[attr])
-
-        return model_cfg, "train_config.model_config"
+        return _coerce_model_config(model_config), "train_config.model_config"
 
     inferred_channels = _infer_fusion_channels_from_state_dict(checkpoint.get("model_state", {}))
     if inferred_channels:
@@ -663,6 +756,36 @@ def _disable_pretrained_backbones(model_cfg: object) -> object:
     except Exception:
         pass
     return model_cfg
+
+
+def _normalize_profile_input_size(value: object) -> int | None:
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, (tuple, list)) and value:
+        try:
+            if len(value) >= 2:
+                return int(max(value[-2], value[-1]))
+            return int(value[0])
+        except Exception:
+            return None
+    return None
+
+
+def _resolve_checkpoint_profile_input_size(train_config: dict, model_cfg: object) -> tuple[int, str]:
+    train_value = _normalize_profile_input_size(train_config.get("input_size"))
+    if train_value is not None:
+        return train_value, "train_config.input_size"
+
+    cfg_candidates = [
+        getattr(getattr(model_cfg, "swin", None), "input_size", None),
+        getattr(getattr(model_cfg, "efficientnet", None), "input_size", None),
+    ]
+    for candidate in cfg_candidates:
+        resolved = _normalize_profile_input_size(candidate)
+        if resolved is not None:
+            return resolved, "model_config"
+
+    return 448, "default"
 
 
 def _select_output_head(outputs: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -742,13 +865,14 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
     checkpoint_epoch = int(checkpoint.get("epoch", -1))
     model_cfg, config_source = _build_model_config_from_checkpoint(checkpoint)
     model_cfg = _disable_pretrained_backbones(model_cfg)
-    model = HybridNGIML(model_cfg).to(device)
+    model = HybridNGIML(model_cfg)
 
     missing, unexpected, skipped_mismatched = _load_state_dict_with_fallback(model, checkpoint["model_state"])
+    model = model.to(device)
     model.eval()
     resolved_threshold, threshold_source = resolve_threshold_for_checkpoint(
         Path(checkpoint_path),
@@ -757,6 +881,7 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
     )
 
     train_config = checkpoint.get("train_config") or {}
+    profile_input_size, profile_input_size_source = _resolve_checkpoint_profile_input_size(train_config, model_cfg)
 
     has_train_resize_max_side = "resize_max_side" in train_config
     autocast_dtype, autocast_source = _resolve_checkpoint_autocast_dtype(train_config, device)
@@ -770,7 +895,8 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device | Non
         "fusion_channels": tuple(int(value) for value in model.cfg.fusion.fusion_channels),
         "default_threshold": float(resolved_threshold),
         "threshold_source": str(threshold_source),
-        "input_size": int(train_config.get("input_size", 448) or 448),
+        "input_size": int(profile_input_size),
+        "input_size_source": str(profile_input_size_source),
         "resize_max_side": int(train_config.get("resize_max_side", 0) or 0),
         "resize_max_side_source": "train_config" if has_train_resize_max_side else "default",
         "runtime_precision": precision_raw,
@@ -1355,7 +1481,7 @@ def list_epoch_checkpoints(checkpoint_dir: str | Path) -> list[Path]:
 def sweep_checkpoint_inference_for_image(
     checkpoint_dir: str | Path,
     image: torch.Tensor,
-    normalization_mode: str = "imagenet",
+    normalization_mode: str | None = "imagenet",
     strategy: str = "direct",
     threshold: float | None = None,
     infer_size: int = 448,
@@ -1394,11 +1520,16 @@ def sweep_checkpoint_inference_for_image(
 
     for checkpoint_path in iterator:
         model, device, ckpt_info = load_model_from_checkpoint(checkpoint_path)
+        resolved_normalization = resolve_normalization_mode_for_inference(
+            manual_mode=normalization_mode,
+            checkpoint_path=checkpoint_path,
+            default_mode="imagenet",
+        )
         run = run_multi_strategy_inference(
             model=model,
             image=image,
             device=device,
-            normalization_mode=normalization_mode,
+            normalization_mode=resolved_normalization,
             threshold=threshold,
             infer_size=infer_size,
             tile_size=tile_size,
@@ -1416,7 +1547,7 @@ def sweep_checkpoint_inference_for_image(
                 "checkpoint_epoch_from_name": _epoch_from_checkpoint_name(checkpoint_path),
                 "checkpoint_epoch_from_state": ckpt_info.get("epoch"),
                 "strategy": strategy_key,
-                "normalization_mode": normalization_mode,
+                "normalization_mode": resolved_normalization,
                 "threshold_used": float(run["threshold"]),
                 "mean_probability": float(summary["mean_probability"]),
                 "max_probability": float(summary["max_probability"]),
@@ -1602,41 +1733,41 @@ def get_model_complexity_stats(
     profile_model.eval()
     try:
         try:
-            with torch.no_grad():
-                analysis = _build_flop_analysis(profile_model, sample)
-                total_flops = float(analysis.total())
-                unsupported_ops = {str(name): int(count) for name, count in analysis.unsupported_ops().items()}
-            stats["flops"] = total_flops
-            stats["macs"] = total_flops / 2.0
-            stats["unsupported_ops"] = unsupported_ops
-            stats["flops_source"] = "fvcore+custom_op_handles"
-            stats["flops_error"] = (
-                None
-                if not unsupported_ops
-                else "FLOPs include custom op-handle estimates; unsupported ops remain in `unsupported_ops`."
-            )
-        except Exception as fv_error:
-            try:
-                from thop import profile as thop_profile
+            from thop import profile as thop_profile
 
+            with torch.no_grad():
+                macs, _ = thop_profile(profile_model, inputs=(sample,), verbose=False)
+            macs = float(macs)
+            stats["macs"] = macs
+            stats["flops"] = macs * 2.0
+            stats["unsupported_ops"] = None
+            stats["flops_source"] = "thop"
+            stats["flops_error"] = None
+        except Exception as thop_error:
+            try:
                 with torch.no_grad():
-                    macs, _ = thop_profile(profile_model, inputs=(sample,), verbose=False)
-                macs = float(macs)
-                stats["macs"] = macs
-                stats["flops"] = macs * 2.0
-                stats["unsupported_ops"] = None
-                stats["flops_source"] = "thop"
-                stats["flops_error"] = f"fvcore unavailable ({fv_error}); used thop fallback"
-            except Exception as thop_error:
+                    analysis = _build_flop_analysis(profile_model, sample)
+                    total_flops = float(analysis.total())
+                    unsupported_ops = {str(name): int(count) for name, count in analysis.unsupported_ops().items()}
+                stats["flops"] = total_flops
+                stats["macs"] = total_flops / 2.0
+                stats["unsupported_ops"] = unsupported_ops
+                stats["flops_source"] = "fvcore+custom_op_handles"
+                stats["flops_error"] = (
+                    None
+                    if not unsupported_ops
+                    else "THOP unavailable; fvcore fallback may undercount unsupported ops listed in `unsupported_ops`."
+                )
+            except Exception as fv_error:
                 stats["flops"] = None
                 stats["macs"] = None
                 stats["unsupported_ops"] = None
                 stats["flops_source"] = None
                 stats["flops_error"] = (
                     "FLOPs unavailable. "
-                    f"fvcore error: {fv_error}. "
                     f"thop error: {thop_error}. "
-                    "Try `%pip install fvcore iopath` (or `%pip install thop`) in the active notebook kernel."
+                    f"fvcore error: {fv_error}. "
+                    "Try `%pip install thop` (or `%pip install fvcore iopath`) in the active notebook kernel."
                 )
     finally:
         model.train(was_training)

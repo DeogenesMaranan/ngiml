@@ -319,18 +319,11 @@ def prepare_single_dataset(
             f"prepare_datasets expects exactly one target size, got {target_sizes}"
         )
     crop_size = target_sizes[0]
-    tiny_threshold = max(1, crop_size // 2)
 
     records: List[SampleRecord] = []
     skipped_fake_missing_mask = 0
-    skipped_tiny_images = 0
 
     for real_img in tqdm(real_images, desc=f"{cfg.dataset_name} real", leave=False):
-        with Image.open(real_img) as real_pil:
-            w, h = real_pil.size
-        if min(w, h) < tiny_threshold:
-            skipped_tiny_images += 1
-            continue
         records.append(
             SampleRecord(
                 dataset=cfg.dataset_name,
@@ -342,11 +335,6 @@ def prepare_single_dataset(
         )
 
     for fake_img in tqdm(fake_images, desc=f"{cfg.dataset_name} fake", leave=False):
-        with Image.open(fake_img) as fake_pil:
-            w, h = fake_pil.size
-        if min(w, h) < tiny_threshold:
-            skipped_tiny_images += 1
-            continue
         mask_path = _find_mask(fake_img, mask_dir, cfg.mask_suffix)
         if mask_path is None:
             skipped_fake_missing_mask += 1
@@ -433,11 +421,6 @@ def prepare_single_dataset(
     if skipped_fake_missing_mask > 0:
         print(
             f"[{cfg.dataset_name}] Skipped fake images without masks: {skipped_fake_missing_mask}",
-            file=sys.stderr,
-        )
-    if skipped_tiny_images > 0:
-        print(
-            f"[{cfg.dataset_name}] Filtered tiny images (short side < {tiny_threshold}px): {skipped_tiny_images}",
             file=sys.stderr,
         )
     return prepared_records

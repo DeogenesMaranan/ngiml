@@ -152,6 +152,8 @@ def _load_from_npz(
             if mask.max() > 1.0:
                 mask = mask / 255.0
             mask = mask.float()
+            if mask.shape[-2:] != image.shape[-2:]:
+                mask = F.resize(mask, list(image.shape[-2:]), interpolation=InterpolationMode.NEAREST)
 
         residual_noise = _compute_residual_noise(image)
 
@@ -963,15 +965,6 @@ def _collate_impl(
 
     shapes = [img.shape for img in images]
     need_pad = any(s != images[0].shape for s in shapes)
-    if not need_pad:
-        target_h, target_w = images[0].shape[-2:]
-        need_pad = any(
-            m is None or m.shape[-2:] != (target_h, target_w)
-            for m in masks
-        )
-    if not need_pad and collect_residual_noise and residual_noisees:
-        target_h, target_w = images[0].shape[-2:]
-        need_pad = any(hp.shape[-2:] != (target_h, target_w) for hp in residual_noisees)
 
     if need_pad:
         max_c = max(s[0] for s in shapes)
@@ -995,8 +988,9 @@ def _collate_impl(
             if m is None:
                 m = torch.zeros((1, h, w), dtype=torch.float32, device=img.device)
             else:
-                m = _pad_or_crop_to_shape(m, h, w)
-            m = _pad_or_crop_to_shape(m, max_h, max_w)
+                _mc, mh, mw = m.shape
+                if (mh != max_h) or (mw != max_w):
+                    m = NN_F.pad(m, (0, max_w - mw, 0, max_h - mh), value=0)
 
             padded_images.append(img)
             padded_masks.append(m)

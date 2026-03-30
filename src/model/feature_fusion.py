@@ -43,6 +43,9 @@ class FeatureFusionConfig:
     norm: str = "bn"
     activation: str = "relu"
     fusion_refinement: bool = True  # Add Conv3x3+IN+ReLU after fusion output (enabled by default)
+    enable_joint_gating: bool = False
+    late_residual_boost_start: int = 1
+    late_residual_boost: float = 0.0
 
 
 class _AdaptiveFusionStage(nn.Module):
@@ -57,8 +60,11 @@ class _AdaptiveFusionStage(nn.Module):
         norm: str,
         activation: str,
         fusion_refinement: bool = False,
+        enable_joint_gating: bool = False,
+        late_residual_boost: float = 0.0,
     ) -> None:
         super().__init__()
+        self.branch_order = tuple(branch_channels.keys())
         # Conv only for projected features before fusion (no norm/activation)
         self.projections = nn.ModuleDict(
             {
@@ -66,18 +72,40 @@ class _AdaptiveFusionStage(nn.Module):
                 for branch, in_ch in branch_channels.items()
             }
         )
-        num_branches = len(branch_channels)
-        # Initialize fusion gates equally across branches
-        self.gate_params = nn.ParameterDict({
-            branch: nn.Parameter(torch.full((1, 1, 1, 1), 1.0 / num_branches))
-            for branch in branch_channels
-        })
+        gate_hidden = max(8, out_channels // 4)
+        self.gate_generators = nn.ModuleDict(
+            {
+                branch: nn.Sequential(
+                    nn.Conv2d(out_channels, gate_hidden, kernel_size=1, bias=True),
+                    _build_activation(activation),
+                    nn.Conv2d(gate_hidden, out_channels, kernel_size=1, bias=True),
+                )
+                for branch in branch_channels
+            }
+        )
+        self.enable_joint_gating = bool(enable_joint_gating) and len(self.branch_order) > 1
+        if self.enable_joint_gating:
+            joint_in_channels = out_channels * len(self.branch_order)
+            self.joint_gate_generator = nn.Sequential(
+                nn.Conv2d(joint_in_channels, gate_hidden, kernel_size=1, bias=True),
+                _build_activation(activation),
+                nn.Conv2d(gate_hidden, out_channels * len(self.branch_order), kernel_size=1, bias=True),
+            )
+        else:
+            self.joint_gate_generator = None
+        self.gate_bias = nn.ParameterDict(
+            {
+                branch: nn.Parameter(torch.zeros((1, out_channels, 1, 1)))
+                for branch in branch_channels
+            }
+        )
         self.refine = nn.Sequential(
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
             _build_norm(norm, out_channels),
             _build_activation(activation),
         )
         self.fusion_refinement = fusion_refinement
+        self.late_residual_boost = max(late_residual_boost, 0.0)
         if self.fusion_refinement:
             self.refine2 = nn.Sequential(
                 nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
@@ -124,17 +152,40 @@ class _AdaptiveFusionStage(nn.Module):
         fused = None
         weight_sum = None
         eps = 1e-6
+        aligned_projections: Dict[str, Tensor] = {}
 
         for branch, tensor in features.items():
             proj = self.projections[branch](tensor)
             if proj.shape[-2:] != (align_h, align_w):
                 proj = F.interpolate(proj, size=(align_h, align_w), mode="bilinear", align_corners=False)
+            aligned_projections[branch] = proj
 
-            # Bounded sigmoid gating: gate = sigmoid(param) * 0.8 + 0.1
-            raw_gate = self.gate_params[branch]
+        if len(self.branch_order) > 1 and hasattr(self, "joint_gate_generator") and self.joint_gate_generator is not None:
+            joint_gate_tensor = self.joint_gate_generator(
+                torch.cat([aligned_projections[branch] for branch in self.branch_order], dim=1)
+            )
+            joint_gate_chunks = joint_gate_tensor.chunk(len(self.branch_order), dim=1)
+            joint_gate_map = {
+                branch: gate_chunk
+                for branch, gate_chunk in zip(self.branch_order, joint_gate_chunks)
+            }
+        else:
+            joint_gate_map = {
+                branch: torch.zeros_like(proj)
+                for branch, proj in aligned_projections.items()
+            }
+
+        for branch in self.branch_order:
+            if branch not in aligned_projections:
+                continue
+            proj = aligned_projections[branch]
+            # Feature-conditioned gating lets each branch adapt by region and channel.
+            raw_gate = (
+                self.gate_generators[branch](proj)
+                + joint_gate_map[branch]
+                + self.gate_bias[branch]
+            )
             gate = torch.sigmoid(raw_gate) * 0.8 + 0.1
-            # Broadcast gate to proj shape
-            gate = gate.expand_as(proj)
             if noise_branch is not None and branch == noise_branch:
                 # weight noise branch by the configured noise weight
                 gate = gate * noise_weight
@@ -153,6 +204,13 @@ class _AdaptiveFusionStage(nn.Module):
                 weight_sum = weight_sum + gate
 
         fused = fused / (weight_sum + eps)
+        if (
+            noise_branch is not None
+            and self.late_residual_boost > 0.0
+            and noise_branch in aligned_projections
+            and noise_weight > 0.0
+        ):
+            fused = fused + (aligned_projections[noise_branch] * (self.late_residual_boost * noise_weight))
         fused = self.refine(fused)
         if self.fusion_refinement:
             fused = self.refine2(fused)
@@ -189,6 +247,15 @@ class MultiStageFeatureFusion(nn.Module):
                     norm=config.norm,
                     activation=config.activation,
                     fusion_refinement=getattr(config, 'fusion_refinement', False),
+                    enable_joint_gating=getattr(config, "enable_joint_gating", False),
+                    late_residual_boost=(
+                        getattr(config, "late_residual_boost", 0.0)
+                        if (
+                            config.noise_branch in stage_branch_channels
+                            and stage_idx >= getattr(config, "late_residual_boost_start", 1)
+                        )
+                        else 0.0
+                    ),
                 )
             )
 

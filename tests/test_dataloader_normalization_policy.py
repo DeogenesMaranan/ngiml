@@ -57,3 +57,34 @@ def test_collate_keeps_noise_branch_separate_from_rgb_normalization():
     # Noise branch tensor should remain in its original scale.
     assert torch.allclose(out_noise, noise)
 
+
+def test_collate_pads_variable_size_masks_after_batch_resize():
+    batch = [
+        {
+            "image": torch.ones((3, 448, 448), dtype=torch.float32),
+            "mask": torch.ones((1, 448, 448), dtype=torch.float32),
+            "label": torch.tensor(1, dtype=torch.long),
+            "dataset": "CASIA2",
+            "residual_noise": torch.zeros((3, 448, 448), dtype=torch.float32),
+        },
+        {
+            "image": torch.ones((3, 448, 320), dtype=torch.float32),
+            "mask": torch.ones((1, 448, 320), dtype=torch.float32),
+            "label": torch.tensor(0, dtype=torch.long),
+            "dataset": "CASIA2",
+            "residual_noise": torch.zeros((3, 448, 320), dtype=torch.float32),
+        },
+    ]
+
+    out = _collate_impl(
+        per_dataset_aug={"CASIA2": AugmentationConfig(enable=False)},
+        normalization_mode="imagenet",
+        training=False,
+        aug_seed=None,
+        batch=batch,
+    )
+
+    assert out["images"].shape == (2, 3, 448, 448)
+    assert out["masks"].shape == (2, 1, 448, 448)
+    assert out["residual_noise"].shape == (2, 3, 448, 448)
+

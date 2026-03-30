@@ -210,6 +210,7 @@ datasets/*
 test_datasets/*
 prepared_test_datasets/*
 prepared/*
+Toy/*
 
 checkpoints/*
 samples/*

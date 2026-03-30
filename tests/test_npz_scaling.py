@@ -84,3 +84,16 @@ def test_npz_residual_noise_key_is_loaded(tmp_path):
     expected_residual = _compute_residual_noise(out_image)
     assert torch.allclose(out_residual_noise, expected_residual, atol=1e-6)
 
+
+def test_npz_mask_is_resized_to_match_image_shape(tmp_path):
+    npz_path = tmp_path / "sample_mismatch.npz"
+    image = np.full((448, 448, 3), 255, dtype=np.uint8)
+    mask = np.ones((448, 320), dtype=np.uint8)
+    np.savez(npz_path, image=image, mask=mask)
+
+    out_image, out_mask, _out_residual_noise = _load_from_npz(str(npz_path))
+
+    assert out_image.shape == (3, 448, 448)
+    assert out_mask is not None
+    assert out_mask.shape == (1, 448, 448)
+
