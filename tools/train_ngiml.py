@@ -1116,10 +1116,18 @@ def load_checkpoint(
     # Attempt to load the requested checkpoint; if it's corrupt/unreadable,
     # try earlier "checkpoint_epoch_*.pt" files in the same directory as fallbacks.
     original_exc: Exception | None = None
+    checkpoint_map_location: str | torch.device = "cpu"
+
+    def _move_optimizer_state_to_device(opt: torch.optim.Optimizer, target_device: torch.device) -> None:
+        for state in opt.state.values():
+            if isinstance(state, dict):
+                for key, value in state.items():
+                    if torch.is_tensor(value):
+                        state[key] = value.to(device=target_device, non_blocking=(target_device.type == "cuda"))
 
     def _attempt_load(p: Path):
         try:
-            return torch.load(p, map_location=device), p
+            return torch.load(p, map_location=checkpoint_map_location), p
         except Exception as exc:
             return exc, p
 
@@ -1158,6 +1166,7 @@ def load_checkpoint(
         else:
             ema_model.load_state_dict(model.state_dict())
     optimizer.load_state_dict(data["optimizer_state"])
+    _move_optimizer_state_to_device(optimizer, device)
     if scheduler is not None and data.get("scheduler_state") is not None:
         scheduler.load_state_dict(data["scheduler_state"])
     if data.get("scaler_state") and scaler.is_enabled():

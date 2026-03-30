@@ -864,6 +864,17 @@ def _collate_impl(
     aug_seed: int | None,
     batch: List[dict[str, object]],
 ) -> dict[str, object]:
+    def _pad_or_crop_to_shape(tensor: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+        _, cur_h, cur_w = tensor.shape
+        if cur_h > target_h or cur_w > target_w:
+            tensor = tensor[:, :target_h, :target_w]
+            _, cur_h, cur_w = tensor.shape
+        pad_h = max(0, target_h - cur_h)
+        pad_w = max(0, target_w - cur_w)
+        if pad_h or pad_w:
+            tensor = NN_F.pad(tensor, (0, pad_w, 0, pad_h), value=0)
+        return tensor
+
     imagenet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
     imagenet_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
@@ -990,11 +1001,7 @@ def _collate_impl(
         if collect_residual_noise and residual_noisees:
             padded_high: List[torch.Tensor] = []
             for hp in residual_noisees:
-                hc, hh, hw = hp.shape
-                ph = max_h - hh
-                pw = max_w - hw
-                if ph or pw:
-                    hp = NN_F.pad(hp, (0, pw, 0, ph), value=0)
+                hp = _pad_or_crop_to_shape(hp, max_h, max_w)
                 padded_high.append(hp)
             residual_noisees = padded_high
 
