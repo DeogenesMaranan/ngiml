@@ -1,0 +1,61 @@
+\centering
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, calc}
+
+\begin{tikzpicture}[
+    node distance=1.9cm and 0.5cm,
+    phase/.style={
+        draw,
+        rounded corners=8pt,
+        minimum width=3.2cm,
+        minimum height=1.2cm,
+        align=center,
+        font=\sffamily\small,
+        line width=0.9pt,
+        fill=blue!8
+    },
+    desc/.style={
+        font=\sffamily\tiny,
+        align=center,
+        text width=3.3cm
+    },
+    flow/.style={
+        -{Latex[length=3mm,width=2mm]},
+        line width=0.9pt
+    },
+    loop/.style={
+        -{Latex[length=3mm,width=2mm]},
+        line width=0.9pt,
+        dashed
+    }
+]
+
+\node[phase, fill=cyan!12] (business) {Business\\Understanding};
+\node[phase, fill=teal!12, right=of business] (datau) {Data\\Understanding};
+\node[phase, fill=green!12, right=of datau] (datap) {Data\\Preparation};
+\node[phase, fill=yellow!18, below=of datap] (model) {Modeling};
+\node[phase, fill=orange!18, left=of model] (eval) {Evaluation};
+\node[phase, fill=red!12, left=of eval] (deploy) {Deployment};
+
+\draw[flow] (business) -- (datau);
+\draw[flow] (datau) -- (datap);
+\draw[flow] (datap) -- (model);
+\draw[flow] (model) -- (eval);
+\draw[flow] (eval) -- (deploy);
+
+\draw[loop] (eval.north) to[bend left=20] node[above, font=\sffamily\tiny] {refinement} (model.north);
+\draw[loop] (model.north) to[bend left=-45] 
+node[below, font=\sffamily\tiny, rotate=90] {pipeline updates} 
+(datap.south);
+\draw[loop] (datap.south) to[bend left=18] node[above, font=\sffamily\tiny] {dataset insights} (datau.south);
+
+\node[desc, above=0.18cm of business] {Research motivation, objectives,\\and success criteria};
+\node[desc, above=0.18cm of datau] {Dataset examination and\\forgery characteristics};
+\node[desc, above=0.18cm of datap] {Preprocessing, normalization,\\splitting, and augmentation};
+\node[desc, below=0.18cm of model] {Noise-guided EfficientNet--Swin--UNet\\architecture and training};
+\node[desc, below=0.18cm of eval] {Quantitative and qualitative\\performance assessment};
+\node[desc, below=0.18cm of deploy] {Documentation of findings,\\trained models, and insights};
+
+\node[font=\sffamily\bfseries\normalsize] at ($(business.north)!0.5!(datap.north)+(0,1.45)$)
+{CRISP--DM Framework Adapted for the Study};
+
+\end{tikzpicture}
