@@ -8,9 +8,9 @@ from src.data.config import AugmentationConfig
 from src.data.dataloaders import load_manifest
 from src.model.hybrid_ngiml import HybridNGIMLConfig
 from src.model.losses import MultiStageLossConfig
-from tools.train_ngiml import (
+from src.training_defaults import (
     build_default_components as _build_default_components_top_level,
-    build_training_config as _build_training_config_top_level,
+    build_training_config as _build_training_config_top_level
 )
 
 

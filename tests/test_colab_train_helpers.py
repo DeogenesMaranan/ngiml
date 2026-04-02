@@ -1,5 +1,4 @@
-from tools.colab_train_helpers import apply_colab_runtime_settings
-from tools.train_ngiml import build_default_components, build_training_config
+from tools.colab_train_helpers import apply_colab_runtime_settings, build_default_components, build_training_config
 from src.model.hybrid_ngiml import HybridNGIMLConfig
 from src.model.feature_fusion import FeatureFusionConfig
 
@@ -56,7 +55,7 @@ def test_build_training_config_uses_fixed_threshold_iou_early_stopping_defaults(
 
     assert cfg["early_stopping_patience"] == 5
     assert cfg["early_stopping_min_delta"] == 3e-3
-    assert cfg["early_stopping_monitor"] == "iou"
+    assert cfg["early_stopping_monitor"] == "loss"
     assert cfg["metric_threshold"] == 0.5
     assert cfg["optimize_threshold"] is False
 

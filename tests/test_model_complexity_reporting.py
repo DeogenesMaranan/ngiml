@@ -2,7 +2,7 @@ import torch
 
 import tools.infer_helpers as infer_helpers
 from src.model.hybrid_ngiml import HybridNGIML
-from tools.train_ngiml import build_default_components
+from src.training_defaults import build_default_components
 
 
 def test_get_model_complexity_stats_prefers_thop():

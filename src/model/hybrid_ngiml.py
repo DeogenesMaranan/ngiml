@@ -75,8 +75,6 @@ class HybridNGIMLConfig:
     enable_context_residual_attention: bool = False
     residual_attention_init_scale: float = 0.0
     gradient_checkpointing: bool = True
-    flash_attention: bool = True
-    xformers: bool = True
 
 
 class HybridNGIML(nn.Module):
@@ -93,12 +91,7 @@ class HybridNGIML(nn.Module):
             self.efficientnet = EfficientNetBackbone(self.cfg.efficientnet)
 
         if self.cfg.use_context:
-            swin_kwargs = {}
-            if hasattr(self.cfg, 'flash_attention'):
-                swin_kwargs['flash_attention'] = getattr(self.cfg, 'flash_attention', False)
-            if hasattr(self.cfg, 'xformers'):
-                swin_kwargs['xformers'] = getattr(self.cfg, 'xformers', False)
-            self.swin = SwinBackbone(self.cfg.swin, **swin_kwargs)
+            self.swin = SwinBackbone(self.cfg.swin)
 
         if self.cfg.use_residual:
             self.noise = ResidualNoiseModule(self.cfg.residual)

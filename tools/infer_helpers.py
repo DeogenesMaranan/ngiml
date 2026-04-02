@@ -33,7 +33,8 @@ from src.data.dataloaders import (
 )
 from src.data.config import SampleRecord
 from src.model.hybrid_ngiml import HybridNGIML
-from tools.train_ngiml import _coerce_model_config, build_default_components
+from src.training_defaults import build_default_components
+from src.training_loop_helpers import _coerce_model_config
 
 
 def _require_matplotlib() -> None:

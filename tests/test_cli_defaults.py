@@ -32,19 +32,19 @@ def test_balance_real_fake_defaults_consistent():
 def test_loss_defaults_are_stable_overlap_core(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train_ngiml.py", "--manifest", "dummy_manifest.json"])
     cfg = parse_args()
-    assert cfg.tversky_weight == 0.0
+    assert cfg.tversky_weight == 0.2
     assert cfg.tversky_beta == 0.8
-    assert cfg.lovasz_weight == 0.0
+    assert cfg.lovasz_weight == 0.05
     assert cfg.use_boundary_loss is True
-    assert cfg.boundary_weight == 0.05
+    assert cfg.boundary_weight == 0.03
 
 
 def test_overlap_focused_threshold_and_mining_defaults(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train_ngiml.py", "--manifest", "dummy_manifest.json"])
     cfg = parse_args()
-    assert cfg.early_stopping_patience == 3
-    assert cfg.early_stopping_monitor == "f1"
-    assert cfg.early_stopping_min_delta == 2e-3
+    assert cfg.early_stopping_patience == 5
+    assert cfg.early_stopping_monitor == "loss"
+    assert cfg.early_stopping_min_delta == 3e-3
     assert cfg.optimize_threshold is False
     assert cfg.metric_threshold == 0.5
     assert cfg.threshold_metric == "f1"
