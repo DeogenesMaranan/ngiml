@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
-
-
+"""Data loading, augmentation, and sampler utilities for NGIML training."""
 import io
 import json
 import tarfile
@@ -27,6 +26,7 @@ _TAR_CACHE: "OrderedDict[str, tarfile.TarFile]" = OrderedDict()
 
 
 def _close_all_tars() -> None:
+    """Close and clear all cached tar handles."""
     while _TAR_CACHE:
         _, tar = _TAR_CACHE.popitem(last=False)
         try:
@@ -39,6 +39,7 @@ atexit.register(_close_all_tars)
 
 
 def _get_tarfile(archive_path: str) -> tarfile.TarFile:
+    """Return an open tar handle from LRU cache, opening if needed."""
     tar = _TAR_CACHE.pop(archive_path, None)
     if tar is None or tar.closed:
         tar = tarfile.open(archive_path, "r:*")
@@ -53,6 +54,7 @@ def _get_tarfile(archive_path: str) -> tarfile.TarFile:
 
 
 def torchvision_load_image(path: str, as_mask: bool = False) -> torch.Tensor:
+    """Load an image tensor with torchvision and optionally force single-channel mask."""
     from torchvision.io import read_image
 
     image = read_image(path)
@@ -62,6 +64,7 @@ def torchvision_load_image(path: str, as_mask: bool = False) -> torch.Tensor:
 
 
 def _load_image(path: str) -> torch.Tensor:
+    """Load an RGB image as float32 in [0, 1], expanding grayscale to 3 channels."""
     image = torchvision_load_image(path).float() / 255.0
     if image.shape[0] == 1:
         image = image.repeat(3, 1, 1)
@@ -69,6 +72,7 @@ def _load_image(path: str) -> torch.Tensor:
 
 
 def _load_mask(mask_path: str | None, target_hw: Sequence[int]) -> torch.Tensor:
+    """Load a binary mask resized to target spatial resolution."""
     if mask_path is None:
         return torch.zeros((1, target_hw[0], target_hw[1]), dtype=torch.float32)
     mask = torchvision_load_image(mask_path, as_mask=True).float()
@@ -82,6 +86,7 @@ def _load_mask(mask_path: str | None, target_hw: Sequence[int]) -> torch.Tensor:
 
 
 def _safe_scale_to_unit_float32(tensor: torch.Tensor) -> torch.Tensor:
+    """Convert tensor to float32 and normalize value range to [0, 1] when needed."""
     source_dtype = tensor.dtype
     tensor = tensor.float()
     if tensor.numel() == 0:
@@ -96,6 +101,7 @@ def _safe_scale_to_unit_float32(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _compute_residual_noise(image: torch.Tensor) -> torch.Tensor:
+    """Compute a normalized high-pass residual map from a CHW RGB image."""
     if image.ndim != 3 or image.shape[0] != 3:
         raise ValueError(f"Expected CHW image with 3 channels, got shape {tuple(image.shape)}")
 
@@ -118,6 +124,7 @@ def _compute_residual_noise(image: torch.Tensor) -> torch.Tensor:
 def _load_from_npz(
     path: str | io.BytesIO,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Load image/mask tensors from NPZ and derive residual noise on the fly."""
     with np.load(path, allow_pickle=False) as data:
         image_np = data["image"]
         image = torch.from_numpy(image_np)
@@ -161,6 +168,7 @@ def _load_from_npz(
 def _load_from_tar_npz(
     tar_spec: str,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Load NPZ sample from tar-member spec '<archive>::<member>'."""
     if "::" not in tar_spec:
         raise ValueError(f"Invalid tar npz spec: {tar_spec}")
     archive_path, member_name = tar_spec.split("::", 1)
@@ -173,6 +181,7 @@ def _load_from_tar_npz(
 
 
 class PerDatasetDataset(Dataset):
+    """Dataset wrapper for one source dataset with optional per-sample augmentation."""
     def __init__(
         self,
         samples: Sequence[SampleRecord],
@@ -251,6 +260,7 @@ class PerDatasetDataset(Dataset):
 
 
 class CombinedDataset(Dataset):
+    """Concatenate multiple datasets and expose a single global index space."""
     def __init__(self, datasets: Sequence[Dataset]) -> None:
         self.datasets = list(datasets)
         self.offsets: List[int] = []
@@ -270,6 +280,7 @@ class CombinedDataset(Dataset):
 
 
 class RoundRobinSampler(Sampler[int]):
+    """Interleave indices from per-dataset subsets in round-robin order."""
     def __init__(
         self,
         datasets: Sequence[Dataset],
@@ -321,6 +332,7 @@ class RoundRobinSampler(Sampler[int]):
 
 
 class RoundRobinBalancedClassSampler(Sampler[int]):
+    """Round-robin sampler with per-dataset positive/negative class ratio control."""
     def __init__(
         self,
         datasets: Sequence[Dataset],
@@ -441,6 +453,7 @@ def _apply_gpu_augmentations(
     residual_noise: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Apply stochastic per-sample geometric and photometric augmentations."""
     def _rand_scalar() -> torch.Tensor:
         return torch.rand((), device=image.device, generator=generator)
 
@@ -600,6 +613,7 @@ def _apply_gpu_augmentations_batch(
     residual_noise: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Apply batched GPU augmentations to NCHW images, masks, and residual maps."""
     if generator is None:
         try:
             generator = torch.Generator(device=images.device)
@@ -718,6 +732,7 @@ def _apply_gpu_augmentations_batch(
 
 
 class SizeBucketingBatchSampler:
+    """Batch sampler that groups items by short-side bins before batching."""
     def __init__(self, base_sampler, short_sides, batch_size: int, drop_last: bool = True, bin_size: int = 32):
         self.base_sampler = base_sampler
         self.short_sides = list(int(s) for s in short_sides)
@@ -770,6 +785,7 @@ def _collate_impl(
     aug_seed: int | None,
     batch: List[dict[str, object]],
 ) -> dict[str, object]:
+    """Collate heterogeneous samples into padded batch tensors with optional view expansion."""
     def _pad_or_crop_to_shape(tensor: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
         _, cur_h, cur_w = tensor.shape
         if cur_h > target_h or cur_w > target_w:
@@ -922,10 +938,12 @@ def _collate_builder(
     training: bool,
     aug_seed: int | None = None,
 ):
+    """Create a collate function with bound augmentation and normalization settings."""
     return functools.partial(_collate_impl, per_dataset_aug, normalization_mode, training, aug_seed)
 
 
 def _group_by(split: str, samples: Iterable[SampleRecord]) -> Dict[str, list[SampleRecord]]:
+    """Group manifest records by dataset for a requested split name."""
     grouped: Dict[str, list[SampleRecord]] = {}
     for record in samples:
         if record.split != split:
@@ -935,6 +953,7 @@ def _group_by(split: str, samples: Iterable[SampleRecord]) -> Dict[str, list[Sam
 
 
 def load_manifest(path: str | Path) -> Manifest:
+    """Load a manifest from parquet or JSON into a Manifest object."""
     path = Path(path)
     if path.suffix.lower() == ".parquet":
         df = pd.read_parquet(path)
@@ -966,6 +985,7 @@ def create_dataloaders(
     short_side_probe_samples: int = 128,
     normalization_mode_override: str | None = None,
 ) -> Dict[str, DataLoader]:
+    """Build split-specific dataloaders with round-robin sampling and optional bucketing."""
     manifest = load_manifest(manifest_path)
     normalization_mode = (
         str(normalization_mode_override)
