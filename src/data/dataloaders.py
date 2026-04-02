@@ -14,19 +14,14 @@ import numpy as np
 import torch
 import math
 import torch.nn.functional as NN_F
-from torch.utils.data import DataLoader, Dataset, Sampler, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torchvision.transforms import functional as F
 from torchvision.transforms.functional import InterpolationMode
-import random
 import functools
 from dataclasses import replace as _dc_replace
-from bisect import bisect_left
 
 from .config import AugmentationConfig, Manifest, SampleRecord
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".npz"}
-
-# Per-process LRU cache of open tar archives to avoid reopening on every sample.
 _TAR_CACHE_LIMIT = 8
 _TAR_CACHE: "OrderedDict[str, tarfile.TarFile]" = OrderedDict()
 
@@ -57,6 +52,15 @@ def _get_tarfile(archive_path: str) -> tarfile.TarFile:
     return tar
 
 
+def torchvision_load_image(path: str, as_mask: bool = False) -> torch.Tensor:
+    from torchvision.io import read_image
+
+    image = read_image(path)
+    if as_mask and image.shape[0] > 1:
+        image = image[:1]
+    return image
+
+
 def _load_image(path: str) -> torch.Tensor:
     image = torchvision_load_image(path).float() / 255.0
     if image.shape[0] == 1:
@@ -75,12 +79,6 @@ def _load_mask(mask_path: str | None, target_hw: Sequence[int]) -> torch.Tensor:
     if mask.shape[-2:] != tuple(target_hw):
         mask = F.resize(mask, target_hw, interpolation=InterpolationMode.NEAREST)
     return mask
-
-
-def _load_optional_mask(mask_path: str | None, target_hw: Sequence[int]) -> torch.Tensor | None:
-    if mask_path is None:
-        return None
-    return _load_mask(mask_path, target_hw)
 
 
 def _safe_scale_to_unit_float32(tensor: torch.Tensor) -> torch.Tensor:
@@ -174,16 +172,6 @@ def _load_from_tar_npz(
     return _load_from_npz(io.BytesIO(npz_bytes))
 
 
-def torchvision_load_image(path: str, as_mask: bool = False) -> torch.Tensor:
-    # Lazy import to avoid hard dependency at module import time.
-    from torchvision.io import read_image
-
-    image = read_image(path)
-    if as_mask and image.shape[0] > 1:
-        image = image[:1]
-    return image
-
-
 class PerDatasetDataset(Dataset):
     def __init__(
         self,
@@ -198,18 +186,14 @@ class PerDatasetDataset(Dataset):
         self.aug_cfg = aug_cfg
         self.training = training
         self.sample_labels = [int(sample.label) for sample in self.samples]
-        # Optional cap on image short side to avoid extremely large dynamic inputs
-        # (helps prevent oversized backbone inputs that trigger timm assertions
-        # or excessive GPU memory usage). If None, no cap is applied.
         self.resize_max_side = int(resize_max_side) if resize_max_side is not None else None
-        # Per-worker augmentation seed and whether to perform augmentations inside workers
         self.aug_seed = aug_seed
         self.apply_augmentations = bool(apply_augmentations)
 
-    def __len__(self) -> int:  # type: ignore[override]
+    def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> dict[str, object]:  # type: ignore[override]
+    def __getitem__(self, index: int) -> dict[str, object]:
         record = self.samples[index]
 
         if "::" in record.image_path and record.image_path.endswith(".npz"):
@@ -227,14 +211,12 @@ class PerDatasetDataset(Dataset):
         if mask is None:
             mask = torch.zeros((1, image.shape[-2], image.shape[-1]), dtype=torch.float32)
 
-        # Enforce a maximum short side early to avoid very large dynamic sizes.
         if self.resize_max_side is not None:
             h, w = image.shape[-2:]
             short_side = min(h, w)
             if short_side > self.resize_max_side:
                 scale = float(self.resize_max_side) / float(short_side)
                 new_h, new_w = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
-                # Resize before any augmentations to keep sizes bounded
                 image = F.resize(image, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
                 mask = F.resize(mask, [new_h, new_w], interpolation=InterpolationMode.NEAREST)
                 if residual_noise is not None:
@@ -242,7 +224,6 @@ class PerDatasetDataset(Dataset):
 
         cfg = self.aug_cfg
 
-        # If configured, perform per-sample augmentations inside the worker.
         if self.apply_augmentations and self.training and cfg.enable:
             worker_info = torch.utils.data.get_worker_info()
             worker_offset = worker_info.id if worker_info is not None else 0
@@ -279,58 +260,13 @@ class CombinedDataset(Dataset):
             total += len(ds)
         self.total_len = total
 
-    def __len__(self) -> int:  # type: ignore[override]
+    def __len__(self) -> int:
         return self.total_len
 
-    def __getitem__(self, index: int) -> dict[str, object]:  # type: ignore[override]
+    def __getitem__(self, index: int) -> dict[str, object]:
         ds_idx = bisect_right(self.offsets, index) - 1
         local_index = index - self.offsets[ds_idx]
         return self.datasets[ds_idx][local_index]
-
-
-def _build_real_fake_balanced_sampler(
-    combined_dataset: CombinedDataset,
-    pos_ratio: float,
-    seed: int | None,
-    num_samples: int | None = None,
-) -> WeightedRandomSampler | None:
-    labels: list[int] = []
-    for ds in combined_dataset.datasets:
-        ds_labels = getattr(ds, "sample_labels", None)
-        if ds_labels is None:
-            return None
-        labels.extend(int(v) for v in ds_labels)
-
-    if not labels:
-        return None
-
-    label_tensor = torch.tensor(labels, dtype=torch.long)
-    class_counts = torch.bincount(label_tensor, minlength=2).float()
-    if class_counts.sum().item() <= 0:
-        return None
-
-    pos_ratio = float(min(max(pos_ratio, 0.05), 0.95))
-    neg_ratio = 1.0 - pos_ratio
-
-    class_weights = torch.zeros_like(class_counts)
-    class_weights[0] = neg_ratio / class_counts[0].clamp_min(1.0)
-    class_weights[1] = pos_ratio / class_counts[1].clamp_min(1.0)
-    sample_weights = class_weights[label_tensor]
-
-    target_num_samples = int(num_samples) if num_samples is not None else len(labels)
-    target_num_samples = max(1, target_num_samples)
-
-    generator = None
-    if seed is not None:
-        generator = torch.Generator()
-        generator.manual_seed(int(seed))
-
-    return WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=target_num_samples,
-        replacement=True,
-        generator=generator,
-    )
 
 
 class RoundRobinSampler(Sampler[int]):
@@ -353,7 +289,7 @@ class RoundRobinSampler(Sampler[int]):
             self.offsets.append(total)
             total += length
 
-    def __iter__(self):  # type: ignore[override]
+    def __iter__(self):
         generator = torch.Generator()
         if self.seed is not None:
             generator.manual_seed(self.seed + self._iteration)
@@ -378,15 +314,13 @@ class RoundRobinSampler(Sampler[int]):
                 local_idx = indices[offset % local_len] if self.balance else indices[offset]
                 yield self.offsets[ds_idx] + local_idx
 
-    def __len__(self) -> int:  # type: ignore[override]
+    def __len__(self) -> int:
         if self.balance:
             return max(self.lengths) * len(self.datasets)
         return sum(self.lengths)
 
 
 class RoundRobinBalancedClassSampler(Sampler[int]):
-    """Round-robin across datasets while balancing real/fake sampling within each dataset."""
-
     def __init__(
         self,
         datasets: Sequence[Dataset],
@@ -409,7 +343,7 @@ class RoundRobinBalancedClassSampler(Sampler[int]):
             self.offsets.append(total)
             total += length
 
-    def __iter__(self):  # type: ignore[override]
+    def __iter__(self):
         generator = torch.Generator()
         if self.seed is not None:
             generator.manual_seed(int(self.seed) + self._iteration)
@@ -473,7 +407,7 @@ class RoundRobinBalancedClassSampler(Sampler[int]):
                     continue
                 yield self.offsets[ds_idx] + local_idx
 
-    def __len__(self) -> int:  # type: ignore[override]
+    def __len__(self) -> int:
         if self.balance:
             return max(self.lengths) * len(self.datasets)
         return sum(self.lengths)
@@ -488,8 +422,6 @@ def _normalize(
     if mode == "zero_one":
         return image
     if mode == "imagenet":
-        # ImageNet stats are defined for RGB only. Keep non-RGB tensors
-        # (for example residual/noise inputs) in their native scale.
         if image.ndim != 3 or image.shape[0] != 3:
             return image
         if imagenet_mean is None or imagenet_std is None:
@@ -668,13 +600,6 @@ def _apply_gpu_augmentations_batch(
     residual_noise: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Batched version of `_apply_gpu_augmentations` operating on tensors
-    shaped `(B,C,H,W)` and `(B,1,H,W)` for masks. This implements the
-    most common augmentations (random flips, rotations, color jitter, noise)
-    using vectorized torch ops to reduce Python/kernel-launch overhead.
-    More complex ops (elastic / resized_crop) remain per-sample and are
-    skipped here for simplicity.
-    """
     if generator is None:
         try:
             generator = torch.Generator(device=images.device)
@@ -686,7 +611,6 @@ def _apply_gpu_augmentations_batch(
     def _rand_scalar(shape=(B,)):
         return torch.rand(shape, device=images.device, generator=generator)
 
-    # Horizontal and vertical flips
     if cfg.enable_flips:
         horiz = _rand_scalar() < 0.5
         vert = _rand_scalar() < 0.2
@@ -701,7 +625,6 @@ def _apply_gpu_augmentations_batch(
             if residual_noise is not None:
                 residual_noise[vert] = torch.flip(residual_noise[vert], dims=[2])
 
-    # Rotations via affine grid (vectorized)
     if cfg.enable_rotations and cfg.max_rotation_degrees > 0:
         ang = (_rand_scalar() * 2.0 - 1.0) * cfg.max_rotation_degrees
         ang_rad = ang * (math.pi / 180.0)
@@ -712,7 +635,13 @@ def _apply_gpu_augmentations_batch(
             thetas[:, 1, 1] = 1.0
             cos = torch.cos(ang_rad[non_zero])
             sin = torch.sin(ang_rad[non_zero])
-            thetas_non = torch.stack([torch.stack([cos, -sin, torch.zeros_like(cos)], dim=1), torch.stack([sin, cos, torch.zeros_like(cos)], dim=1)], dim=1)
+            thetas_non = torch.stack(
+                [
+                    torch.stack([cos, -sin, torch.zeros_like(cos)], dim=1),
+                    torch.stack([sin, cos, torch.zeros_like(cos)], dim=1),
+                ],
+                dim=1,
+            )
             thetas[non_zero] = thetas_non
             grid = torch.nn.functional.affine_grid(thetas, images.size(), align_corners=True)
             images = torch.nn.functional.grid_sample(images, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
@@ -720,13 +649,11 @@ def _apply_gpu_augmentations_batch(
             if residual_noise is not None:
                 residual_noise = torch.nn.functional.grid_sample(residual_noise, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
 
-    # Color jitter (brightness/contrast) vectorized
     if cfg.enable_color_jitter:
         brightness_min, brightness_max = getattr(cfg, "brightness_jitter_factors", getattr(cfg, "color_jitter_factors", (0.9, 1.1)))
         contrast_min, contrast_max = getattr(cfg, "contrast_jitter_factors", (0.9, 1.1))
         br = brightness_min + _rand_scalar() * (brightness_max - brightness_min)
         ct = contrast_min + _rand_scalar() * (contrast_max - contrast_min)
-        # reshape for broadcast (B,1,1,1)
         br = br.view(B, 1, 1, 1)
         ct = ct.view(B, 1, 1, 1)
         mean = images.mean(dim=(1, 2, 3), keepdim=True)
@@ -734,21 +661,17 @@ def _apply_gpu_augmentations_batch(
         images = images * br
         images = torch.clamp(images, 0.0, 1.0)
 
-    # Noise
     if cfg.enable_noise and cfg.noise_std_range[1] > 0:
         stds = cfg.noise_std_range[0] + _rand_scalar() * (cfg.noise_std_range[1] - cfg.noise_std_range[0])
         stds = stds.view(B, 1, 1, 1)
         noise = torch.randn_like(images) * stds
         images = torch.clamp(images + noise, 0.0, 1.0)
 
-    # Random resized_crop vectorized (approximate; does not implement
-    # object-centered crop bias). Uses affine_grid + grid_sample for batch.
     if cfg.enable_random_crop:
         _, _, H, W = images.shape
         scales = cfg.crop_scale_range[0] + _rand_scalar((B,)) * (cfg.crop_scale_range[1] - cfg.crop_scale_range[0])
         crop_h = (scales * float(H)).round().to(dtype=torch.int64)
         crop_w = (scales * float(W)).round().to(dtype=torch.int64)
-        # Clamp
         crop_h = torch.clamp(crop_h, min=1, max=H)
         crop_w = torch.clamp(crop_w, min=1, max=W)
 
@@ -756,7 +679,6 @@ def _apply_gpu_augmentations_batch(
         lefts = torch.zeros((B,), dtype=torch.int64, device=images.device)
         valid_crop = (crop_h < H) | (crop_w < W)
         if valid_crop.any():
-            # choose random top/left where crop smaller than original
             max_t = (H - crop_h).clamp(min=0)
             max_l = (W - crop_w).clamp(min=0)
             r_t = torch.rand((B,), device=images.device, generator=generator)
@@ -796,17 +718,6 @@ def _apply_gpu_augmentations_batch(
 
 
 class SizeBucketingBatchSampler:
-    """BatchSampler that groups indices from a base sampler into batches of
-    similarly-sized samples (by short side) to reduce padding waste.
-
-    Args:
-        base_sampler: an iterable yielding indices (e.g., RoundRobinSampler)
-        short_sides: list-like mapping index -> short-side length (int)
-        batch_size: batch size
-        drop_last: whether to drop incomplete batches
-        bin_size: bucket width in pixels (default 32)
-    """
-
     def __init__(self, base_sampler, short_sides, batch_size: int, drop_last: bool = True, bin_size: int = 32):
         self.base_sampler = base_sampler
         self.short_sides = list(int(s) for s in short_sides)
@@ -818,7 +729,6 @@ class SizeBucketingBatchSampler:
         buckets = {}
         for idx in self.base_sampler:
             if idx < 0 or idx >= len(self.short_sides):
-                # forward indices unchanged
                 bucket_key = 0
             else:
                 s = int(self.short_sides[idx])
@@ -829,7 +739,6 @@ class SizeBucketingBatchSampler:
                 yield lst[: self.batch_size]
                 del lst[: self.batch_size]
 
-        # emit remaining
         if not self.drop_last:
             remaining = []
             for lst in buckets.values():
@@ -842,9 +751,6 @@ class SizeBucketingBatchSampler:
                 yield remaining
 
     def __len__(self):
-        # Best-effort batch count from the base sampler cardinality.
-        # Exact count can vary slightly with per-bucket leftovers, but this
-        # provides the correct order of magnitude for progress reporting.
         try:
             base_count = int(len(self.base_sampler))
         except Exception:
@@ -878,7 +784,6 @@ def _collate_impl(
     imagenet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
     imagenet_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
-    # Create a per-call generator seeded from aug_seed and worker id (if provided).
     aug_generator = None
     if aug_seed is not None:
         worker_info = torch.utils.data.get_worker_info()
@@ -937,18 +842,13 @@ def _collate_impl(
             if collect_residual_noise and view_residual_noise is not None:
                 residual_noisees.append(view_residual_noise)
 
-    # Reduce per-batch size variance: resize all images in the batch to the
-    # median short-side to avoid excessive padding across widely varying sizes.
-    # This is a cheap bucketing heuristic that improves memory usage and
-    # throughput while keeping aspect ratios.
     shapes = [img.shape for img in images]
     shorts = [min(s[1], s[2]) for s in shapes]
-    if len(shorts) > 1:
+    if training and len(shorts) > 1:
         try:
             target_short = int(round(float(np.median(shorts))))
         except Exception:
             target_short = shorts[0]
-        # Only resize when it actually changes the short side
         for i, img in enumerate(images):
             c, h, w = img.shape
             short_side = min(h, w)
@@ -975,7 +875,6 @@ def _collate_impl(
         padded_masks: List[torch.Tensor] = []
         for img, m in zip(images, masks):
             c, h, w = img.shape
-            # pad channels if necessary (unlikely)
             if c < max_c:
                 pad_ch = max_c - c
                 img = torch.cat([img, torch.zeros((pad_ch, h, w), dtype=img.dtype, device=img.device)], dim=0)
@@ -984,7 +883,6 @@ def _collate_impl(
             pad_h = max_h - h
             if pad_w or pad_h:
                 img = NN_F.pad(img, (0, pad_w, 0, pad_h), value=0)
-            # handle missing masks (create zero mask)
             if m is None:
                 m = torch.zeros((1, h, w), dtype=torch.float32, device=img.device)
             else:
@@ -1024,8 +922,6 @@ def _collate_builder(
     training: bool,
     aug_seed: int | None = None,
 ):
-    # Return a picklable partial of the top-level collate implementation so
-    # spawn-based multiprocessing (Windows) can serialize it.
     return functools.partial(_collate_impl, per_dataset_aug, normalization_mode, training, aug_seed)
 
 
@@ -1088,7 +984,6 @@ def create_dataloaders(
         training = split_name == "train"
         datasets: List[PerDatasetDataset] = []
         combined_short_sides: List[int] = []
-        # Track whether each dataset will perform augmentations inside workers
         per_dataset_apply_in_worker: Dict[str, bool] = {}
         split_probe_budget = max(0, int(short_side_probe_samples))
         probed_count = 0
@@ -1106,16 +1001,12 @@ def create_dataloaders(
                     apply_augmentations=apply_in_worker,
                 )
             )
-            # Estimate short-side per-sample for bucketing heuristics.
-            # Probing files is expensive for large manifests, so cap the number
-            # of on-disk probes per split and use a bounded fallback afterwards.
             for r in records:
                 ss = None
                 if split_probe_budget > 0 and probed_count < split_probe_budget:
                     try:
                         p = str(r.image_path)
                         if "::" in p and p.endswith(".npz"):
-                            # tar::npz entry: extract member bytes from tar and inspect
                             archive, member = p.split("::", 1)
                             try:
                                 tar = _get_tarfile(archive)
@@ -1171,8 +1062,6 @@ def create_dataloaders(
         else:
             sampler = None
 
-        # If a dataset applies augmentations in the worker, disable collate-time
-        # augmentations for that dataset to avoid double-application.
         collate_aug_map: Dict[str, AugmentationConfig] = {}
         for name, aug in per_dataset_augmentations.items():
             if per_dataset_apply_in_worker.get(name, False):
@@ -1190,8 +1079,6 @@ def create_dataloaders(
         pf = prefetch_factor if num_workers > 0 else None
         persistent = persistent_workers if num_workers > 0 else False
 
-        # Optionally use a size-bucketing batch sampler to group similarly
-        # sized samples and reduce padding waste during batching.
         use_batch_sampler = bool(training and size_bucketing and sampler is not None)
         if use_batch_sampler:
             batch_sampler = SizeBucketingBatchSampler(sampler, combined_short_sides, batch_size=batch_size, drop_last=drop_last)
@@ -1221,4 +1108,3 @@ def create_dataloaders(
         loaders[split_name] = loader
 
     return loaders
-

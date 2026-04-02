@@ -493,7 +493,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--disable-aug", action="store_true", help="Disable GPU augmentations")
     parser.add_argument("--device", type=str, default=None, help="Override device (e.g., cuda:0 or cpu)")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducibility")
-    parser.add_argument("--early-stopping-patience", type=int, default=2, help="Stop after N validations without improvement; <=0 disables")
+    parser.add_argument("--early-stopping-patience", type=int, default=3, help="Stop after N validations without improvement; <=0 disables")
     parser.add_argument("--early-stopping-min-delta", type=float, default=2e-3, help="Minimum monitored-metric improvement to reset early stopping")
     parser.add_argument(
         "--early-stopping-monitor",
