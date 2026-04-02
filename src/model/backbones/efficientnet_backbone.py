@@ -1,7 +1,4 @@
-"""EfficientNet backbone for NGIML low-level feature extraction (timm-based).
-
-Forensic motivation: timm EfficientNet provides more stable pretrained weights and better intermediate feature extraction for manipulation localization tasks.
-"""
+"""EfficientNet backbone wrapper."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,16 +11,14 @@ import torch.nn.functional as F
 import timm
 
 _LOG = logging.getLogger(__name__)
-# Reduce noisy pretrained-weight mismatch warnings from timm internals
 logging.getLogger("timm.models._builder").setLevel(logging.ERROR)
 
 
 @dataclass
 class EfficientNetBackboneConfig:
-    """Configuration container for EfficientNet backbone."""
+    """Configuration for EfficientNetBackbone."""
 
     pretrained: bool = True
-    # Default to common EfficientNet feature indices for B0-like variants.
     out_indices: Sequence[int] = (1, 2, 3, 4)
     enforce_input_size: bool = False
     input_size: Union[int, Tuple[int, int], None] = None
@@ -31,10 +26,7 @@ class EfficientNetBackboneConfig:
 
 
 class EfficientNetBackbone(nn.Module):
-    """Wrapper that exposes multi-scale EfficientNet feature maps using timm.
-
-    Forensic motivation: Use timm EfficientNet for more stable pretrained weights and better feature extraction for manipulation localization.
-    """
+    """Expose multi-scale EfficientNet features from timm."""
     def __init__(self, config: EfficientNetBackboneConfig | None = None) -> None:
         super().__init__()
         cfg = config or EfficientNetBackboneConfig()
@@ -48,10 +40,8 @@ class EfficientNetBackbone(nn.Module):
             else:
                 self.expected_hw = tuple(cfg.input_size)
         else:
-            self.expected_hw = (224, 224)  # default EfficientNet input
+            self.expected_hw = (224, 224)
 
-        # Use timm to create EfficientNet backbone without forcing out_indices.
-        # We'll select the requested feature maps from the returned list to avoid timm internal index mismatches.
         model_name = getattr(cfg, 'model_name', 'efficientnet_b0')
         self.backbone = timm.create_model(model_name, pretrained=cfg.pretrained, features_only=True)
         avail_n = len(self.backbone.feature_info)
@@ -60,9 +50,6 @@ class EfficientNetBackbone(nn.Module):
         if not valid_indices:
             valid_indices = tuple(range(avail_n))
         if valid_indices != tuple(requested):
-            # Log at INFO to avoid alarming warnings for auto-adjustments; this
-            # is non-fatal and many timm variants expose slightly different
-            # feature index ranges.
             _LOG.info(
                 "requested efficientnet out_indices %s adjusted to available indices %s for model %s",
                 requested,
@@ -70,7 +57,6 @@ class EfficientNetBackbone(nn.Module):
                 model_name,
             )
         self.selected_indices = valid_indices
-        # Cache channel dimensions for downstream heads corresponding to selected indices
         self.out_channels: List[int] = [self.backbone.feature_info[i]['num_chs'] for i in self.selected_indices]
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
@@ -81,7 +67,6 @@ class EfficientNetBackbone(nn.Module):
                 x.shape[-2], x.shape[-1], self.expected_hw[0], self.expected_hw[1],
             )
             x = F.interpolate(x, size=self.expected_hw, mode="bilinear", align_corners=False)
-        # Guard timm model `out_indices` attribute to avoid internal index errors
         if hasattr(self.backbone, "feature_info") and hasattr(self.backbone, "out_indices"):
             avail = len(self.backbone.feature_info)
             safe_out = tuple(i for i in self.selected_indices if 0 <= i < avail)
@@ -112,7 +97,6 @@ class EfficientNetBackbone(nn.Module):
                     raise
             else:
                 raise
-        # Select only the requested feature maps and return as list
         if isinstance(features, (list, tuple)):
             selected = [features[i] for i in self.selected_indices]
             return selected

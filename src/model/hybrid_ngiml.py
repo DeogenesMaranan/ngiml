@@ -9,7 +9,7 @@ from torch import Tensor, nn
 from torch.optim import AdamW
 
 from .backbones.efficientnet_backbone import EfficientNetBackbone, EfficientNetBackboneConfig
-from .backbones.residual_noise_branch import ResidualNoiseBranch, ResidualNoiseConfig
+from .backbones.residual_noise_branch import ResidualNoiseModule, ResidualNoiseConfig
 from .backbones.swin_backbone import SwinBackbone, SwinBackboneConfig
 from .feature_fusion import FeatureFusionConfig, MultiStageFeatureFusion
 from .unet_decoder import UNetDecoder, UNetDecoderConfig
@@ -23,7 +23,6 @@ class OptimizerGroupConfig:
 
 
 def _default_efficientnet_optim() -> OptimizerGroupConfig:
-    # Forensic motivation: Lower LR for backbone to stabilize early training
     return OptimizerGroupConfig(lr=1e-5, weight_decay=1.5e-4)
 
 
@@ -45,10 +44,7 @@ def _default_decoder_optim() -> OptimizerGroupConfig:
 
 @dataclass
 class HybridNGIMLOptimizerConfig:
-    """Optimizer hyper-parameters separated per backbone/fusion branch.
-
-    Forensic motivation: Lower backbone LR, higher forensic/fusion/decoder LRs, and support freezing backbone for early epochs.
-    """
+    """Optimizer configuration split by model branch."""
     efficientnet: OptimizerGroupConfig = field(default_factory=_default_efficientnet_optim)
     swin: OptimizerGroupConfig = field(default_factory=_default_swin_optim)
     residual: OptimizerGroupConfig = field(default_factory=_default_residual_optim)
@@ -78,29 +74,25 @@ class HybridNGIMLConfig:
     enable_low_level_residual_attention: bool = True
     enable_context_residual_attention: bool = False
     residual_attention_init_scale: float = 0.0
-    gradient_checkpointing: bool = True  # Enable gradient checkpointing for memory savings
-    flash_attention: bool = True  # Enable flash attention by default
-    xformers: bool = True  # Enable xformers by default
+    gradient_checkpointing: bool = True
+    flash_attention: bool = True
+    xformers: bool = True
 
 
 class HybridNGIML(nn.Module):
-    """Full NGIML model exposing fused multi-scale features.
-
-    Forensic motivation: Optionally applies residual-guided attention to semantic features before fusion, improving manipulation localization.
-    """
+    """Hybrid NGIML model with backbone extraction, fusion, and decoding."""
 
     def __init__(self, config: HybridNGIMLConfig | None = None) -> None:
         super().__init__()
         self.cfg = config or HybridNGIMLConfig()
         self.efficientnet: Optional[EfficientNetBackbone] = None
         self.swin: Optional[SwinBackbone] = None
-        self.noise: Optional[ResidualNoiseBranch] = None
+        self.noise: Optional[ResidualNoiseModule] = None
 
         if self.cfg.use_low_level:
             self.efficientnet = EfficientNetBackbone(self.cfg.efficientnet)
 
         if self.cfg.use_context:
-            # Pass flash_attention and xformers flags if present in config
             swin_kwargs = {}
             if hasattr(self.cfg, 'flash_attention'):
                 swin_kwargs['flash_attention'] = getattr(self.cfg, 'flash_attention', False)
@@ -109,7 +101,7 @@ class HybridNGIML(nn.Module):
             self.swin = SwinBackbone(self.cfg.swin, **swin_kwargs)
 
         if self.cfg.use_residual:
-            self.noise = ResidualNoiseBranch(self.cfg.residual)
+            self.noise = ResidualNoiseModule(self.cfg.residual)
 
         layout = {
             "low_level": self.efficientnet.out_channels if self.efficientnet is not None else [],
@@ -135,7 +127,6 @@ class HybridNGIML(nn.Module):
         self.fusion = MultiStageFeatureFusion(branch_channels, self.cfg.fusion)
         self.decoder = UNetDecoder(self.cfg.fusion.fusion_channels, self.cfg.decoder)
 
-        # Residual-guided attention module (optional)
         self.enable_residual_attention = (
             getattr(self.cfg, 'enable_residual_attention', False)
             and self.cfg.use_residual
@@ -203,8 +194,6 @@ class HybridNGIML(nn.Module):
         for stage_idx, proj in enumerate(projections):
             if stage_idx >= len(target_features) or stage_idx >= len(residual_features):
                 break
-            # Start from an identity modulation at zero init so residual guidance
-            # does not bias all semantic streams before learning.
             attn_map = (2.0 * torch.sigmoid(proj(residual_features[stage_idx]))) - 1.0
             if scales is not None and stage_idx < len(scales):
                 attn_map = attn_map * scales[stage_idx].view(1, 1, 1, 1)
@@ -218,7 +207,6 @@ class HybridNGIML(nn.Module):
         context = self.swin(x) if self.swin is not None else None
         residual = self.noise(x, residual_noise=residual_noise) if self.noise is not None else None
 
-        # Residual-guided attention (modulate semantic features before fusion)
         if self.enable_residual_attention and isinstance(residual, list):
             self._apply_residual_attention(
                 low_level,
@@ -232,13 +220,6 @@ class HybridNGIML(nn.Module):
                 getattr(self, "context_residual_attention_proj", nn.ModuleList()),
                 getattr(self, "context_residual_attention_scale", None),
             )
-
-        # Note: previous implementation attempted to checkpoint each child module
-        # by calling them directly with the original input `x`. That is incorrect
-        # because many backbone children expect the output of prior blocks, not
-        # the raw image, which can cause BatchNorm channel mismatches.
-        # For now, we avoid per-child checkpointing and rely on the backbone's
-        # own forward implementation (which may internally support memory saving).
 
         return {
             "low_level": low_level,

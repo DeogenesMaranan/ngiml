@@ -1,4 +1,3 @@
-"""Adaptive multi-branch feature fusion for NGIML."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -31,10 +30,7 @@ def _build_activation(name: str) -> nn.Module:
 
 @dataclass
 class FeatureFusionConfig:
-    """Config container for the multi-stage fusion module.
-
-    Forensic motivation: Optionally adds a spatial refinement layer after fusion output for each stage, improving spatial detail without large FLOP increase.
-    """
+    """Configuration for multi-stage feature fusion."""
 
     fusion_channels: Sequence[int]
     noise_branch: str = "residual"
@@ -42,17 +38,14 @@ class FeatureFusionConfig:
     noise_decay: float = 1.0
     norm: str = "bn"
     activation: str = "relu"
-    fusion_refinement: bool = True  # Add Conv3x3+IN+ReLU after fusion output (enabled by default)
+    fusion_refinement: bool = True
     enable_joint_gating: bool = False
     late_residual_boost_start: int = 1
     late_residual_boost: float = 0.0
 
 
 class _AdaptiveFusionStage(nn.Module):
-    """Stage-wise fusion with learned gating and post refinement.
-
-    Forensic motivation: Optionally adds a spatial refinement layer after fusion output for each stage, improving spatial detail without large FLOP increase.
-    """
+    """Single fusion stage with per-branch gates and optional refinement."""
     def __init__(
         self,
         branch_channels: Dict[str, int],
@@ -65,7 +58,6 @@ class _AdaptiveFusionStage(nn.Module):
     ) -> None:
         super().__init__()
         self.branch_order = tuple(branch_channels.keys())
-        # Conv only for projected features before fusion (no norm/activation)
         self.projections = nn.ModuleDict(
             {
                 branch: nn.Conv2d(in_ch, out_channels, kernel_size=1, bias=False)
@@ -123,25 +115,17 @@ class _AdaptiveFusionStage(nn.Module):
         if not features:
             raise ValueError("Fusion stage received no features to fuse")
 
-        # Determine alignment size: provided target overrides per-stage maximum.
         if target_size is not None:
             align_h, align_w = target_size
         else:
-            # Compute per-branch spatial sizes
             sizes = {branch: (tensor.shape[-2], tensor.shape[-1]) for branch, tensor in features.items()}
-            # Default to the maximum across branches
             max_h = max(h for h, w in sizes.values())
             max_w = max(w for h, w in sizes.values())
 
-            # If a noise/residual branch is present and is extremely larger than
-            # the other branches, avoid upsampling everything to that huge size
-            # (which can OOM). Instead prefer the maximum among non-noise
-            # branches when the residual spatial size exceeds others by >2x.
             non_noise_sizes = [s for b, s in sizes.items() if b != (noise_branch or "")] if features else []
             if non_noise_sizes:
                 non_max_h = max(h for h, w in non_noise_sizes)
                 non_max_w = max(w for h, w in non_noise_sizes)
-                # If the largest size is more than twice the non-noise max, cap it.
                 if max_h >= 2 * non_max_h:
                     max_h = non_max_h
                 if max_w >= 2 * non_max_w:
@@ -179,7 +163,6 @@ class _AdaptiveFusionStage(nn.Module):
             if branch not in aligned_projections:
                 continue
             proj = aligned_projections[branch]
-            # Feature-conditioned gating lets each branch adapt by region and channel.
             raw_gate = (
                 self.gate_generators[branch](proj)
                 + joint_gate_map[branch]
@@ -187,15 +170,9 @@ class _AdaptiveFusionStage(nn.Module):
             )
             gate = torch.sigmoid(raw_gate) * 0.8 + 0.1
             if noise_branch is not None and branch == noise_branch:
-                # weight noise branch by the configured noise weight
                 gate = gate * noise_weight
 
-            # Initialize fused/weight_sum tensors on first iteration to avoid
-            # creating large intermediate Python floats and to enable in-place
-            # accumulation which reduces peak memory.
             if fused is None:
-                # Initialize accumulators as regular tensors (not in-place) so
-                # autograd can track operations correctly.
                 fused = proj * gate
                 weight_sum = gate
             else:
@@ -218,10 +195,7 @@ class _AdaptiveFusionStage(nn.Module):
 
 
 class MultiStageFeatureFusion(nn.Module):
-    """Fuses multi-branch features across stages with adaptive gating.
-
-    Forensic motivation: Optionally adds a spatial refinement layer after fusion output for each stage, improving spatial detail without large FLOP increase.
-    """
+    """Fuse multi-branch features across decoder stages."""
     def __init__(
         self,
         branch_channels: Dict[str, Sequence[int]],

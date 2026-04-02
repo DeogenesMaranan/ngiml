@@ -78,7 +78,7 @@ class LovaszHingeLoss(nn.Module):
         super().__init__()
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        signs = targets * 2 - 1  # Convert targets to {-1, 1}
+        signs = targets * 2 - 1
         errors = 1 - logits * signs
         errors_sorted, perm = torch.sort(errors.view(errors.size(0), -1), dim=1, descending=True)
         perm = perm.detach()
@@ -98,36 +98,29 @@ class LovaszHingeLoss(nn.Module):
 
 @dataclass
 class MultiStageLossConfig:
-    """Configuration flags for the combined Dice + weighted BCE loss.
-
-    Forensic motivation: Reduce deep supervision strength so final prediction dominates total loss, improving stability for forensic segmentation. Optionally applies hard pixel mining to focus on ambiguous regions.
-    """
+    """Configuration for multi-stage segmentation loss."""
 
     dice_weight: float = 1.0
     bce_weight: float = 1.0
     pos_weight: float = 1.0
-    # Default stage weights: [0.05, 0.1, 0.2, 1.0] (final prediction dominates)
     stage_weights: Optional[Sequence[float]] = field(default_factory=lambda: [0.05, 0.1, 0.2, 1.0])
     smooth: float = 1e-6
-    hybrid_mode: str = "dice_bce"  # one of: dice_bce, dice_focal
+    hybrid_mode: str = "dice_bce"
     focal_gamma: float = 2.0
     focal_alpha: float = 0.25
     tversky_weight: float = 0.0
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.8
-    lovasz_weight: float = 0.0  # Weight for Lovasz Hinge Loss
+    lovasz_weight: float = 0.0
     use_boundary_loss: bool = False
     boundary_weight: float = 0.03
-    hard_pixel_mining: bool = False  # Disable hard pixel mining by default to stabilize training
+    hard_pixel_mining: bool = False
     
 
 
 
 class MultiStageManipulationLoss(nn.Module):
-    """Applies configurable hybrid segmentation supervision at every prediction stage, with optional boundary loss.
-
-    Forensic motivation: Adds Sobel-based boundary loss to encourage sharper manipulation boundaries.
-    """
+    """Hybrid multi-stage loss with optional boundary supervision."""
     def __init__(self, config: MultiStageLossConfig | None = None) -> None:
         super().__init__()
         self.cfg = config or MultiStageLossConfig()
@@ -189,15 +182,13 @@ class MultiStageManipulationLoss(nn.Module):
                 focal = self.focal(logits, target)
                 hybrid_term = self.cfg.bce_weight * focal
 
-            # Hard pixel mining: weight loss by pixel difficulty
             if getattr(self.cfg, "hard_pixel_mining", False):
                 with torch.no_grad():
                     pred_prob = torch.sigmoid(logits)
                     difficulty = torch.abs(pred_prob - target)
                     weight = 1.0 + 2.0 * (difficulty > 0.3).float()
-                # Apply weighting to BCE/focal and dice
                 hybrid_term = (hybrid_term * weight).mean()
-                dice = (1.0 - ((1.0 - dice) * weight).mean())  # Weighted dice
+                dice = (1.0 - ((1.0 - dice) * weight).mean())
             else:
                 hybrid_term = hybrid_term.mean() if hybrid_term.ndim > 0 else hybrid_term
 
@@ -210,7 +201,6 @@ class MultiStageManipulationLoss(nn.Module):
             total_loss += stage_weight * stage_loss
             normalizer += stage_weight
 
-        # Add boundary loss on stage-0 (highest-resolution) prediction.
         if self.use_boundary_loss and self.boundary_loss is not None and preds:
             boundary = self.boundary_loss(preds[0], target)
             total_loss += self.boundary_weight * boundary
@@ -218,13 +208,9 @@ class MultiStageManipulationLoss(nn.Module):
         return total_loss / max(normalizer, 1e-6)
 
 class SobelBoundaryLoss(nn.Module):
-    """Sobel-based boundary loss for sharper manipulation boundaries.
-
-    Forensic motivation: Penalizes boundary errors by comparing Sobel gradient magnitudes of prediction and target.
-    """
+    """Boundary loss based on Sobel gradient magnitude matching."""
     def __init__(self):
         super().__init__()
-        # Sobel kernels
         sobel_x = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3)
         sobel_y = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3)
         self.register_buffer('sobel_x', sobel_x)
@@ -237,11 +223,8 @@ class SobelBoundaryLoss(nn.Module):
     ) -> Tensor:
         pred = torch.sigmoid(pred)
         target = target.float()
-        # Ensure sobel kernels match input dtype/device to avoid type-mismatch
-        # errors when using mixed precision (e.g., fp16/bf16).
         sobel_x = self.sobel_x.to(dtype=pred.dtype, device=pred.device)
         sobel_y = self.sobel_y.to(dtype=pred.dtype, device=pred.device)
-        # Compute gradients
         grad_pred_x = F.conv2d(pred, sobel_x, padding=1)
         grad_pred_y = F.conv2d(pred, sobel_y, padding=1)
         grad_target_x = F.conv2d(target, sobel_x, padding=1)

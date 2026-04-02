@@ -45,32 +45,26 @@ class _ConvBlock(nn.Module):
 
 @dataclass
 class UNetDecoderConfig:
-    """Configuration for the U-Net style decoder.
-
-    Forensic motivation: Use InstanceNorm by default to improve stability for forensic segmentation. Optionally inject edge-aware refinement for sharper boundaries. Optionally apply Dropout2d to the highest-res decoder output to regularize overfitting to spurious artifacts.
-    """
+    """Configuration for UNetDecoder."""
 
     decoder_channels: Sequence[int] | None = None
     out_channels: int = 1
-    norm: str = "in"  # Default to InstanceNorm
+    norm: str = "in"
     activation: str = "relu"
     per_stage_heads: bool = True
-    enable_edge_guidance: bool = True  # Edge-aware decoder refinement (enabled by default)
-    use_dropout: bool = True  # Dropout2d in highest-res decoder output enabled by default
+    enable_edge_guidance: bool = True
+    use_dropout: bool = True
     dropout_p: float = 0.2
-    enable_boundary_refinement: bool = True  # Sobel-guided residual correction after final logits
-    boundary_refine_channels: int = 8  # Lightweight hidden width for post-logit correction
-    boundary_refine_scale: float = 1.0  # Multiplicative scale for residual correction
-    enable_detail_refinement: bool = True  # Final-stage detail correction for small/low-res regions
-    detail_refine_channels: int = 16  # Lightweight hidden width for final detail refinement
-    detail_refine_scale: float = 1.0  # Multiplicative scale for final residual correction
+    enable_boundary_refinement: bool = True
+    boundary_refine_channels: int = 8
+    boundary_refine_scale: float = 1.0
+    enable_detail_refinement: bool = True
+    detail_refine_channels: int = 16
+    detail_refine_scale: float = 1.0
 
 
 class UNetDecoder(nn.Module):
-    """U-Net decoder that upsamples fused features into manipulation logits.
-
-    Forensic motivation: Optionally injects Sobel edge map into highest-resolution decoder feature for improved boundary localization.
-    """
+    """Decoder mapping fused features to segmentation logits."""
 
     def __init__(self, stage_channels: Sequence[int], config: UNetDecoderConfig | None = None) -> None:
         super().__init__()
@@ -91,16 +85,13 @@ class UNetDecoder(nn.Module):
             decoder_channels = tuple(self.cfg.decoder_channels)
         self.decoder_channels = tuple(decoder_channels)
 
-        # Edge-aware decoder refinement (optional)
         self.enable_edge_guidance = getattr(self.cfg, 'enable_edge_guidance', False)
         if self.enable_edge_guidance:
-            # Project Sobel edge map to decoder feature channels
             self.edge_proj = nn.Sequential(
                 nn.Conv2d(1, self.decoder_channels[0], kernel_size=3, padding=1, bias=False),
                 _build_norm(self.cfg.norm, self.decoder_channels[0]),
                 _build_activation(self.cfg.activation),
             )
-            # Sobel kernels
             sobel_x = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3)
             sobel_y = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3)
             self.register_buffer('sobel_x', sobel_x)
@@ -154,12 +145,10 @@ class UNetDecoder(nn.Module):
                 _build_activation(self.cfg.activation),
                 nn.Conv2d(refine_channels, self.cfg.out_channels, kernel_size=1, bias=True),
             )
-            # Preserve identity behavior at initialization.
             nn.init.zeros_(self.detail_refine_head[-1].weight)
             if self.detail_refine_head[-1].bias is not None:
                 nn.init.zeros_(self.detail_refine_head[-1].bias)
 
-        # Lightweight post-logit boundary refinement (optional).
         self.enable_boundary_refinement = bool(getattr(self.cfg, "enable_boundary_refinement", False))
         self.boundary_refine_scale = float(getattr(self.cfg, "boundary_refine_scale", 1.0))
         if self.enable_boundary_refinement:
@@ -169,7 +158,6 @@ class UNetDecoder(nn.Module):
                 _build_activation(self.cfg.activation),
                 nn.Conv2d(refine_channels, self.cfg.out_channels, kernel_size=1, bias=True),
             )
-            # Start from an identity mapping: logits + 0.0 * residual.
             nn.init.zeros_(self.boundary_refine_head[-1].weight)
             if self.boundary_refine_head[-1].bias is not None:
                 nn.init.zeros_(self.boundary_refine_head[-1].bias)
@@ -184,7 +172,6 @@ class UNetDecoder(nn.Module):
             return logits
 
         if logits.shape[1] != self.cfg.out_channels:
-            # Conservative fallback for unexpected channel layouts.
             return logits
 
         sobel_x = self.boundary_sobel_x.to(dtype=logits.dtype, device=logits.device)
@@ -197,7 +184,6 @@ class UNetDecoder(nn.Module):
             edge_mag = torch.sqrt(grad_x * grad_x + grad_y * grad_y + 1e-6)
             refine_in = torch.cat([logits, edge_mag], dim=1)
         else:
-            # Grouped Sobel for multi-channel logits (kept for completeness).
             probs = torch.sigmoid(logits)
             groups = int(logits.shape[1])
             sx = sobel_x.repeat(groups, 1, 1, 1)
@@ -242,9 +228,7 @@ class UNetDecoder(nn.Module):
 
         projected = [proj(feat) for proj, feat in zip(self.skip_projections, features)]
 
-        # Edge-aware refinement: inject projected Sobel edge map into highest-res decoder feature
         if self.enable_edge_guidance and image is not None:
-            # Compute grayscale edge map
             with torch.no_grad():
                 if image.shape[1] > 1:
                     gray = image.mean(dim=1, keepdim=True)
@@ -254,8 +238,6 @@ class UNetDecoder(nn.Module):
                 grad_y = F.conv2d(gray, self.sobel_y, padding=1)
                 edge_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-6)
             edge_proj = self.edge_proj(edge_mag)
-            # Ensure edge projection spatial size matches the highest-res
-            # decoder feature before addition (avoid mismatched dimensions).
             if edge_proj.shape[-2:] != projected[0].shape[-2:]:
                 edge_proj = F.interpolate(
                     edge_proj, size=projected[0].shape[-2:], mode="bilinear", align_corners=False
@@ -279,7 +261,6 @@ class UNetDecoder(nn.Module):
                 predictions[idx] = self.predictors[idx](x)
 
         if self.cfg.per_stage_heads:
-            # Optionally apply dropout to highest-res output
             out_preds = [pred for pred in predictions if pred is not None]
             if self.use_dropout and out_preds:
                 out_preds[0] = self.dropout(out_preds[0])

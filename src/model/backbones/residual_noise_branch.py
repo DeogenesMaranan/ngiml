@@ -1,25 +1,25 @@
 ﻿from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, List
+import logging
 
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 
+_LOG = logging.getLogger(__name__)
+
 
 @dataclass
 class ResidualNoiseConfig:
-    """Configuration for the SRM residual branch / multi-scale backbone."""
-    num_kernels: int = 3  # SRM kernels (fixed)
-    base_channels: int = 32  # CNN backbone base channels
-    num_stages: int = 4      # Number of pyramid stages
+    """Configuration for residual-noise backbone."""
+    num_kernels: int = 3
+    base_channels: int = 32
+    num_stages: int = 4
 
 
 class ConvBlock(nn.Module):
-    """Basic 2-layer conv + norm + ReLU block.
-
-    Forensic motivation: Normalization is disabled for residual/noise branch to preserve forensic frequency statistics.
-    """
+    """Two-layer convolutional block."""
     def __init__(self, in_channels: int, out_channels: int, norm_layer: nn.Module = None) -> None:
         super().__init__()
         if norm_layer is None:
@@ -38,24 +38,15 @@ class ConvBlock(nn.Module):
 
 
 class ResidualNoiseModule(nn.Module):
-    """
-    Combined SRM residual extractor + learnable multi-scale CNN backbone.
-
-    Forensic motivation: Disables normalization for residual branch to preserve forensic signal integrity. Adds learnable scale to strengthen residual branch contribution.
-
-    For splicing / copy-move detection:
-        Image â†’ SRMResidualBranch â†’ ResidualNoiseBackbone â†’ multi-scale features
-    """
+    """SRM residual extractor with multi-scale CNN feature backbone."""
 
     def __init__(self, config: Optional[ResidualNoiseConfig] = None, in_channels: int = 3) -> None:
         super().__init__()
         cfg = config or ResidualNoiseConfig()
         self.cfg = cfg
         self.in_channels = in_channels
-        # Learnable scale for residual branch
         self.residual_scale = nn.Parameter(torch.tensor(1.5))
 
-        # --- SRM Residual Branch ---
         srm_kernels = torch.tensor([
             [[0, 0, 0, 0, 0],
              [0, -1, 2, -1, 0],
@@ -75,11 +66,10 @@ class ResidualNoiseModule(nn.Module):
         ], dtype=torch.float32)
         srm_kernels /= torch.abs(srm_kernels).sum(dim=(1, 2), keepdim=True)
         self.register_buffer("srm_kernels", srm_kernels.view(cfg.num_kernels, 1, 5, 5), persistent=False)
-        self.srm_out_channels = in_channels * cfg.num_kernels  # e.g., RGB * 3
+        self.srm_out_channels = in_channels * cfg.num_kernels
         self._cached_srm_kernels: Tensor | None = None
         self._cached_srm_key: tuple[torch.dtype, torch.device, int] | None = None
 
-        # --- Multi-scale residual backbone ---
         stage_channels = [cfg.base_channels * (2**i) for i in range(cfg.num_stages)]
         self.feature_dims = stage_channels
         self.out_channels = stage_channels
@@ -88,7 +78,6 @@ class ResidualNoiseModule(nn.Module):
         downsamplers = []
         current_in = self.srm_out_channels
         for idx, out_channels in enumerate(stage_channels):
-            # Disable normalization for residual branch
             norm_layer = nn.Identity()
             blocks.append(ConvBlock(current_in, out_channels, norm_layer=norm_layer))
             current_in = out_channels
@@ -114,15 +103,8 @@ class ResidualNoiseModule(nn.Module):
         self._cached_srm_key = key
         return kernels
 
-    # ------------------------------------------------------------------
     def forward(self, x: Tensor, residual_noise: Tensor | None = None) -> List[Tensor]:
-        """
-        Args:
-            x : (B, C, H, W), e.g., RGB image
-        Returns:
-            List of multi-scale feature tensors from CNN backbone
-        """
-        # --- SRM residuals ---
+        """Extract multi-scale residual features."""
         c = x.shape[1]
         kernels = self._get_srm_kernels(x)
         residual_map = F.conv2d(
@@ -130,7 +112,7 @@ class ResidualNoiseModule(nn.Module):
             kernels,
             padding=2,
             groups=c,
-        )  # shape: (B, C*3, H, W)
+        )
 
         if residual_noise is not None:
             hp = residual_noise
@@ -163,9 +145,7 @@ class ResidualNoiseModule(nn.Module):
             )
             residual_map = 0.5 * (residual_map + hp_residual_map)
 
-        # --- Multi-scale CNN ---
         features = []
-        # Apply learnable scale to residuals before fusion
         out = residual_map * self.residual_scale
         for idx, block in enumerate(self.blocks):
             out = block(out)
@@ -175,8 +155,5 @@ class ResidualNoiseModule(nn.Module):
         return features
 
 
-# Backward compatibility for existing imports
-ResidualNoiseBranch = ResidualNoiseModule
-
-__all__ = ["ResidualNoiseModule", "ResidualNoiseBranch", "ResidualNoiseConfig"]
+__all__ = ["ResidualNoiseModule", "ResidualNoiseConfig"]
 
