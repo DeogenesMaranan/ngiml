@@ -14,7 +14,6 @@ from typing import Dict, Optional, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
-
 from src.data.dataloaders import AugmentationConfig, create_dataloaders, load_manifest
 from src.model.hybrid_ngiml import HybridNGIML, HybridNGIMLConfig
 from src.model.losses import MultiStageLossConfig
@@ -156,13 +155,6 @@ def _segmentation_counts(logits: torch.Tensor, target: torch.Tensor, threshold: 
     fp = torch.sum(pred * (1.0 - target)).item()
     fn = torch.sum((1.0 - pred) * target).item()
     return {"tp": float(tp), "tn": float(tn), "fp": float(fp), "fn": float(fn)}
-
-
-def _select_pred_head(preds: Sequence[torch.Tensor]) -> torch.Tensor:
-    """Return the highest-resolution decoder prediction tensor."""
-    if not preds:
-        raise ValueError("Model returned empty predictions list")
-    return preds[0]
 
 
 def _metrics_from_counts(tp: float, tn: float, fp: float, fn: float, eps: float = 1e-6) -> Dict[str, float]:
@@ -366,30 +358,6 @@ def _resolve_cuda_runtime_stability(cfg: TrainConfig, device: torch.device) -> T
         )
         return resolved
     return cfg
-
-
-def _disable_pretrained_backbones_for_checkpoint_load(model_cfg: HybridNGIMLConfig) -> HybridNGIMLConfig:
-    """Return a config that avoids external backbone downloads during checkpoint restore."""
-    cfg_out = model_cfg
-    try:
-        if hasattr(cfg_out.efficientnet, "pretrained"):
-            cfg_out = replace(cfg_out, efficientnet=replace(cfg_out.efficientnet, pretrained=False))
-    except Exception:
-        try:
-            cfg_out.efficientnet.pretrained = False
-        except Exception:
-            pass
-
-    try:
-        if hasattr(cfg_out.swin, "pretrained"):
-            cfg_out = replace(cfg_out, swin=replace(cfg_out.swin, pretrained=False))
-    except Exception:
-        try:
-            cfg_out.swin.pretrained = False
-        except Exception:
-            pass
-
-    return cfg_out
 
 
 def _should_disable_compile_for_device(cfg: TrainConfig, device: torch.device) -> bool:
@@ -655,11 +623,6 @@ def _resolve_manifest_for_training(cfg: TrainConfig, out_dir: Path) -> Path:
 
     print(f"Materializing tar::npz samples to local cache: {cache_root}")
     return _materialize_tar_npz_manifest(manifest_path, cache_root)
-
-
-def _checkpoint_epoch(path: Path) -> int:
-    match = re.search(r"checkpoint_epoch_(\d+)\.pt$", path.name)
-    return int(match.group(1)) if match else -1
 
 
 def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
@@ -952,10 +915,8 @@ __all__ = [
     "to_float_label_ratio",
     "_build_lr_scheduler",
     "_build_threshold_grid",
-    "_checkpoint_epoch",
     "_coerce_loss_config",
     "_coerce_model_config",
-    "_disable_pretrained_backbones_for_checkpoint_load",
     "_empty_bin_stats",
     "_finalize_bin_stats",
     "_initial_best_for_monitor",
@@ -969,7 +930,6 @@ __all__ = [
     "_resolve_cuda_runtime_stability",
     "_resolve_manifest_for_training",
     "_segmentation_counts",
-    "_select_pred_head",
     "_select_threshold_with_precision_guard",
     "_set_backbone_trainability_for_epoch",
     "_should_disable_compile_for_device",

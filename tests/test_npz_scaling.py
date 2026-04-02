@@ -3,7 +3,7 @@ import torch
 
 from src.data.config import SampleRecord
 from src.data.dataloaders import _compute_residual_noise, _load_from_npz
-from tools.infer_helpers import load_image_mask_from_record
+from src.infer_helpers import load_image_mask_from_record
 
 
 def test_npz_uint8_scaled_to_unit_float32(tmp_path):
@@ -96,4 +96,5 @@ def test_npz_mask_is_resized_to_match_image_shape(tmp_path):
     assert out_image.shape == (3, 448, 448)
     assert out_mask is not None
     assert out_mask.shape == (1, 448, 448)
+
 

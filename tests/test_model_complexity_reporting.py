@@ -1,6 +1,6 @@
-import torch
+﻿import torch
 
-import tools.infer_helpers as infer_helpers
+import src.infer_helpers as infer_helpers
 from src.model.hybrid_ngiml import HybridNGIML
 from src.training_defaults import build_default_components
 
@@ -14,3 +14,4 @@ def test_get_model_complexity_stats_prefers_thop():
     assert stats["flops_source"] == "thop"
     assert float(stats["macs"]) > 3.0e10
     assert float(stats["flops"]) > 6.0e10
+

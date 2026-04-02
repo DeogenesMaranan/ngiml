@@ -6,26 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-
-
-def _build_norm(norm: str, channels: int) -> nn.Module:
-    norm = norm.lower()
-    if norm == "bn":
-        return nn.BatchNorm2d(channels)
-    if norm == "in":
-        return nn.InstanceNorm2d(channels, affine=True)
-    raise ValueError(f"Unsupported norm type: {norm}")
-
-
-def _build_activation(name: str) -> nn.Module:
-    name = name.lower()
-    if name == "relu":
-        return nn.ReLU(inplace=True)
-    if name == "gelu":
-        return nn.GELU()
-    if name == "silu":
-        return nn.SiLU(inplace=True)
-    raise ValueError(f"Unsupported activation: {name}")
+from src.model.common_layers import build_activation, build_norm
 
 
 @dataclass
@@ -69,7 +50,7 @@ class _AdaptiveFusionStage(nn.Module):
             {
                 branch: nn.Sequential(
                     nn.Conv2d(out_channels, gate_hidden, kernel_size=1, bias=True),
-                    _build_activation(activation),
+                    build_activation(activation),
                     nn.Conv2d(gate_hidden, out_channels, kernel_size=1, bias=True),
                 )
                 for branch in branch_channels
@@ -80,7 +61,7 @@ class _AdaptiveFusionStage(nn.Module):
             joint_in_channels = out_channels * len(self.branch_order)
             self.joint_gate_generator = nn.Sequential(
                 nn.Conv2d(joint_in_channels, gate_hidden, kernel_size=1, bias=True),
-                _build_activation(activation),
+                build_activation(activation),
                 nn.Conv2d(gate_hidden, out_channels * len(self.branch_order), kernel_size=1, bias=True),
             )
         else:
@@ -93,8 +74,8 @@ class _AdaptiveFusionStage(nn.Module):
         )
         self.refine = nn.Sequential(
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            _build_norm(norm, out_channels),
-            _build_activation(activation),
+            build_norm(norm, out_channels),
+            build_activation(activation),
         )
         self.fusion_refinement = fusion_refinement
         self.late_residual_boost = max(late_residual_boost, 0.0)

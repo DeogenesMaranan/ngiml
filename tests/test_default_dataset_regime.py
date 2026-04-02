@@ -1,4 +1,4 @@
-from tools.colab_train_helpers import build_default_components
+﻿from src.colab_train_helpers import build_default_components
 from tools.prepare_datasets import build_default_configs
 
 

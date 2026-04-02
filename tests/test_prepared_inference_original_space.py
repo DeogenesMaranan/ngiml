@@ -1,6 +1,6 @@
-import numpy as np
+﻿import numpy as np
 
-from tools.infer_helpers import _original_space_ground_truth, _original_space_probability
+from src.infer_helpers import _original_space_ground_truth, _original_space_probability
 
 
 def test_original_space_restore_for_padded_sample():
@@ -39,3 +39,4 @@ def test_original_space_restore_for_resize_then_pad_sample():
     assert restored_prob.shape == (6, 2)
     assert np.array_equal(restored_gt, np.ones((6, 2), dtype=np.uint8))
     assert np.allclose(restored_prob, np.ones((6, 2), dtype=np.float32))
+

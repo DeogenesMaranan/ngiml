@@ -1,4 +1,4 @@
-from tools.colab_train_helpers import apply_colab_runtime_settings, build_default_components, build_training_config
+﻿from src.colab_train_helpers import apply_colab_runtime_settings, build_default_components, build_training_config
 from src.model.hybrid_ngiml import HybridNGIMLConfig
 from src.model.feature_fusion import FeatureFusionConfig
 
@@ -26,7 +26,7 @@ def test_apply_colab_runtime_settings_caps_excessive_num_workers():
     cfg = {
         "num_workers": 6,
     }
-    import tools.colab_train_helpers as helpers
+    import src.colab_train_helpers as helpers
 
     original_cpu_count = helpers.os.cpu_count
     try:
@@ -69,3 +69,4 @@ def test_further_lite_defaults_enable_low_level_only_residual_attention_and_disa
     assert model_cfg.enable_context_residual_attention is False
     assert model_cfg.residual_attention_init_scale == 0.0
     assert fusion_cfg.enable_joint_gating is False
+

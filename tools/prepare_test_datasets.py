@@ -1,12 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
-import io
 import json
 import shutil
 import sys
-import tarfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
@@ -26,6 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.config import Manifest, SampleRecord
+from src.prepare_shared import TarShardWriter, discover_images
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
@@ -77,15 +75,6 @@ def default_specs() -> list[DatasetSpec]:
     ]
 
 
-def _discover_images(root: Path) -> list[Path]:
-    if not root.exists():
-        return []
-    return sorted(
-        p for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-    )
-
-
 def _safe_name(value: str) -> str:
     text = value.replace("\\", "_").replace("/", "_").replace(" ", "_")
     return "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in text)
@@ -93,7 +82,7 @@ def _safe_name(value: str) -> str:
 
 def _build_mask_index(mask_dir: Path) -> dict[str, Path]:
     index: dict[str, Path] = {}
-    for path in _discover_images(mask_dir):
+    for path in discover_images(mask_dir, IMAGE_EXTENSIONS, return_empty_if_missing=True):
         key = path.stem.lower()
         if key not in index:
             index[key] = path
@@ -112,7 +101,7 @@ def _resolve_mask(
 
 
 def _pad_to_size(arr: np.ndarray, size: int, mode: str, constant: int = 0) -> np.ndarray:
-    """Pad a HW or HWC array to size×size. Never upsamples."""
+    """Pad a HW or HWC array to size x size. Never upsamples."""
     h, w = arr.shape[:2]
     pad_h = max(0, size - h)
     pad_w = max(0, size - w)
@@ -132,14 +121,14 @@ def _pad_to_size(arr: np.ndarray, size: int, mode: str, constant: int = 0) -> np
 
 
 def _process_image(image_path: Path, size: int) -> tuple[np.ndarray, tuple[int, int], str]:
-    """Load and bring image to size×size.
+    """Load and bring image to size x size.
 
     Cases:
-      A — both dims >= size: resize to size×size (BILINEAR). All models get
-          the same squash distortion — fair controlled comparison.
-      B — either dim < size (after any needed downscale): pad to size×size
-          with symmetric padding. No upsampling — forensic cues preserved.
-      C — one dim > size, other dim < size (extreme aspect ratio): resize
+      A - both dims >= size: resize to size x size (BILINEAR). All models get
+          the same squash distortion - fair controlled comparison.
+      B - either dim < size (after any needed downscale): pad to size x size
+          with symmetric padding. No upsampling - forensic cues preserved.
+      C - one dim > size, other dim < size (extreme aspect ratio): resize
           long side to size (downscale only), then pad short side to size.
 
     Returns:
@@ -152,18 +141,18 @@ def _process_image(image_path: Path, size: int) -> tuple[np.ndarray, tuple[int, 
     h, w = original_hw
 
     if h >= size and w >= size:
-        # Case A — both dims large enough, direct resize
+        # Case A - both dims large enough, direct resize
         if image.size != (size, size):
             image = image.resize((size, size), resample=Image.BILINEAR)
         return np.asarray(image, dtype=np.uint8), original_hw, "resize"
 
     if h <= size and w <= size:
-        # Case B — both dims below size, pad only
+        # Case B - both dims below size, pad only
         arr = np.asarray(image, dtype=np.uint8)
         arr = _pad_to_size(arr, size, mode="symmetric")
         return arr, original_hw, "pad"
 
-    # Case C — one dim > size, other < size (extreme aspect ratio)
+    # Case C - one dim > size, other < size (extreme aspect ratio)
     # Downscale the long side to size, then pad the short side.
     long_side = max(h, w)
     scale = size / long_side
@@ -176,12 +165,12 @@ def _process_image(image_path: Path, size: int) -> tuple[np.ndarray, tuple[int, 
 
 
 def _process_mask(mask_path: Path, size: int, original_hw: tuple[int, int], preproc_mode: str) -> np.ndarray:
-    """Load and bring mask to size×size using the same path as the image.
+    """Load and bring mask to size x size using the same path as the image.
 
     Mirrors _process_image exactly:
-      - resize → NEAREST resize to size×size
-      - pad → zero pad to size×size
-      - resize_then_pad → NEAREST downscale long side, then zero pad
+      - resize -> NEAREST resize to size x size
+      - pad -> zero pad to size x size
+      - resize_then_pad -> NEAREST downscale long side, then zero pad
     Binarizes at 127 after all transforms.
     """
     mask = Image.open(mask_path).convert("L")
@@ -220,7 +209,7 @@ def _save_npz(
 ) -> None:
     """Save image and optional mask to uncompressed NPZ.
 
-    mask_np is None for real images — evaluator assumes all-zero ground truth.
+    mask_np is None for real images - evaluator assumes all-zero ground truth.
     """
     npz_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_json = json.dumps(metadata, ensure_ascii=True)
@@ -230,7 +219,7 @@ def _save_npz(
     }
     if mask_np is not None:
         arrays["mask"] = mask_np
-    # ZIP_STORED (uncompressed) — do not switch to savez_compressed.
+    # ZIP_STORED (uncompressed) - do not switch to savez_compressed.
     np.savez(npz_path, **arrays)
 
 
@@ -244,45 +233,6 @@ def _append_manifest_row(jsonl_path: Path, row: dict[str, object]) -> None:
 # ---------------------------------------------------------------------------
 # Tar sharding
 # ---------------------------------------------------------------------------
-
-class TarShardWriter:
-    """Write NPZ payloads into sequential uncompressed tar shards."""
-
-    def __init__(self, out_root: Path, shard_size: int) -> None:
-        self.out_root = out_root
-        self.shard_size = max(1, shard_size)
-        self.shard_idx = 0
-        self.current: tarfile.TarFile | None = None
-        self.current_path: Path | None = None
-        self.count_in_shard = 0
-
-    def _start_new_shard(self) -> None:
-        self.out_root.mkdir(parents=True, exist_ok=True)
-        tar_path = self.out_root / f"shard_{self.shard_idx:05d}.tar"
-        self.shard_idx += 1
-        self.count_in_shard = 0
-        if self.current is not None:
-            self.current.close()
-        self.current = tarfile.open(tar_path, mode="w")
-        self.current_path = tar_path
-
-    def add(self, payload_bytes: bytes, member_name: str) -> tuple[str, str]:
-        if self.current is None or self.count_in_shard >= self.shard_size:
-            self._start_new_shard()
-        assert self.current is not None and self.current_path is not None
-        info = tarfile.TarInfo(name=member_name)
-        info.size = len(payload_bytes)
-        info.mtime = time.time()
-        self.current.addfile(info, io.BytesIO(payload_bytes))
-        self.count_in_shard += 1
-        return str(self.current_path), member_name
-
-    def close(self) -> None:
-        if self.current is not None:
-            self.current.close()
-            self.current = None
-            self.current_path = None
-
 
 def _shard_records(
     records: list[SampleRecord],
@@ -386,11 +336,11 @@ def prepare_test_datasets(
         entries: list[tuple[str, Path, Path | None, int]] = []
 
         if spec.real_dir:
-            for image_path in _discover_images(dataset_root / spec.real_dir):
+            for image_path in discover_images(dataset_root / spec.real_dir, IMAGE_EXTENSIONS, return_empty_if_missing=True):
                 entries.append(("real", image_path, None, 0))
 
         if spec.fake_dir:
-            for image_path in _discover_images(dataset_root / spec.fake_dir):
+            for image_path in discover_images(dataset_root / spec.fake_dir, IMAGE_EXTENSIONS, return_empty_if_missing=True):
                 mask_path = _resolve_mask(image_path, mask_index, spec.mask_stem_candidates)
                 if mask_path is None:
                     skipped_missing_mask += 1
@@ -431,10 +381,10 @@ def prepare_test_datasets(
                 "original_size_hw": list(original_hw),
                 "processed_size_hw": [size, size],
                 "processed_sample_path": str(npz_path),
-                # How the image was brought to size×size — useful for
+                # How the image was brought to size x size - useful for
                 # breaking down metrics by preprocessing path.
                 "preproc_mode": preproc_mode,
-                # True for reals — evaluator assumes all-zero ground truth.
+                # True for reals - evaluator assumes all-zero ground truth.
                 "mask_is_all_zero": mask_np is None,
                 "mask_foreground_pixels": int(mask_np.sum()) if mask_np is not None else 0,
                 "storage": "npz",
@@ -509,7 +459,7 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Prepare benchmark test datasets for fair evaluation against "
             "MantraNet, ProFact, and MVSSNet. Images >= SIZE are resized to "
-            "SIZE×SIZE. Images < SIZE are padded to SIZE×SIZE without upsampling."
+            "SIZE x SIZE. Images < SIZE are padded to SIZE x SIZE without upsampling."
         )
     )
     parser.add_argument(
@@ -540,7 +490,7 @@ def parse_args() -> argparse.Namespace:
         "--size",
         type=int,
         default=448,
-        help="Target square size — images resized or padded to size×size (default: 448)",
+        help="Target square size - images resized or padded to size x size (default: 448)",
     )
     parser.add_argument(
         "--split",

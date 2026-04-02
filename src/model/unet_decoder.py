@@ -7,24 +7,7 @@ from typing import List, Optional, Sequence
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-
-
-def _build_norm(kind: str, channels: int) -> nn.Module:
-    if kind.lower() == "bn":
-        return nn.BatchNorm2d(channels)
-    if kind.lower() == "in":
-        return nn.InstanceNorm2d(channels, affine=True)
-    raise ValueError(f"Unsupported norm type: {kind}")
-
-
-def _build_activation(name: str) -> nn.Module:
-    if name.lower() == "relu":
-        return nn.ReLU(inplace=True)
-    if name.lower() == "gelu":
-        return nn.GELU()
-    if name.lower() == "silu":
-        return nn.SiLU(inplace=True)
-    raise ValueError(f"Unsupported activation: {name}")
+from src.model.common_layers import build_activation, build_norm
 
 
 class _ConvBlock(nn.Module):
@@ -32,11 +15,11 @@ class _ConvBlock(nn.Module):
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            _build_norm(norm, out_channels),
-            _build_activation(activation),
+            build_norm(norm, out_channels),
+            build_activation(activation),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            _build_norm(norm, out_channels),
-            _build_activation(activation),
+            build_norm(norm, out_channels),
+            build_activation(activation),
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -89,8 +72,8 @@ class UNetDecoder(nn.Module):
         if self.enable_edge_guidance:
             self.edge_proj = nn.Sequential(
                 nn.Conv2d(1, self.decoder_channels[0], kernel_size=3, padding=1, bias=False),
-                _build_norm(self.cfg.norm, self.decoder_channels[0]),
-                _build_activation(self.cfg.activation),
+                build_norm(self.cfg.norm, self.decoder_channels[0]),
+                build_activation(self.cfg.activation),
             )
             sobel_x = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3)
             sobel_y = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3)
@@ -101,8 +84,8 @@ class UNetDecoder(nn.Module):
             [
                 nn.Sequential(
                     nn.Conv2d(in_ch, dec_ch, kernel_size=1, bias=False),
-                    _build_norm(self.cfg.norm, dec_ch),
-                    _build_activation(self.cfg.activation),
+                    build_norm(self.cfg.norm, dec_ch),
+                    build_activation(self.cfg.activation),
                 )
                 for in_ch, dec_ch in zip(self.stage_channels, self.decoder_channels)
             ]
@@ -141,8 +124,8 @@ class UNetDecoder(nn.Module):
             detail_in_channels = (self.decoder_channels[0] * 2) + self.cfg.out_channels
             self.detail_refine_head = nn.Sequential(
                 nn.Conv2d(detail_in_channels, refine_channels, kernel_size=3, padding=1, bias=False),
-                _build_norm(self.cfg.norm, refine_channels),
-                _build_activation(self.cfg.activation),
+                build_norm(self.cfg.norm, refine_channels),
+                build_activation(self.cfg.activation),
                 nn.Conv2d(refine_channels, self.cfg.out_channels, kernel_size=1, bias=True),
             )
             nn.init.zeros_(self.detail_refine_head[-1].weight)
@@ -155,7 +138,7 @@ class UNetDecoder(nn.Module):
             refine_channels = int(max(1, getattr(self.cfg, "boundary_refine_channels", 8)))
             self.boundary_refine_head = nn.Sequential(
                 nn.Conv2d(2, refine_channels, kernel_size=3, padding=1, bias=False),
-                _build_activation(self.cfg.activation),
+                build_activation(self.cfg.activation),
                 nn.Conv2d(refine_channels, self.cfg.out_channels, kernel_size=1, bias=True),
             )
             nn.init.zeros_(self.boundary_refine_head[-1].weight)

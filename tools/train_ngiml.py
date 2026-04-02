@@ -37,6 +37,11 @@ from src.data.dataloaders import (
     _apply_gpu_augmentations_batch,
     _normalize,
 )
+from src.checkpoint_utils import (
+    disable_pretrained_backbones_for_checkpoint_load,
+    parse_checkpoint_epoch,
+    select_highest_resolution_head,
+)
 from src.model.hybrid_ngiml import HybridNGIML, HybridNGIMLConfig
 from src.model.losses import MultiStageManipulationLoss
 from src.training_cli import parse_args as _parse_args
@@ -211,7 +216,8 @@ def load_checkpoint(
         scaler.load_state_dict(data["scaler_state"])
     raw_epoch = data.get("epoch")
     if raw_epoch is None or int(raw_epoch) == 0:
-        parsed_epoch = _checkpoint_epoch(loaded_path) if loaded_path is not None else -1
+        parsed = parse_checkpoint_epoch(loaded_path) if loaded_path is not None else None
+        parsed_epoch = int(parsed) if parsed is not None else -1
         if parsed_epoch > 0:
             start_epoch = parsed_epoch
         else:
@@ -448,7 +454,7 @@ def train_one_epoch(
             forward_end = time.perf_counter()
 
         if cfg.hard_mining_enabled and epoch >= int(max(0, cfg.hard_mining_start_epoch)):
-            final_logits = _select_pred_head(preds)
+            final_logits = select_highest_resolution_head(preds)
             if final_logits.shape[-2:] != masks.shape[-2:]:
                 final_logits = torch.nn.functional.interpolate(
                     final_logits,
@@ -564,7 +570,7 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
         else:
             preds = model(images, target_size=masks.shape[-2:], residual_noise=residual_noise)
             loss = loss_fn(preds, masks)
-        logits = _select_pred_head(preds)
+        logits = select_highest_resolution_head(preds)
 
         with torch.no_grad():
             fg_ratio = masks.float().mean(dim=(1, 2, 3))
@@ -726,7 +732,7 @@ def run_training(cfg: TrainConfig) -> None:
 
     model_cfg = _coerce_model_config(cfg.model_config)
     if resume_path is not None and resume_path.is_file():
-        model_cfg = _disable_pretrained_backbones_for_checkpoint_load(model_cfg)
+        model_cfg = disable_pretrained_backbones_for_checkpoint_load(model_cfg)
     base_loss_cfg = _coerce_loss_config(cfg.loss_config)
     cfg = replace(cfg, model_config=model_cfg, loss_config=base_loss_cfg)
 

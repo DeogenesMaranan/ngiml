@@ -7,10 +7,8 @@ import io
 import random
 import re
 import sys
-import tarfile
-import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -27,53 +25,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.config import DatasetStructureConfig, Manifest, PreparationConfig, SampleRecord, SplitConfig
+from src.prepare_shared import TarShardWriter, discover_images
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-
-
-class TarShardWriter:
-    """Utility to write NPZ payloads into sequential tar shards."""
-
-    def __init__(self, out_root: Path, shard_size: int) -> None:
-        self.out_root = out_root
-        self.shard_size = max(1, shard_size)
-        self.shard_idx = 0
-        self.current: tarfile.TarFile | None = None
-        self.current_path: Path | None = None
-        self.count_in_shard = 0
-
-    def _start_new_shard(self) -> None:
-        self.out_root.mkdir(parents=True, exist_ok=True)
-        tar_path = self.out_root / f"shard_{self.shard_idx:05d}.tar"
-        self.shard_idx += 1
-        self.count_in_shard = 0
-        if self.current is not None:
-            self.current.close()
-        self.current = tarfile.open(tar_path, mode="w")
-        self.current_path = tar_path
-
-    def add(self, payload_bytes: bytes, member_name: str) -> tuple[str, str]:
-        if self.current is None or self.count_in_shard >= self.shard_size:
-            self._start_new_shard()
-        assert self.current is not None and self.current_path is not None
-        info = tarfile.TarInfo(name=member_name)
-        info.size = len(payload_bytes)
-        info.mtime = time.time()
-        self.current.addfile(info, io.BytesIO(payload_bytes))
-        self.count_in_shard += 1
-        return str(self.current_path), member_name
-
-    def close(self) -> None:
-        if self.current is not None:
-            self.current.close()
-            self.current = None
-            self.current_path = None
-
-
-def _discover_images(directory: Path) -> List[Path]:
-    return sorted(
-        [p for p in directory.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
-    )
 
 
 def _find_mask(fake_path: Path, mask_dir: Path, mask_suffix: str) -> Path | None:
@@ -307,8 +261,8 @@ def prepare_single_dataset(
     fake_dir = root / cfg.fake_subdir
     mask_dir = root / cfg.mask_subdir
 
-    real_images = _discover_images(real_dir) if real_dir.exists() else []
-    fake_images = _discover_images(fake_dir) if fake_dir.exists() else []
+    real_images = discover_images(real_dir, IMAGE_EXTENSIONS) if real_dir.exists() else []
+    fake_images = discover_images(fake_dir, IMAGE_EXTENSIONS) if fake_dir.exists() else []
     dir_tokens, stem_suffixes = _build_grouping_rules(cfg)
     target_sizes = sorted(prep_cfg.target_size_set())
     if len(target_sizes) != 1:
@@ -553,4 +507,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
