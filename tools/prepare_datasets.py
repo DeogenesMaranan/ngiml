@@ -16,15 +16,15 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-try:  # tqdm makes progress clearer; fall back to no-op if missing
+try:
     from tqdm import tqdm
-except ImportError:  # pragma: no cover - lightweight fallback
+except ImportError:
     def tqdm(iterable: Iterable | None = None, total: int | None = None, desc: str | None = None, **_: object):
         return iterable if iterable is not None else []
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))  # allow running as a script without installing the package
+    sys.path.insert(0, str(ROOT))
 
 from src.data.config import DatasetStructureConfig, Manifest, PreparationConfig, SampleRecord, SplitConfig
 
@@ -193,7 +193,6 @@ def _build_npz_bytes(
     resize_max_side: int,
     rng: random.Random,
 ) -> bytes:
-    # Tiny-image filtering is handled upstream in prepare_single_dataset.
     image = Image.open(image_path).convert("RGB")
     mask_img = Image.open(mask_path).convert("L") if mask_path is not None else None
 
@@ -243,7 +242,6 @@ def _build_npz_bytes(
             mask_bin = mask_np_full > 127
             fg_coords = np.argwhere(mask_bin)
             if fg_coords.shape[0] > 0:
-                # Bias fake crops to boundaries when possible.
                 up = np.pad(mask_bin[:-1, :], ((1, 0), (0, 0)), constant_values=False)
                 down = np.pad(mask_bin[1:, :], ((0, 1), (0, 0)), constant_values=False)
                 left_n = np.pad(mask_bin[:, :-1], ((0, 0), (1, 0)), constant_values=False)
@@ -291,7 +289,6 @@ def _build_npz_bytes(
         payload["mask"] = (mask_np > 127).astype(np.uint8)
 
     buf = io.BytesIO()
-    # np.savez (not compressed) to avoid CPU overhead from compression.
     np.savez(buf, **payload)
     return buf.getvalue()
 
@@ -327,7 +324,7 @@ def prepare_single_dataset(
         records.append(
             SampleRecord(
                 dataset=cfg.dataset_name,
-                split="train",  # placeholder, real split decided later
+                split="train",
                 image_path=str(real_img),
                 mask_path=None,
                 label=0,
@@ -343,14 +340,13 @@ def prepare_single_dataset(
         records.append(
             SampleRecord(
                 dataset=cfg.dataset_name,
-                split="train",  # placeholder
+                split="train",
                 image_path=str(fake_img),
                 mask_path=str(mask_path),
                 label=1,
             )
         )
 
-    # Apply sampling limit if set
     if sample_limit > 0 and len(records) > sample_limit:
         sample_seed_text = f"{split_cfg.seed}|{cfg.dataset_name}|sample_limit"
         sample_seed = int.from_bytes(hashlib.blake2b(sample_seed_text.encode("utf-8"), digest_size=8).digest(), "big")
@@ -523,10 +519,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Run dataset preparation.
+
+    Dataset declarations are managed via `build_default_configs()` in this entrypoint flow.
+    """
     args = parse_args()
     datasets, per_dataset_splits, prep_cfg = build_default_configs()
 
-    # Filter datasets if --dataset is specified
     if args.dataset:
         selected = args.dataset.strip().lower()
         datasets = [d for d in datasets if d.dataset_name.lower() == selected]
@@ -535,7 +534,6 @@ def main() -> None:
         print(f"Processing only dataset: {datasets[0].dataset_name}")
 
     prepared_root = Path(datasets[0].prepared_root)
-    # If only one dataset, default manifest name includes dataset name
     if args.manifest:
         manifest_out = Path(args.manifest)
     elif len(datasets) == 1:
