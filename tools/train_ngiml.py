@@ -1,6 +1,6 @@
 ﻿"""End-to-end NGIML training loop with checkpointing.
 
-Run example (Colab-ready):
+Run example:
     python tools/train_ngiml.py --manifest /content/data/manifest.json --output-dir /content/runs
 
 The script expects a prepared manifest (see src/data/config.py) and will
@@ -83,8 +83,6 @@ class _PrefetchLoader:
             return next(self._iter)
         if self._next_batch is None:
             raise StopIteration
-        # Wait only for the currently prefetched batch, then launch prefetch
-        # for the subsequent one to overlap transfer with compute.
         torch.cuda.current_stream().wait_stream(self._stream)
         batch = self._next_batch
         for value in batch.values():
@@ -100,7 +98,6 @@ class _PrefetchLoader:
             self._next_batch = None
             return
 
-        # Move tensors to GPU in the prefetch stream
         with torch.cuda.stream(self._stream):
             for k, v in list(nxt.items()):
                 if isinstance(v, torch.Tensor):
@@ -117,7 +114,6 @@ class _PrefetchLoader:
             raise TypeError("wrapped loader has no __len__")
 
     def __getattr__(self, name: str):
-        # Proxy attribute access to the underlying loader for compatibility
         return getattr(self._loader, name)
 
 
@@ -149,9 +145,9 @@ def _build_lr_scheduler(optimizer, cfg):
 @dataclass
 class TrainConfig:
     manifest: str
-    scheduler_type: str = "cosine"  # one of: 'cosine', 'step' (cosine enabled by default)
+    scheduler_type: str = "cosine"
     output_dir: str = "runs/ngiml"
-    batch_size: int = 20
+    batch_size: int = 16
     epochs: int = 50
     num_workers: int = 6
     amp: bool = True
@@ -167,8 +163,8 @@ class TrainConfig:
     xformers: bool = True
     cuda_expandable_segments: bool = True
     lr_schedule: bool = True
-    warmup_epochs: int = 3  # Linear warmup for first 3 epochs
-    min_lr_scale: float = 0.1  # Start at 10% base LR
+    warmup_epochs: int = 3
+    min_lr_scale: float = 0.1
     grad_clip: float = 1.0
     grad_accum_steps: int = 1
     val_every: int = 1
@@ -187,18 +183,18 @@ class TrainConfig:
     auto_local_cache: bool = True
     local_cache_dir: Optional[str] = "/cache"
     reuse_local_cache_manifest: bool = True
-    views_per_sample: int = 3
+    views_per_sample: int = 2
     gpu_aug_batch_chunk_size: int = 0
-    resize_max_side: int = 0
+    resize_max_side: int = 448
     max_rotation_degrees: float = 6.0
     noise_std_max: float = 0.012
     disable_aug: bool = False
     device: Optional[str] = "cuda"
     aug_seed: Optional[int] = 42
     seed: int = 42
-    early_stopping_patience: int = 3
-    early_stopping_min_delta: float = 2e-3
-    early_stopping_monitor: str = "f1"
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 3e-3
+    early_stopping_monitor: str = "loss"
     metric_threshold: float = 0.5
     optimize_threshold: bool = False
     threshold_metric: str = "f1"
@@ -219,10 +215,10 @@ class TrainConfig:
     bce_weight: float = 1.0
     focal_gamma: float = 2.0
     focal_alpha: float = 0.25
-    tversky_weight: float = 0.0
+    tversky_weight: float = 0.2
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.8
-    lovasz_weight: float = 0.0
+    lovasz_weight: float = 0.05
     use_boundary_loss: bool = True
     boundary_weight: float = 0.03
     ema_enabled: bool = True
@@ -266,17 +262,31 @@ def build_default_components() -> tuple[HybridNGIMLConfig, MultiStageLossConfig,
         swin=SwinBackboneConfig(model_name="swin_tiny_patch4_window7_224", pretrained=True, input_size=448),
         residual=ResidualNoiseConfig(num_kernels=3, base_channels=32, num_stages=4),
         fusion=FeatureFusionConfig(fusion_channels=(64, 128, 192, 256)),
-        decoder=UNetDecoderConfig(decoder_channels=None, out_channels=1, per_stage_heads=True),
+        decoder=UNetDecoderConfig(
+            decoder_channels=None,
+            out_channels=1,
+            per_stage_heads=True,
+            enable_edge_guidance=True,
+            use_dropout=True,
+            dropout_p=0.2,
+            enable_boundary_refinement=True,
+            enable_detail_refinement=True,
+        ),
         optimizer=HybridNGIMLOptimizerConfig(
             efficientnet=OptimizerGroupConfig(lr=1e-5, weight_decay=1.5e-4),
             swin=OptimizerGroupConfig(lr=5e-6, weight_decay=1e-4),
             residual=OptimizerGroupConfig(lr=2.5e-4, weight_decay=2e-4),
             fusion=OptimizerGroupConfig(lr=1.2e-4, weight_decay=2e-4),
             decoder=OptimizerGroupConfig(lr=1.8e-4, weight_decay=2e-4),
+            freeze_backbone_epochs=3,
         ),
         use_low_level=True,
         use_context=True,
         use_residual=True,
+        enable_residual_attention=True,
+        enable_low_level_residual_attention=True,
+        enable_context_residual_attention=False,
+        residual_attention_init_scale=0.0,
     )
 
     loss_cfg = MultiStageLossConfig(
@@ -289,7 +299,7 @@ def build_default_components() -> tuple[HybridNGIMLConfig, MultiStageLossConfig,
         tversky_weight=0.2,
         tversky_alpha=0.3,
         tversky_beta=0.8,
-        lovasz_weight=0.0,
+        lovasz_weight=0.05,
         use_boundary_loss=True,
         boundary_weight=0.03,
     )
@@ -337,7 +347,7 @@ def build_training_config(
     cfg = TrainConfig(
         manifest=str(manifest_path),
         output_dir=output_dir,
-        batch_size=20,
+        batch_size=16,
         num_workers=0,
         prefetch_factor=2,
         views_per_sample=1,
@@ -350,7 +360,7 @@ def build_training_config(
         auto_resume=True,
         early_stopping_patience=5,
         early_stopping_min_delta=3e-3,
-        early_stopping_monitor="iou",
+        early_stopping_monitor="loss",
         metric_threshold=0.5,
         optimize_threshold=False,
         foreground_ratio_max_batches=20,
@@ -364,7 +374,7 @@ def build_training_config(
         tversky_weight=float(getattr(loss_cfg, "tversky_weight", 0.2)),
         tversky_alpha=float(getattr(loss_cfg, "tversky_alpha", 0.3)),
         tversky_beta=float(getattr(loss_cfg, "tversky_beta", 0.8)),
-        lovasz_weight=float(getattr(loss_cfg, "lovasz_weight", 0.0)),
+        lovasz_weight=float(getattr(loss_cfg, "lovasz_weight", 0.05)),
         use_boundary_loss=bool(getattr(loss_cfg, "use_boundary_loss", False)),
         boundary_weight=float(getattr(loss_cfg, "boundary_weight", 0.05)),
         ema_enabled=False,
@@ -377,14 +387,13 @@ def build_training_config(
 
 
 def parse_args() -> TrainConfig:
-    # Use a higher default worker count to better saturate fast GPUs (e.g. A100).
-    # Keep a sensible floor to avoid tiny values on CI/low-core systems.
+    """Parse CLI arguments into a validated training config."""
     default_workers = max(4, (os.cpu_count() or 4))
     parser = argparse.ArgumentParser(description="Train NGIML manipulation localization")
     parser.add_argument("--scheduler-type", type=str, default="cosine", choices=["cosine", "step"], help="LR scheduler type (cosine or step)")
     parser.add_argument("--manifest", required=True, help="Path to prepared manifest JSON")
     parser.add_argument("--output-dir", default="runs/ngiml", help="Directory to write checkpoints/logs")
-    parser.add_argument("--batch-size", type=int, default=8, help="Mini-batch size")
+    parser.add_argument("--batch-size", type=int, default=16, help="Mini-batch size")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--num-workers", type=int, default=default_workers, help="DataLoader workers")
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision training")
@@ -396,7 +405,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--no-tf32", action="store_true", help="Disable TF32 matrix math on CUDA")
     parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Numerical precision for training")
     parser.add_argument("--debug-timing", action="store_true", help="Enable lightweight per-stage timing prints during training")
-    parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False, help="Enable gradient checkpointing for memory savings")
+    parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True, help="Enable gradient checkpointing for memory savings")
     parser.add_argument("--flash-attention", action=argparse.BooleanOptionalAction, default=False, help="Enable flash attention if supported")
     parser.add_argument("--xformers", action=argparse.BooleanOptionalAction, default=False, help="Enable xformers memory-efficient attention if supported")
     parser.add_argument(
@@ -488,17 +497,17 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--views-per-sample", type=int, default=2, help="Number of augmented views per sample (on-the-fly)")
     parser.add_argument("--gpu-aug-batch-chunk-size", type=int, default=1, help="Chunk size for GPU-side batched augmentations; smaller uses less memory")
     parser.add_argument("--resize-max-side", type=int, default=448, help="Cap image short side before batching (lower is faster)")
-    parser.add_argument("--max-rotation-degrees", type=float, default=0.0, help="Random rotation range (+/-)")
+    parser.add_argument("--max-rotation-degrees", type=float, default=6.0, help="Random rotation range (+/-)")
     parser.add_argument("--noise-std-max", type=float, default=0.01, help="Max Gaussian noise std")
     parser.add_argument("--disable-aug", action="store_true", help="Disable GPU augmentations")
     parser.add_argument("--device", type=str, default=None, help="Override device (e.g., cuda:0 or cpu)")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducibility")
-    parser.add_argument("--early-stopping-patience", type=int, default=3, help="Stop after N validations without improvement; <=0 disables")
-    parser.add_argument("--early-stopping-min-delta", type=float, default=2e-3, help="Minimum monitored-metric improvement to reset early stopping")
+    parser.add_argument("--early-stopping-patience", type=int, default=5, help="Stop after N validations without improvement; <=0 disables")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=3e-3, help="Minimum monitored-metric improvement to reset early stopping")
     parser.add_argument(
         "--early-stopping-monitor",
         type=str,
-        default="f1",
+        default="loss",
         choices=["loss", "iou", "f1", "recall", "precision", "accuracy"],
         help="Validation metric used for early stopping and best checkpoint",
     )
@@ -537,12 +546,12 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--bce-weight", type=float, default=1.0, help="BCE/Focal term weight in hybrid loss")
     parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (used when loss-hybrid-mode=dice_focal)")
     parser.add_argument("--focal-alpha", type=float, default=0.25, help="Focal loss alpha (used when loss-hybrid-mode=dice_focal)")
-    parser.add_argument("--tversky-weight", type=float, default=0.0, help="Optional Tversky loss weight to improve recall")
+    parser.add_argument("--tversky-weight", type=float, default=0.2, help="Optional Tversky loss weight to improve recall")
     parser.add_argument("--tversky-alpha", type=float, default=0.3, help="Tversky alpha (FP penalty)")
     parser.add_argument("--tversky-beta", type=float, default=0.8, help="Tversky beta (FN penalty)")
-    parser.add_argument("--lovasz-weight", type=float, default=0.0, help="Lovasz Hinge Loss weight for IoU optimization")
+    parser.add_argument("--lovasz-weight", type=float, default=0.05, help="Lovasz Hinge Loss weight for IoU optimization")
     parser.add_argument("--use-boundary-loss", action=argparse.BooleanOptionalAction, default=True, help="Enable Sobel boundary loss on stage-0 (highest-resolution) prediction")
-    parser.add_argument("--boundary-weight", type=float, default=0.05, help="Boundary loss weight when --use-boundary-loss is enabled")
+    parser.add_argument("--boundary-weight", type=float, default=0.03, help="Boundary loss weight when --use-boundary-loss is enabled")
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=True, help="Use EMA weights for validation and best checkpoints")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay factor")
     parser.add_argument("--hard-mining-enabled", action=argparse.BooleanOptionalAction, default=False, help="Enable low-IoU hard-example weighting")
@@ -784,18 +793,12 @@ def _build_aug_map(names: Sequence[str], cfg: TrainConfig) -> Dict[str, Augmenta
 
 
 def _prepare_dataloaders(cfg: TrainConfig, device: torch.device):
+    """Create train/val/test loaders and return runtime augmentation metadata."""
     manifest_path = Path(cfg.manifest)
     dataset_names = _collect_dataset_names(manifest_path)
     per_dataset_aug = _build_aug_map(dataset_names, cfg)
-    # Also return the per-dataset augmentation map and normalization mode so
-    # augmentations can be applied on-device in the training loop.
     manifest = load_manifest(manifest_path)
     normalization_mode = manifest.normalization_mode
-    # When running on CUDA we prefer to perform augmentations and normalization
-    # on-device. To enable that we disable cpu-side augmentation/normalization
-    # inside the collate function by passing a disabled aug map and using
-    # a no-op normalization there. The original per_dataset_aug and
-    # normalization_mode are returned for on-device application in the loop.
     collate_aug_map = per_dataset_aug
     collate_norm_mode = normalization_mode
     if device.type == "cuda":
@@ -834,6 +837,7 @@ def _safe_cache_name(spec: str) -> str:
 
 
 def _materialize_tar_npz_manifest(manifest_path: Path, cache_root: Path) -> Path:
+    """Resolve tar::npz references into local files and write a cache manifest."""
     manifest = load_manifest(manifest_path)
     cache_root.mkdir(parents=True, exist_ok=True)
     samples_dir = cache_root / "samples"
@@ -858,7 +862,6 @@ def _materialize_tar_npz_manifest(manifest_path: Path, cache_root: Path) -> Path
         if member is None:
             raise FileNotFoundError(f"Missing tar member {member_name} in {archive_path}")
 
-        # Stream-write the member to avoid loading the entire file into memory
         with open(out_path, "wb") as out_f:
             shutil.copyfileobj(member, out_f)
         return str(out_path)
@@ -923,9 +926,9 @@ def _segmentation_counts(logits: torch.Tensor, target: torch.Tensor, threshold: 
 
 
 def _select_pred_head(preds: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Return the highest-resolution decoder prediction tensor."""
     if not preds:
         raise ValueError("Model returned empty predictions list")
-    # Highest-resolution decoder output is index 0 by contract.
     return preds[0]
 
 
@@ -982,9 +985,6 @@ def _select_threshold_with_precision_guard(
     baseline_threshold, baseline_metrics = max(scored_thresholds, key=lambda item: item[1][metric_key])
     baseline_metric = float(baseline_metrics[metric_key])
 
-    # During cold start when the target metric is essentially zero, avoid
-    # precision-driven extreme thresholds (e.g., all-background at 0.9).
-    # Prefer the threshold nearest to 0.5 to keep gradients/metrics informative.
     if baseline_metric <= float(cold_start_metric_floor):
         neutral_threshold, neutral_metrics = min(scored_thresholds, key=lambda item: abs(float(item[0]) - 0.5))
         return float(neutral_threshold), neutral_metrics
@@ -1046,6 +1046,7 @@ def save_checkpoint(
 
 
 def append_checkpoint_log(path: Path, record: dict) -> None:
+    """Append checkpoint metrics using an atomic JSON rewrite."""
     path.parent.mkdir(parents=True, exist_ok=True)
     records: list[dict] = []
 
@@ -1067,7 +1068,6 @@ def append_checkpoint_log(path: Path, record: dict) -> None:
             elif isinstance(payload, dict):
                 records = [payload]
         except Exception as exc:
-            # Preserve the corrupt file for inspection and continue with empty records
             print(f"Warning: failed to read existing checkpoint log {path}: {exc}")
             _backup_corrupt(path)
             records = []
@@ -1090,7 +1090,6 @@ def append_checkpoint_log(path: Path, record: dict) -> None:
 
     records.append(record)
 
-    # Write atomically to avoid truncation/corruption from concurrent writers or syncs.
     tmp_path = path.with_suffix(".tmp")
     try:
         with open(tmp_path, "w", encoding="utf-8") as handle:
@@ -1113,8 +1112,7 @@ def load_checkpoint(
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     ema_model: Optional[HybridNGIML] = None,
 ) -> Tuple[int, int, dict]:
-    # Attempt to load the requested checkpoint; if it's corrupt/unreadable,
-    # try earlier "checkpoint_epoch_*.pt" files in the same directory as fallbacks.
+    """Load checkpoint state and fall back to older checkpoints on corruption."""
     original_exc: Exception | None = None
     checkpoint_map_location: str | torch.device = "cpu"
 
@@ -1135,7 +1133,6 @@ def load_checkpoint(
     if isinstance(loaded_obj, Exception):
         original_exc = loaded_obj
         print(f"Failed to load checkpoint {path}: {loaded_obj}")
-        # Search for other checkpoint candidates in the same directory
         cand_dir = path.parent
         try:
             candidates = sorted(cand_dir.glob("checkpoint_epoch_*.pt"), key=_checkpoint_epoch)
@@ -1154,7 +1151,6 @@ def load_checkpoint(
                 print(f"Skipping unreadable checkpoint {cand}: {cand_obj}")
 
     if isinstance(loaded_obj, Exception):
-        # Nothing usable found
         raise RuntimeError(f"Unable to load checkpoint {path} or any fallback checkpoints: {original_exc}") from original_exc
 
     data = loaded_obj
@@ -1171,8 +1167,6 @@ def load_checkpoint(
         scheduler.load_state_dict(data["scheduler_state"])
     if data.get("scaler_state") and scaler.is_enabled():
         scaler.load_state_dict(data["scaler_state"])
-    # Prefer checkpoint-internal metadata, but fall back to parsing the
-    # filename when epoch is missing or zero (common for some exported weights).
     raw_epoch = data.get("epoch")
     if raw_epoch is None or int(raw_epoch) == 0:
         parsed_epoch = _checkpoint_epoch(loaded_path) if loaded_path is not None else -1
@@ -1185,7 +1179,6 @@ def load_checkpoint(
 
     global_step = int(data.get("global_step", 0))
     if global_step == 0:
-        # If global_step missing, try to infer from filename or leave as 0.
         pass
 
     training_state = data.get("training_state")
@@ -1899,19 +1892,16 @@ def train_one_epoch(
     per_dataset_aug: Optional[Dict[str, AugmentationConfig]] = None,
     normalization_mode: Optional[str] = None,
 ):
+    """Run one training epoch with optional GPU-side augmentations and EMA updates."""
     model.train()
     running_loss = 0.0
     num_batches = 0
     sampled_pos = 0.0
     sampled_total = 0.0
     accum_steps = max(1, int(cfg.grad_accum_steps))
-    # Wrap loader with prefetcher to overlap host->device copy with GPU compute.
     if device.type == "cuda":
         loader = _PrefetchLoader(loader, device)
 
-    # Determine a batch-level total for tqdm. Avoid falling back to dataset
-    # sample count, which can massively overstate steps when using custom
-    # samplers/batch samplers.
     def _safe_len(obj) -> Optional[int]:
         if obj is None:
             return None
@@ -1974,7 +1964,6 @@ def train_one_epoch(
                 residual_noise = residual_noise.to(device, non_blocking=True)
         else:
             residual_noise = None
-        # Apply GPU-side augmentations and normalization when requested.
         aug_start = None
         forward_start = None
         backward_end = None
@@ -1994,24 +1983,20 @@ def train_one_epoch(
             datasets_list = batch.get("datasets", None)
             if datasets_list is not None:
                 bsz = images.shape[0]
-                # Group indices by dataset name so we can batch augment per-dataset
                 idxs_by_ds: dict[str, list[int]] = {}
                 for i in range(bsz):
                     ds_name = str(datasets_list[i])
                     idxs_by_ds.setdefault(ds_name, []).append(i)
 
-                # Use a single generator seeded per-batch for reproducibility
                 gen = gen if 'gen' in locals() else gen
                 for ds_name, idxs in idxs_by_ds.items():
                     aug_cfg = per_dataset_aug.get(ds_name, None)
                     if aug_cfg is None or not getattr(aug_cfg, "enable", False):
-                        # Apply normalization on-device in batch
                         if normalization_mode == "imagenet":
                             mean = imagenet_mean.view(1, 3, 1, 1)
                             std = imagenet_std.view(1, 3, 1, 1)
                             images[idxs] = (images[idxs] - mean) / std
                         else:
-                            # zero_one or other modes: leave as-is
                             images[idxs] = images[idxs]
                         continue
 
@@ -2148,7 +2133,6 @@ def train_one_epoch(
         num_batches += 1
         global_step += 1
 
-        # Record timings if enabled
         if cfg.debug_timing:
             batch_end = time.perf_counter()
             batch_time = batch_end - batch_start
@@ -2235,6 +2219,7 @@ def find_best_threshold(model: HybridNGIML, loader, device: torch.device, cfg: T
 
 @torch.inference_mode()
 def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: TrainConfig, normalization_mode: Optional[str] = None) -> dict:
+    """Evaluate model loss and segmentation metrics on a validation loader."""
     model.eval()
     total_loss = 0.0
     batches = 0
@@ -2262,8 +2247,6 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
             residual_noise = residual_noise.to(device, non_blocking=True)
         else:
             residual_noise = None
-        # If collate left normalization to be done on-device (collate used zero_one),
-        # perform normalization here on the GPU for evaluation.
         if device.type == "cuda" and normalization_mode is not None:
             bsz = images.shape[0]
             for i in range(bsz):
@@ -2357,13 +2340,13 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
 
 
 def run_training(cfg: TrainConfig) -> None:
+    """Run full NGIML training with validation, checkpointing, and early stopping."""
     set_global_seed(cfg.seed, deterministic=cfg.deterministic)
     startup_t0 = time.time()
 
     if cfg.cuda_expandable_segments and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-    # Force device to CUDA when available per user request
     if torch.cuda.is_available():
         cfg = replace(cfg, device="cuda")
     device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -2383,7 +2366,6 @@ def run_training(cfg: TrainConfig) -> None:
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high" if cfg.use_tf32 else "highest")
 
-        # PyTorch 2.9+ prefers fp32_precision knobs over allow_tf32 flags.
         cudnn_backend = getattr(torch.backends, "cudnn", None)
         cuda_backend = getattr(torch.backends, "cuda", None)
         cudnn_conv = getattr(cudnn_backend, "conv", None)
@@ -2449,7 +2431,6 @@ def run_training(cfg: TrainConfig) -> None:
     base_loss_cfg = _coerce_loss_config(cfg.loss_config)
     cfg = replace(cfg, model_config=model_cfg, loss_config=base_loss_cfg)
 
-    # Honor the training-level gradient checkpointing toggle when instantiating the model
     try:
         from dataclasses import replace as _dc_replace
 
@@ -2462,7 +2443,6 @@ def run_training(cfg: TrainConfig) -> None:
         model = model.to(memory_format=torch.channels_last)
     optimizer = model.build_optimizer()
     scheduler = _build_lr_scheduler(optimizer, cfg)
-    # Precision fallback logic: keep T4-class GPUs on fp16 instead of forcing fp32.
     requested_precision = str(cfg.precision).lower()
     if requested_precision == "bf16" and device.type == "cuda" and not torch.cuda.is_bf16_supported():
         print("[Warning] bf16 precision requested but not supported on this device. Falling back to fp16 with AMP enabled.")
@@ -2766,7 +2746,6 @@ def run_training(cfg: TrainConfig) -> None:
                 )
                 epoch_status_flags.append(f"best-overlap -> {best_f1_iou_path.name}")
 
-            # Use the configured early-stopping monitor to determine when to reset patience
             monitor_value = _metric_for_monitor(metrics, cfg.early_stopping_monitor)
             monitor_improved = _monitor_improved(
                 cfg.early_stopping_monitor,
@@ -2823,12 +2802,10 @@ def run_training(cfg: TrainConfig) -> None:
                 )
 
             if monitor_improved:
-                # Update recorded bests and reset patience
                 best_monitor_value = monitor_value
                 no_improve_epochs = 0
                 epoch_status_flags.append(f"monitor improved ({cfg.early_stopping_monitor}={monitor_value:.4f})")
             else:
-                # Update monitor-based counter
                 if early_stopping_enabled:
                     no_improve_epochs += 1
                     epoch_status_flags.append(
