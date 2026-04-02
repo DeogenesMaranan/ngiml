@@ -422,6 +422,7 @@ def run_prepared_dataset_inference(
             repo_id=hf_dataset_repo_id,
             repo_type="dataset",
             local_dir=str(hf_snapshot_local_dir),
+            token=False,
             local_dir_use_symlinks=False,
         )
     )
