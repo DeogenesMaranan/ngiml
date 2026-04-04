@@ -44,12 +44,13 @@ from src.model.hybrid_ngiml import HybridNGIML
 from src.training_defaults import build_default_components
 
 
-_HF_UNAUTH_WARN_TEXT = "unauthenticated requests to the HF Hub"
+_HF_UNAUTH_WARN_TEXT = "unauthenticated requests to the hf hub"
 
 
 def _snapshot_download_dataset(repo_id: str, local_dir: Path) -> Path:
     """Download a dataset snapshot while keeping HF deprecation/auth warning noise out of logs."""
-    token = (os.getenv("HF_TOKEN") or "").strip() or None
+    hf_token = (os.getenv("HF_TOKEN") or "").strip()
+    token: str | bool = hf_token if hf_token else False
 
     hf_http_logger = logging.getLogger("huggingface_hub.utils._http")
 
@@ -59,9 +60,22 @@ def _snapshot_download_dataset(repo_id: str, local_dir: Path) -> Path:
 
     suppress_filter = _SkipHfUnauthenticatedWarning()
     hf_http_logger.addFilter(suppress_filter)
+    prev_disable_implicit_token = os.environ.get("HF_HUB_DISABLE_IMPLICIT_TOKEN")
+    if not hf_token:
+        os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
     try:
         with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=r".*unauthenticated requests to the HF Hub.*")
+            warnings.filterwarnings("ignore", message=r"(?i).*unauthenticated requests to the hf hub.*")
+            warnings.filterwarnings(
+                "ignore",
+                message=r"(?i).*error while fetching `HF_TOKEN` secret value from your vault.*",
+                module=r"huggingface_hub\.utils\._auth",
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message=r"(?i).*you are not authenticated with the hugging face hub in this notebook.*",
+                module=r"huggingface_hub\.utils\._auth",
+            )
             return Path(
                 snapshot_download(
                     repo_id=repo_id,
@@ -71,6 +85,11 @@ def _snapshot_download_dataset(repo_id: str, local_dir: Path) -> Path:
                 )
             )
     finally:
+        if not hf_token:
+            if prev_disable_implicit_token is None:
+                os.environ.pop("HF_HUB_DISABLE_IMPLICIT_TOKEN", None)
+            else:
+                os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = prev_disable_implicit_token
         hf_http_logger.removeFilter(suppress_filter)
 
 
