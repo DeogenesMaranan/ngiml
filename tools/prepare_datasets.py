@@ -8,16 +8,20 @@ import random
 import re
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, Sequence, Tuple
+from typing import Iterable, Sequence
 
 import numpy as np
-import pandas as pd
 from PIL import Image
 
 try:
     from tqdm import tqdm
 except ImportError:
-    def tqdm(iterable: Iterable | None = None, total: int | None = None, desc: str | None = None, **_: object):
+    def tqdm(
+        iterable: Iterable | None = None,
+        total: int | None = None,
+        desc: str | None = None,
+        **_: object,
+    ) -> Iterable | list[object]:
         return iterable if iterable is not None else []
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,21 +29,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.config import DatasetStructureConfig, Manifest, PreparationConfig, SampleRecord, SplitConfig
-from src.prepare_shared import TarShardWriter, discover_images
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-
-
-def _find_mask(fake_path: Path, mask_dir: Path, mask_suffix: str) -> Path | None:
-    candidates = []
-    stem = fake_path.stem
-    for ext in IMAGE_EXTENSIONS:
-        candidates.append(mask_dir / f"{stem}{mask_suffix}{ext}")
-        candidates.append(mask_dir / f"{stem}{ext}")
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
+from src.prepare_shared import (
+    IMAGE_EXTENSIONS,
+    TarShardWriter,
+    build_mask_index,
+    discover_images,
+    pad_to_size,
+    resolve_mask_from_candidates,
+)
 
 
 def _build_grouping_rules(cfg: DatasetStructureConfig) -> tuple[set[str], tuple[str, ...]]:
@@ -84,15 +81,15 @@ def _source_group_key(
 
 
 def _assign_grouped_items(
-    grouped_items: Sequence[List[SampleRecord]],
+    grouped_items: Sequence[list[SampleRecord]],
     ratios: Sequence[float],
     rng: random.Random,
-) -> Dict[str, List[SampleRecord]]:
+) -> dict[str, list[SampleRecord]]:
     split_names = ["train", "val", "test"]
     total = sum(len(group) for group in grouped_items)
     target = [float(total) * r for r in ratios]
     assigned_counts = [0, 0, 0]
-    splits: Dict[str, List[SampleRecord]] = {"train": [], "val": [], "test": []}
+    splits: dict[str, list[SampleRecord]] = {"train": [], "val": [], "test": []}
 
     shuffled = [list(group) for group in grouped_items]
     rng.shuffle(shuffled)
@@ -116,10 +113,10 @@ def _split_records(
     dataset_root: Path,
     dir_tokens: set[str],
     stem_suffixes: Sequence[str],
-) -> Dict[str, List[SampleRecord]]:
+) -> dict[str, list[SampleRecord]]:
     split_cfg.validate()
     rng = random.Random(split_cfg.seed)
-    per_label_groups: Dict[int, Dict[str, List[SampleRecord]]] = {0: {}, 1: {}}
+    per_label_groups: dict[int, dict[str, list[SampleRecord]]] = {0: {}, 1: {}}
     for rec in records:
         key = _source_group_key(Path(rec.image_path), dataset_root, dir_tokens, stem_suffixes)
         label_groups = per_label_groups.setdefault(rec.label, {})
@@ -169,22 +166,9 @@ def _build_npz_bytes(
         pad_h = max(0, crop_size - h_full)
         pad_w = max(0, crop_size - w_full)
         if pad_h > 0 or pad_w > 0:
-            pad_top = pad_h // 2
-            pad_bottom = pad_h - pad_top
-            pad_left = pad_w // 2
-            pad_right = pad_w - pad_left
-            image_np_full = np.pad(
-                image_np_full,
-                ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
-                mode="symmetric",
-            )
+            image_np_full = pad_to_size(image_np_full, crop_size, mode="symmetric")
             if mask_np_full is not None:
-                mask_np_full = np.pad(
-                    mask_np_full,
-                    ((pad_top, pad_bottom), (pad_left, pad_right)),
-                    mode="constant",
-                    constant_values=0,
-                )
+                mask_np_full = pad_to_size(mask_np_full, crop_size, mode="constant", constant=0)
 
         h_full, w_full = image_np_full.shape[:2]
         max_top = max(0, h_full - crop_size)
@@ -252,7 +236,7 @@ def prepare_single_dataset(
     split_cfg: SplitConfig,
     prep_cfg: PreparationConfig,
     sample_limit: int = 0,
-) -> List[SampleRecord]:
+) -> list[SampleRecord]:
     root = cfg.root()
     if not root.exists():
         raise FileNotFoundError(f"Dataset root missing: {root}")
@@ -263,6 +247,7 @@ def prepare_single_dataset(
 
     real_images = discover_images(real_dir, IMAGE_EXTENSIONS) if real_dir.exists() else []
     fake_images = discover_images(fake_dir, IMAGE_EXTENSIONS) if fake_dir.exists() else []
+    mask_index = build_mask_index(mask_dir, IMAGE_EXTENSIONS) if mask_dir.exists() else {}
     dir_tokens, stem_suffixes = _build_grouping_rules(cfg)
     target_sizes = sorted(prep_cfg.target_size_set())
     if len(target_sizes) != 1:
@@ -271,7 +256,7 @@ def prepare_single_dataset(
         )
     crop_size = target_sizes[0]
 
-    records: List[SampleRecord] = []
+    records: list[SampleRecord] = []
     skipped_fake_missing_mask = 0
 
     for real_img in tqdm(real_images, desc=f"{cfg.dataset_name} real", leave=False):
@@ -286,7 +271,9 @@ def prepare_single_dataset(
         )
 
     for fake_img in tqdm(fake_images, desc=f"{cfg.dataset_name} fake", leave=False):
-        mask_path = _find_mask(fake_img, mask_dir, cfg.mask_suffix)
+        stem = fake_img.stem
+        candidates = (f"{stem}{cfg.mask_suffix}", stem)
+        mask_path = resolve_mask_from_candidates(stem, mask_index, candidates)
         if mask_path is None:
             skipped_fake_missing_mask += 1
             print(f"Skipping fake image without mask: {fake_img}", file=sys.stderr)
@@ -309,7 +296,7 @@ def prepare_single_dataset(
 
     splits = _split_records(records, split_cfg, root, dir_tokens, stem_suffixes)
 
-    prepared_records: List[SampleRecord] = []
+    prepared_records: list[SampleRecord] = []
     for split_name, split_records in splits.items():
         if not split_records:
             continue
@@ -378,12 +365,12 @@ def prepare_single_dataset(
 
 def prepare_all(
     datasets: Sequence[DatasetStructureConfig],
-    per_dataset_splits: Dict[str, SplitConfig],
+    per_dataset_splits: dict[str, SplitConfig],
     prep_cfg: PreparationConfig,
     manifest_out: Path,
     sample_limit: int = 0,
 ) -> Manifest:
-    all_records: List[SampleRecord] = []
+    all_records: list[SampleRecord] = []
     for cfg in tqdm(datasets, desc="datasets"):
         split_cfg = per_dataset_splits.get(cfg.dataset_name)
         if split_cfg is None:
@@ -398,7 +385,7 @@ def prepare_all(
     return manifest
 
 
-def build_default_configs() -> Tuple[List[DatasetStructureConfig], Dict[str, SplitConfig], PreparationConfig]:
+def build_default_configs() -> tuple[list[DatasetStructureConfig], dict[str, SplitConfig], PreparationConfig]:
     shared_seed = 42
     datasets = [
         DatasetStructureConfig(

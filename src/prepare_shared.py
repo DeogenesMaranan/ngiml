@@ -5,6 +5,11 @@ import tarfile
 import time
 from pathlib import Path
 
+import numpy as np
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
 
 class TarShardWriter:
     """Utility to write NPZ payloads into sequential tar shards."""
@@ -52,3 +57,58 @@ def discover_images(root: Path, image_extensions: set[str], *, return_empty_if_m
         p for p in root.rglob("*")
         if p.is_file() and p.suffix.lower() in image_extensions
     )
+
+
+def build_mask_index(mask_dir: Path, image_extensions: set[str] | None = None) -> dict[str, Path]:
+    exts = image_extensions or IMAGE_EXTENSIONS
+    index: dict[str, Path] = {}
+    for path in discover_images(mask_dir, exts, return_empty_if_missing=True):
+        key = path.stem.lower()
+        if key not in index:
+            index[key] = path
+    return index
+
+
+def resolve_mask_from_candidates(
+    image_stem: str,
+    mask_index: dict[str, Path],
+    candidates: list[str] | tuple[str, ...],
+) -> Path | None:
+    for candidate in candidates:
+        key = str(candidate).strip().lower()
+        if key in mask_index:
+            return mask_index[key]
+    return None
+
+
+def pad_to_size(arr: np.ndarray, size: int, mode: str, constant: int = 0) -> np.ndarray:
+    """Pad a HW or HWC array to size x size."""
+    h, w = arr.shape[:2]
+    pad_h = max(0, size - h)
+    pad_w = max(0, size - w)
+    if pad_h == 0 and pad_w == 0:
+        return arr
+
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+
+    if arr.ndim == 3:
+        padding = ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0))
+    else:
+        padding = ((pad_top, pad_bottom), (pad_left, pad_right))
+
+    if mode == "constant":
+        return np.pad(arr, padding, mode="constant", constant_values=constant)
+    return np.pad(arr, padding, mode=mode)
+
+
+__all__ = [
+    "IMAGE_EXTENSIONS",
+    "TarShardWriter",
+    "build_mask_index",
+    "discover_images",
+    "pad_to_size",
+    "resolve_mask_from_candidates",
+]

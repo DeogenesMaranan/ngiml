@@ -7,7 +7,7 @@ import re
 import tarfile
 from collections import Counter
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Sequence
 
 try:
     import matplotlib.pyplot as plt
@@ -218,7 +218,7 @@ def _dataset_name(sample_uri: str, meta: dict) -> str:
             return parts[i - 1]
     return parts[0] if parts else 'unknown'
 
-def iter_prepared_samples(snapshot_root: Path):
+def iter_prepared_samples(snapshot_root: Path) -> Iterator[tuple[str, dict[str, object]]]:
     for npz_path in sorted(snapshot_root.rglob('*.npz')):
         with np.load(npz_path, allow_pickle=True) as blob:
             yield str(npz_path), {k: blob[k] for k in blob.files}
@@ -268,7 +268,7 @@ def compute_binary_metrics(
         acc = (tp + tn) / (acc_denom + 1e-8)
     return {'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn, 'precision': precision, 'recall': recall, 'f1': f1, 'iou': iou, 'accuracy': acc}
 
-def save_sample_plot(out_path: Path, image_chw: np.ndarray, gt_hw: np.ndarray, prob_hw: np.ndarray, bin05_hw: np.ndarray, title: str):
+def save_sample_plot(out_path: Path, image_chw: np.ndarray, gt_hw: np.ndarray, prob_hw: np.ndarray, bin05_hw: np.ndarray, title: str) -> None:
     _require_matplotlib()
     img = np.transpose(image_chw, (1, 2, 0)).astype(np.float32)
     if img.max() > 1.0:
@@ -575,7 +575,7 @@ def _zero_flop_jit(_inputs, _outputs) -> Counter[str]:
     return Counter()
 
 
-def _build_flop_analysis(model: torch.nn.Module, sample: torch.Tensor):
+def _build_flop_analysis(model: torch.nn.Module, sample: torch.Tensor) -> object:
     from fvcore.nn import FlopCountAnalysis
     from fvcore.nn.jit_handles import elementwise_flop_counter, generic_activation_jit
 

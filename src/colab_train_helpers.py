@@ -2,19 +2,19 @@ import os
 import shutil
 import json
 from pathlib import Path
-from typing import Tuple
+from typing import Any
 
-from src.data.config import AugmentationConfig
 from src.data.dataloaders import load_manifest
-from src.model.hybrid_ngiml import HybridNGIMLConfig
-from src.model.losses import MultiStageLossConfig
-from src.training_defaults import (
-    build_default_components,
-    build_training_config,
-)
+from src.manifest_utils import build_tar_index, resolve_path, sample_files_exist
+
+__all__ = [
+    "apply_colab_runtime_settings",
+    "find_or_resolve_manifest",
+    "stage_persistent_cache_to_runtime",
+]
 
 
-def _cfg_update(config, values: dict, *, overwrite: bool = True) -> None:
+def _cfg_update(config: Any, values: dict[str, Any], *, overwrite: bool = True) -> None:
     if isinstance(config, dict):
         if overwrite:
             config.update(values)
@@ -27,17 +27,17 @@ def _cfg_update(config, values: dict, *, overwrite: bool = True) -> None:
             setattr(config, key, value)
 
 
-def _cfg_as_dict(config) -> dict:
+def _cfg_as_dict(config: Any) -> dict[str, Any]:
     if isinstance(config, dict):
         return config
     return dict(vars(config))
 
 
 def apply_colab_runtime_settings(
-    training_config,
+    training_config: Any,
     balance_sampling: bool = False,
     local_cache_dir: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     recommended_workers = max(2, min(6, (os.cpu_count() or 4)))
     cache_dir = local_cache_dir or "/content/cache"
 
@@ -108,118 +108,7 @@ def stage_persistent_cache_to_runtime(
     }
 
 
-def _norm(value: str) -> str:
-    return str(value).replace("\\", "/")
-
-
-def _suffix_score(a_parts, b_parts) -> int:
-    score = 0
-    for ax, bx in zip(reversed(a_parts), reversed(b_parts)):
-        if ax != bx:
-            break
-        score += 1
-    return score
-
-
-def _candidate_paths(value: str, manifest_path: Path, data_root: Path):
-    normalized = _norm(value)
-    path_value = Path(normalized)
-    candidates = []
-    if path_value.is_absolute():
-        candidates.append(path_value)
-    else:
-        candidates.extend([
-            manifest_path.parent / path_value,
-            data_root / path_value,
-            data_root / "ngiml" / path_value,
-            Path("/content") / path_value,
-            Path("/content/data") / path_value,
-            Path("/content/ngiml") / path_value,
-        ])
-    if "prepared/" in normalized:
-        suffix = normalized.split("prepared/", 1)[1]
-        candidates.extend([
-            data_root / "prepared" / suffix,
-            data_root / "ngiml" / "prepared" / suffix,
-            Path("/content") / "prepared" / suffix,
-            Path("/content/ngiml") / "prepared" / suffix,
-        ])
-    if "datasets/" in normalized:
-        suffix = normalized.split("datasets/", 1)[1]
-        candidates.extend([
-            data_root / "datasets" / suffix,
-            data_root / "ngiml" / "datasets" / suffix,
-            Path("/content") / "datasets" / suffix,
-            Path("/content/ngiml") / "datasets" / suffix,
-        ])
-    seen = set()
-    unique = []
-    for candidate in candidates:
-        key = candidate.as_posix()
-        if key not in seen:
-            seen.add(key)
-            unique.append(candidate)
-    return unique
-
-
-def _build_tar_index(data_root: Path):
-    tar_files = []
-    for pattern in ("*.tar", "*.tar.gz", "*.tgz"):
-        tar_files.extend(data_root.rglob(pattern))
-    tar_by_name = {}
-    for tar_path in tar_files:
-        tar_by_name.setdefault(tar_path.name, []).append(tar_path)
-    return tar_files, tar_by_name
-
-
-def _match_tar_by_basename(value: str, tar_by_name: dict[str, list[Path]]):
-    name = Path(_norm(value)).name
-    matches = tar_by_name.get(name, [])
-    if not matches:
-        return None
-    hint_parts = Path(_norm(value)).parts
-    return max(matches, key=lambda path: _suffix_score(path.parts, hint_parts))
-
-
-def _resolve_file(value: str, manifest_path: Path, data_root: Path, tar_by_name: dict[str, list[Path]]) -> Path:
-    candidates = _candidate_paths(value, manifest_path, data_root)
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    if str(value).endswith((".tar", ".tar.gz", ".tgz")):
-        tar_match = _match_tar_by_basename(value, tar_by_name)
-        if tar_match is not None:
-            return tar_match
-    return candidates[0] if candidates else Path(_norm(value))
-
-
-def _resolve_path(path_str: str | None, manifest_path: Path, data_root: Path, tar_by_name: dict[str, list[Path]]) -> str | None:
-    if path_str is None:
-        return None
-    normalized = _norm(path_str)
-    if "::" in normalized:
-        archive, member = normalized.split("::", 1)
-        archive_path = _resolve_file(archive, manifest_path, data_root, tar_by_name).as_posix()
-        member_path = _norm(member)
-        return f"{archive_path}::{member_path}"
-    return _resolve_file(normalized, manifest_path, data_root, tar_by_name).as_posix()
-
-
-def _sample_files_exist(sample) -> bool:
-    image_path = str(sample.image_path)
-    if "::" in image_path:
-        archive_path, _ = image_path.split("::", 1)
-        if not Path(archive_path).exists():
-            return False
-    else:
-        if not Path(image_path).exists():
-            return False
-    if sample.mask_path is not None and not Path(sample.mask_path).exists():
-        return False
-    return True
-
-
-def find_or_resolve_manifest(data_root: Path, manifest_names: Tuple[str, ...] = ("manifest.parquet", "manifest.json")) -> Path:
+def find_or_resolve_manifest(data_root: Path, manifest_names: tuple[str, ...] = ("manifest.parquet", "manifest.json")) -> Path:
     data_root = Path(data_root)
     resolved_manifest_path = data_root / "manifest_resolved.json"
     manifest_candidates = [
@@ -249,13 +138,13 @@ def find_or_resolve_manifest(data_root: Path, manifest_names: Tuple[str, ...] = 
         print(f"Using cached resolved manifest: {resolved_manifest_path}")
         return resolved_manifest_path
     print("Using manifest:", manifest_path)
-    tar_files, tar_by_name = _build_tar_index(data_root)
+    tar_files, tar_by_name = build_tar_index(data_root)
     print(f"Indexed tar files under {data_root}: {len(tar_files)}")
     manifest_obj = load_manifest(manifest_path)
     rewritten = 0
     for sample in manifest_obj.samples:
-        image_new = _resolve_path(sample.image_path, manifest_path, data_root, tar_by_name)
-        mask_new = _resolve_path(sample.mask_path, manifest_path, data_root, tar_by_name) if sample.mask_path else None
+        image_new = resolve_path(sample.image_path, manifest_path, data_root, tar_by_name)
+        mask_new = resolve_path(sample.mask_path, manifest_path, data_root, tar_by_name) if sample.mask_path else None
         if image_new != sample.image_path:
             sample.image_path = image_new
             rewritten += 1
@@ -266,7 +155,7 @@ def find_or_resolve_manifest(data_root: Path, manifest_names: Tuple[str, ...] = 
             sample.residual_noise_path = None
             rewritten += 1
     original_count = len(manifest_obj.samples)
-    manifest_obj.samples = [s for s in manifest_obj.samples if _sample_files_exist(s)]
+    manifest_obj.samples = [s for s in manifest_obj.samples if sample_files_exist(s)]
     filtered_out = original_count - len(manifest_obj.samples)
     if not manifest_obj.samples:
         raise FileNotFoundError(

@@ -15,7 +15,7 @@ from PIL import Image
 try:
     from tqdm import tqdm
 except ImportError:
-    def tqdm(iterable: Iterable | None = None, **_: object):
+    def tqdm(iterable: Iterable | None = None, **_: object) -> Iterable | list[object]:
         return iterable if iterable is not None else []
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,9 +23,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.config import Manifest, SampleRecord
-from src.prepare_shared import TarShardWriter, discover_images
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+from src.prepare_shared import (
+    IMAGE_EXTENSIONS,
+    TarShardWriter,
+    build_mask_index,
+    discover_images,
+    pad_to_size,
+    resolve_mask_from_candidates,
+)
 
 
 @dataclass(frozen=True)
@@ -80,46 +85,6 @@ def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in text)
 
 
-def _build_mask_index(mask_dir: Path) -> dict[str, Path]:
-    index: dict[str, Path] = {}
-    for path in discover_images(mask_dir, IMAGE_EXTENSIONS, return_empty_if_missing=True):
-        key = path.stem.lower()
-        if key not in index:
-            index[key] = path
-    return index
-
-
-def _resolve_mask(
-    fake_path: Path,
-    mask_index: dict[str, Path],
-    candidates_fn: Callable[[str], Sequence[str]],
-) -> Path | None:
-    for candidate in candidates_fn(fake_path.stem):
-        if candidate.lower() in mask_index:
-            return mask_index[candidate.lower()]
-    return None
-
-
-def _pad_to_size(arr: np.ndarray, size: int, mode: str, constant: int = 0) -> np.ndarray:
-    """Pad a HW or HWC array to size x size."""
-    h, w = arr.shape[:2]
-    pad_h = max(0, size - h)
-    pad_w = max(0, size - w)
-    if pad_h == 0 and pad_w == 0:
-        return arr
-    pad_top = pad_h // 2
-    pad_bottom = pad_h - pad_top
-    pad_left = pad_w // 2
-    pad_right = pad_w - pad_left
-    if arr.ndim == 3:
-        padding = ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0))
-    else:
-        padding = ((pad_top, pad_bottom), (pad_left, pad_right))
-    if mode == "constant":
-        return np.pad(arr, padding, mode="constant", constant_values=constant)
-    return np.pad(arr, padding, mode=mode)
-
-
 def _process_image(image_path: Path, size: int) -> tuple[np.ndarray, tuple[int, int], str]:
     """Load and bring image to size x size using resize/pad policy."""
     image = Image.open(image_path).convert("RGB")
@@ -133,7 +98,7 @@ def _process_image(image_path: Path, size: int) -> tuple[np.ndarray, tuple[int, 
 
     if h <= size and w <= size:
         arr = np.asarray(image, dtype=np.uint8)
-        arr = _pad_to_size(arr, size, mode="symmetric")
+        arr = pad_to_size(arr, size, mode="symmetric")
         return arr, original_hw, "pad"
 
     long_side = max(h, w)
@@ -142,7 +107,7 @@ def _process_image(image_path: Path, size: int) -> tuple[np.ndarray, tuple[int, 
     new_w = max(1, int(round(w * scale)))
     image = image.resize((new_w, new_h), resample=Image.BILINEAR)
     arr = np.asarray(image, dtype=np.uint8)
-    arr = _pad_to_size(arr, size, mode="symmetric")
+    arr = pad_to_size(arr, size, mode="symmetric")
     return arr, original_hw, "resize_then_pad"
 
 
@@ -158,7 +123,7 @@ def _process_mask(mask_path: Path, size: int, original_hw: tuple[int, int], prep
 
     if preproc_mode == "pad":
         arr = np.asarray(mask, dtype=np.uint8)
-        arr = _pad_to_size(arr, size, mode="constant", constant=0)
+        arr = pad_to_size(arr, size, mode="constant", constant=0)
         return (arr > 127).astype(np.uint8)
 
     long_side = max(h, w)
@@ -167,7 +132,7 @@ def _process_mask(mask_path: Path, size: int, original_hw: tuple[int, int], prep
     new_w = max(1, int(round(w * scale)))
     mask = mask.resize((new_w, new_h), resample=Image.NEAREST)
     arr = np.asarray(mask, dtype=np.uint8)
-    arr = _pad_to_size(arr, size, mode="constant", constant=0)
+    arr = pad_to_size(arr, size, mode="constant", constant=0)
     return (arr > 127).astype(np.uint8)
 
 
@@ -288,7 +253,7 @@ def prepare_test_datasets(
 
         mask_index: dict[str, Path] = {}
         if spec.mask_dir:
-            mask_index = _build_mask_index(dataset_root / spec.mask_dir)
+            mask_index = build_mask_index(dataset_root / spec.mask_dir, IMAGE_EXTENSIONS)
 
         entries: list[tuple[str, Path, Path | None, int]] = []
 
@@ -298,7 +263,11 @@ def prepare_test_datasets(
 
         if spec.fake_dir:
             for image_path in discover_images(dataset_root / spec.fake_dir, IMAGE_EXTENSIONS, return_empty_if_missing=True):
-                mask_path = _resolve_mask(image_path, mask_index, spec.mask_stem_candidates)
+                mask_path = resolve_mask_from_candidates(
+                    image_stem=image_path.stem,
+                    mask_index=mask_index,
+                    candidates=tuple(spec.mask_stem_candidates(image_path.stem)),
+                )
                 if mask_path is None:
                     skipped_missing_mask += 1
                     msg = f"[WARN] Missing mask for fake image: {image_path}"

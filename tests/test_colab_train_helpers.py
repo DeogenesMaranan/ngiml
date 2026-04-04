@@ -1,4 +1,5 @@
-﻿from src.colab_train_helpers import apply_colab_runtime_settings, build_default_components, build_training_config
+﻿from src.colab_train_helpers import apply_colab_runtime_settings
+from src.training_defaults import build_default_components, build_training_config
 from src.model.hybrid_ngiml import HybridNGIMLConfig
 from src.model.feature_fusion import FeatureFusionConfig
 

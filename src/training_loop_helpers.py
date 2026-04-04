@@ -374,7 +374,10 @@ def _should_disable_compile_for_device(cfg: TrainConfig, device: torch.device) -
     return total_memory <= (16 * 1024**3)
 
 
-def _build_lr_scheduler(optimizer, cfg):
+def _build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    cfg: TrainConfig,
+) -> torch.optim.lr_scheduler.LRScheduler | None:
     """Builds a learning rate scheduler with optional warmup and cosine/step decay."""
     if not cfg.lr_schedule or cfg.epochs <= 1:
         return None
@@ -422,7 +425,7 @@ def _build_aug_map(names: Sequence[str], cfg: TrainConfig) -> Dict[str, Augmenta
     return aug_map
 
 
-def _prepare_dataloaders(cfg: TrainConfig, device: torch.device):
+def _prepare_dataloaders(cfg: TrainConfig, device: torch.device) -> tuple[object, Dict[str, AugmentationConfig], str]:
     """Create train/val/test loaders and return runtime augmentation metadata."""
     manifest_path = Path(cfg.manifest)
     dataset_names = _collect_dataset_names(manifest_path)
