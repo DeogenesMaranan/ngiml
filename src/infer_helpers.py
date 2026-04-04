@@ -237,8 +237,6 @@ def iter_prepared_samples(snapshot_root: Path) -> Iterator[tuple[str, dict[str, 
 def compute_binary_metrics(
     pred_bin: np.ndarray,
     gt_bin: np.ndarray,
-    *,
-    empty_score_mode: str = "strict",
 ) -> dict[str, float]:
     pred = pred_bin.astype(bool)
     gt = gt_bin.astype(bool)
@@ -246,26 +244,16 @@ def compute_binary_metrics(
     tn = float(np.logical_and(~pred, ~gt).sum())
     fp = float(np.logical_and(pred, ~gt).sum())
     fn = float(np.logical_and(~pred, gt).sum())
-    mode = str(empty_score_mode).strip().lower()
-    if mode not in {"strict", "legacy"}:
-        raise ValueError(f"Unsupported empty_score_mode={empty_score_mode!r}. Use 'strict' or 'legacy'.")
-
     precision_denom = tp + fp
     recall_denom = tp + fn
-    f1_denom = (2 * tp) + fp + fn
     iou_denom = tp + fp + fn
     acc_denom = tp + tn + fp + fn
 
     precision = tp / (precision_denom + 1e-8)
     recall = tp / (recall_denom + 1e-8)
-    if mode == "legacy":
-        f1 = (2 * tp) / f1_denom if f1_denom > 0 else 1.0
-        iou = tp / iou_denom if iou_denom > 0 else 1.0
-        acc = (tp + tn) / acc_denom if acc_denom > 0 else 1.0
-    else:
-        f1 = (2 * precision * recall) / (precision + recall + 1e-8)
-        iou = tp / (iou_denom + 1e-8)
-        acc = (tp + tn) / (acc_denom + 1e-8)
+    f1 = (2 * precision * recall) / (precision + recall + 1e-8)
+    iou = tp / (iou_denom + 1e-8)
+    acc = (tp + tn) / (acc_denom + 1e-8)
     return {'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn, 'precision': precision, 'recall': recall, 'f1': f1, 'iou': iou, 'accuracy': acc}
 
 def save_sample_plot(out_path: Path, image_chw: np.ndarray, gt_hw: np.ndarray, prob_hw: np.ndarray, bin05_hw: np.ndarray, title: str) -> None:
@@ -342,8 +330,7 @@ def _append_prepared_inference_result(
     gt_hw = _original_space_ground_truth(sample["mask_hw"], sample["meta"])
     pred_bin_metric = (prob_hw >= float(threshold_for_metrics)).astype(np.uint8)
     pred_bin_plot = (prob_hw >= float(plot_binary_threshold)).astype(np.uint8)
-    metrics = compute_binary_metrics(pred_bin_metric, gt_hw, empty_score_mode="strict")
-    legacy_metrics = compute_binary_metrics(pred_bin_metric, gt_hw, empty_score_mode="legacy")
+    metrics = compute_binary_metrics(pred_bin_metric, gt_hw)
 
     meta = sample["meta"]
     raw_label = meta.get("label", int(gt_hw.max() > 0))
@@ -369,8 +356,6 @@ def _append_prepared_inference_result(
         "pred_positive_ratio_threshold": float(pred_bin_metric.mean()),
         "pred_positive_ratio_0_5": float(pred_bin_plot.mean()),
         "gt_positive_ratio": float(gt_hw.mean()),
-        "legacy_f1": float(legacy_metrics["f1"]),
-        "legacy_iou": float(legacy_metrics["iou"]),
     }
     row.update(metrics)
     rows.append(row)
@@ -521,8 +506,6 @@ def run_prepared_dataset_inference(
             "mean_probability": "mean",
             "pred_positive_ratio_threshold": "mean",
             "gt_positive_ratio": "mean",
-            "legacy_f1": "mean",
-            "legacy_iou": "mean",
         }
     ).rename(columns={"sample_uri": "num_samples"})
     summary_df.to_csv(summary_csv, index=False)
@@ -531,9 +514,7 @@ def run_prepared_dataset_inference(
             "dataset",
             "num_samples",
             "f1",
-            "legacy_f1",
             "iou",
-            "legacy_iou",
             "precision",
             "recall",
             "accuracy",
@@ -542,8 +523,6 @@ def run_prepared_dataset_inference(
             "gt_positive_ratio",
         ]
     ].copy()
-    comparison_df["f1_gap_legacy_minus_strict"] = comparison_df["legacy_f1"] - comparison_df["f1"]
-    comparison_df["iou_gap_legacy_minus_strict"] = comparison_df["legacy_iou"] - comparison_df["iou"]
     comparison_df.to_csv(comparison_csv, index=False)
 
     for dataset_name, samples in sorted(plot_samples.items()):
