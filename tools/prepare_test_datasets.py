@@ -101,7 +101,7 @@ def _resolve_mask(
 
 
 def _pad_to_size(arr: np.ndarray, size: int, mode: str, constant: int = 0) -> np.ndarray:
-    """Pad a HW or HWC array to size x size. Never upsamples."""
+    """Pad a HW or HWC array to size x size."""
     h, w = arr.shape[:2]
     pad_h = max(0, size - h)
     pad_w = max(0, size - w)
@@ -121,39 +121,21 @@ def _pad_to_size(arr: np.ndarray, size: int, mode: str, constant: int = 0) -> np
 
 
 def _process_image(image_path: Path, size: int) -> tuple[np.ndarray, tuple[int, int], str]:
-    """Load and bring image to size x size.
-
-    Cases:
-      A - both dims >= size: resize to size x size (BILINEAR). All models get
-          the same squash distortion - fair controlled comparison.
-      B - either dim < size (after any needed downscale): pad to size x size
-          with symmetric padding. No upsampling - forensic cues preserved.
-      C - one dim > size, other dim < size (extreme aspect ratio): resize
-          long side to size (downscale only), then pad short side to size.
-
-    Returns:
-        image_np: uint8 RGB array of shape (size, size, 3)
-        original_hw: (H, W) before any processing
-        preproc_mode: one of "resize", "pad", "resize_then_pad"
-    """
+    """Load and bring image to size x size using resize/pad policy."""
     image = Image.open(image_path).convert("RGB")
     original_hw = (image.height, image.width)
     h, w = original_hw
 
     if h >= size and w >= size:
-        # Case A - both dims large enough, direct resize
         if image.size != (size, size):
             image = image.resize((size, size), resample=Image.BILINEAR)
         return np.asarray(image, dtype=np.uint8), original_hw, "resize"
 
     if h <= size and w <= size:
-        # Case B - both dims below size, pad only
         arr = np.asarray(image, dtype=np.uint8)
         arr = _pad_to_size(arr, size, mode="symmetric")
         return arr, original_hw, "pad"
 
-    # Case C - one dim > size, other < size (extreme aspect ratio)
-    # Downscale the long side to size, then pad the short side.
     long_side = max(h, w)
     scale = size / long_side
     new_h = max(1, int(round(h * scale)))
@@ -165,14 +147,7 @@ def _process_image(image_path: Path, size: int) -> tuple[np.ndarray, tuple[int, 
 
 
 def _process_mask(mask_path: Path, size: int, original_hw: tuple[int, int], preproc_mode: str) -> np.ndarray:
-    """Load and bring mask to size x size using the same path as the image.
-
-    Mirrors _process_image exactly:
-      - resize -> NEAREST resize to size x size
-      - pad -> zero pad to size x size
-      - resize_then_pad -> NEAREST downscale long side, then zero pad
-    Binarizes at 127 after all transforms.
-    """
+    """Load and bring mask to size x size using the image preprocessing path."""
     mask = Image.open(mask_path).convert("L")
     h, w = original_hw
 
@@ -186,7 +161,6 @@ def _process_mask(mask_path: Path, size: int, original_hw: tuple[int, int], prep
         arr = _pad_to_size(arr, size, mode="constant", constant=0)
         return (arr > 127).astype(np.uint8)
 
-    # resize_then_pad
     long_side = max(h, w)
     scale = size / long_side
     new_h = max(1, int(round(h * scale)))
@@ -197,20 +171,13 @@ def _process_mask(mask_path: Path, size: int, original_hw: tuple[int, int], prep
     return (arr > 127).astype(np.uint8)
 
 
-# ---------------------------------------------------------------------------
-# Storage helpers
-# ---------------------------------------------------------------------------
-
 def _save_npz(
     npz_path: Path,
     image_np: np.ndarray,
     mask_np: np.ndarray | None,
     metadata: dict[str, object],
 ) -> None:
-    """Save image and optional mask to uncompressed NPZ.
-
-    mask_np is None for real images - evaluator assumes all-zero ground truth.
-    """
+    """Save image and optional mask to uncompressed NPZ."""
     npz_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_json = json.dumps(metadata, ensure_ascii=True)
     arrays: dict[str, np.ndarray] = {
@@ -219,7 +186,6 @@ def _save_npz(
     }
     if mask_np is not None:
         arrays["mask"] = mask_np
-    # ZIP_STORED (uncompressed) - do not switch to savez_compressed.
     np.savez(npz_path, **arrays)
 
 
@@ -229,10 +195,6 @@ def _append_manifest_row(jsonl_path: Path, row: dict[str, object]) -> None:
         handle.write(json.dumps(row, ensure_ascii=True))
         handle.write("\n")
 
-
-# ---------------------------------------------------------------------------
-# Tar sharding
-# ---------------------------------------------------------------------------
 
 def _shard_records(
     records: list[SampleRecord],
@@ -276,10 +238,6 @@ def _shard_records(
     return sharded, writer.shard_idx
 
 
-# ---------------------------------------------------------------------------
-# Main preparation logic
-# ---------------------------------------------------------------------------
-
 def _iter_selected_specs(
     all_specs: Sequence[DatasetSpec],
     requested: str | None,
@@ -320,7 +278,6 @@ def prepare_test_datasets(
     records: list[SampleRecord] = []
     skipped_missing_mask = 0
 
-    # Preprocessing mode counters for summary
     mode_counts: dict[str, int] = {"resize": 0, "pad": 0, "resize_then_pad": 0}
 
     for spec in specs:
@@ -381,10 +338,7 @@ def prepare_test_datasets(
                 "original_size_hw": list(original_hw),
                 "processed_size_hw": [size, size],
                 "processed_sample_path": str(npz_path),
-                # How the image was brought to size x size - useful for
-                # breaking down metrics by preprocessing path.
                 "preproc_mode": preproc_mode,
-                # True for reals - evaluator assumes all-zero ground truth.
                 "mask_is_all_zero": mask_np is None,
                 "mask_foreground_pixels": int(mask_np.sum()) if mask_np is not None else 0,
                 "storage": "npz",
@@ -450,18 +404,8 @@ def prepare_test_datasets(
     return Manifest(samples=records)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Prepare benchmark test datasets for fair evaluation against "
-            "MantraNet, ProFact, and MVSSNet. Images >= SIZE are resized to "
-            "SIZE x SIZE. Images < SIZE are padded to SIZE x SIZE without upsampling."
-        )
-    )
+    parser = argparse.ArgumentParser(description="Prepare benchmark test datasets")
     parser.add_argument(
         "--input-root",
         type=str,

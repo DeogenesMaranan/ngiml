@@ -1,11 +1,4 @@
-﻿"""End-to-end NGIML training loop with checkpointing.
-
-Run example:
-    python tools/train_ngiml.py --manifest /content/data/manifest.json --output-dir /content/runs
-
-The script expects a prepared manifest (see src/data/config.py) and will
-save checkpoints plus a copy of the training arguments inside the output dir.
-"""
+﻿"""End-to-end NGIML training loop with checkpointing."""
 from __future__ import annotations
 
 import json
@@ -645,7 +638,7 @@ def evaluate(model: HybridNGIML, loader, loss_fn, device: torch.device, cfg: Tra
 
 
 def run_training(cfg: TrainConfig) -> None:
-    """Run full NGIML training with validation, checkpointing, and early stopping."""
+    """Run full NGIML training."""
     set_global_seed(cfg.seed, deterministic=cfg.deterministic)
     startup_t0 = time.time()
 

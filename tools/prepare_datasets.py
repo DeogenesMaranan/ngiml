@@ -1,4 +1,4 @@
-﻿"""Prepare datasets into a common manifest with optional resizing."""
+﻿"""Prepare datasets into a common manifest."""
 from __future__ import annotations
 
 import argparse
@@ -473,10 +473,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Run dataset preparation.
-
-    Dataset declarations are managed via `build_default_configs()` in this entrypoint flow.
-    """
+    """Run dataset preparation."""
     args = parse_args()
     datasets, per_dataset_splits, prep_cfg = build_default_configs()
 
