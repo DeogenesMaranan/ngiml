@@ -980,57 +980,6 @@ def _get_model_complexity_stats_for_report(
                 return out[0]
             return out
 
-    def _estimate_macs_with_hooks(module: torch.nn.Module, sample_tensor: torch.Tensor) -> float:
-        macs_total = 0.0
-        hooks: list[torch.utils.hooks.RemovableHandle] = []
-
-        def _conv_hook(layer: torch.nn.Module, inputs: tuple[torch.Tensor, ...], output: torch.Tensor) -> None:
-            nonlocal macs_total
-            if not isinstance(output, torch.Tensor) or not inputs:
-                return
-            out = output
-            if out.ndim < 4:
-                return
-            batch = int(out.shape[0])
-            out_ch = int(out.shape[1])
-            out_h = int(out.shape[-2])
-            out_w = int(out.shape[-1])
-            kernel = getattr(layer, "kernel_size", (1, 1))
-            if isinstance(kernel, int):
-                kernel_h = kernel_w = int(kernel)
-            else:
-                kernel_h, kernel_w = int(kernel[0]), int(kernel[1])
-            in_ch = int(getattr(layer, "in_channels", 0))
-            groups = int(getattr(layer, "groups", 1) or 1)
-            in_per_group = max(1, in_ch // groups)
-            macs_total += float(batch * out_ch * out_h * out_w * in_per_group * kernel_h * kernel_w)
-
-        def _linear_hook(layer: torch.nn.Module, inputs: tuple[torch.Tensor, ...], _output: torch.Tensor) -> None:
-            nonlocal macs_total
-            if not inputs:
-                return
-            inp = inputs[0]
-            if not isinstance(inp, torch.Tensor) or inp.ndim == 0:
-                return
-            batch_items = int(inp.numel() // max(1, int(inp.shape[-1])))
-            in_features = int(getattr(layer, "in_features", 0))
-            out_features = int(getattr(layer, "out_features", 0))
-            macs_total += float(batch_items * in_features * out_features)
-
-        for submodule in module.modules():
-            if isinstance(submodule, (torch.nn.Conv2d, torch.nn.ConvTranspose2d)):
-                hooks.append(submodule.register_forward_hook(_conv_hook))
-            elif isinstance(submodule, torch.nn.Linear):
-                hooks.append(submodule.register_forward_hook(_linear_hook))
-
-        try:
-            with torch.no_grad():
-                _ = module(sample_tensor)
-        finally:
-            for handle in hooks:
-                handle.remove()
-        return float(macs_total)
-
     wrapper = _ProfileWrapper(model).eval()
     try:
         from thop import profile as thop_profile
@@ -1041,35 +990,15 @@ def _get_model_complexity_stats_for_report(
         stats["macs"] = macs
         stats["flops"] = macs * 2.0
         stats["flops_source"] = "thop"
-    except Exception as thop_exc:
-        try:
-            from torch.profiler import ProfilerActivity, profile
-
-            with profile(activities=[ProfilerActivity.CPU], with_flops=True, record_shapes=False) as profiler:
-                with torch.no_grad():
-                    _ = wrapper(sample)
-            total_flops = float(sum(float(getattr(evt, "flops", 0.0) or 0.0) for evt in profiler.key_averages()))
-            if total_flops <= 0.0:
-                raise RuntimeError("torch.profiler returned zero FLOPs")
-            stats["flops"] = total_flops
-            stats["macs"] = total_flops / 2.0
-            stats["flops_source"] = "torch.profiler"
-        except Exception as profiler_exc:
-            try:
-                hook_macs = _estimate_macs_with_hooks(wrapper, sample)
-                if hook_macs <= 0.0:
-                    raise RuntimeError("Hook-based estimator returned zero MACs")
-                stats["macs"] = hook_macs
-                stats["flops"] = hook_macs * 2.0
-                stats["flops_source"] = "hooks(conv+linear)"
-            except Exception as hook_exc:
-                stats["macs"] = None
-                stats["flops"] = None
-                stats["flops_source"] = None
-                stats["flops_error"] = (
-                    "FLOPs unavailable after thop, torch.profiler, and hook-based fallback attempts. "
-                    f"thop: {thop_exc}; profiler: {profiler_exc}; hooks: {hook_exc}"
-                )
+    except Exception as exc:
+        stats["macs"] = None
+        stats["flops"] = None
+        stats["flops_source"] = None
+        stats["flops_error"] = (
+            "FLOPs unavailable. Install thop in the active environment: "
+            "`pip install thop`. "
+            f"Error: {exc}"
+        )
     return stats
 
 
