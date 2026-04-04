@@ -37,9 +37,9 @@ from src.checkpoint_utils import (
     parse_checkpoint_epoch,
     select_highest_resolution_head,
 )
+from src.model_config_utils import coerce_model_config
 from src.model.hybrid_ngiml import HybridNGIML
 from src.training_defaults import build_default_components
-from src.training_loop_helpers import _coerce_model_config
 
 
 def _require_matplotlib() -> None:
@@ -740,7 +740,7 @@ def _build_model_config_from_checkpoint(checkpoint: dict) -> tuple[object, str]:
     model_config = train_config.get("model_config") if isinstance(train_config, dict) else None
 
     if isinstance(model_config, dict):
-        return _coerce_model_config(model_config), "train_config.model_config"
+        return coerce_model_config(model_config), "train_config.model_config"
 
     inferred_channels = _infer_fusion_channels_from_state_dict(checkpoint.get("model_state", {}))
     if inferred_channels:
@@ -1673,82 +1673,3 @@ def plot_multi_strategy_inference(
     plt.tight_layout()
     plt.show()
     return fig, axes
-
-
-def get_model_complexity_stats(
-    model: HybridNGIML,
-    input_size: tuple[int, int, int, int] = (1, 3, 448, 448),
-) -> dict[str, object]:
-    total_params = sum(parameter.numel() for parameter in model.parameters())
-    trainable_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-    frozen_params = total_params - trainable_params
-
-    stats: dict[str, object] = {
-        "total_params": int(total_params),
-        "trainable_params": int(trainable_params),
-        "frozen_params": int(frozen_params),
-        "input_size": tuple(int(v) for v in input_size),
-    }
-
-    sample_device = next(model.parameters()).device
-    sample = torch.randn(*input_size, device=sample_device)
-
-    class _ProfileWrapper(torch.nn.Module):
-        def __init__(self, base_model: HybridNGIML):
-            super().__init__()
-            self.base_model = base_model
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            out = self.base_model(x, target_size=x.shape[-2:], residual_noise=None)
-            if isinstance(out, (list, tuple)):
-                return select_highest_resolution_head(out)
-            return out
-
-    profile_model = _ProfileWrapper(model).to(sample_device)
-
-    was_training = model.training
-    model.eval()
-    profile_model.eval()
-    try:
-        try:
-            from thop import profile as thop_profile
-
-            with torch.no_grad():
-                macs, _ = thop_profile(profile_model, inputs=(sample,), verbose=False)
-            macs = float(macs)
-            stats["macs"] = macs
-            stats["flops"] = macs * 2.0
-            stats["unsupported_ops"] = None
-            stats["flops_source"] = "thop"
-            stats["flops_error"] = None
-        except Exception as thop_error:
-            try:
-                with torch.no_grad():
-                    analysis = _build_flop_analysis(profile_model, sample)
-                    total_flops = float(analysis.total())
-                    unsupported_ops = {str(name): int(count) for name, count in analysis.unsupported_ops().items()}
-                stats["flops"] = total_flops
-                stats["macs"] = total_flops / 2.0
-                stats["unsupported_ops"] = unsupported_ops
-                stats["flops_source"] = "fvcore+custom_op_handles"
-                stats["flops_error"] = (
-                    None
-                    if not unsupported_ops
-                    else "THOP unavailable; fvcore fallback may undercount unsupported ops listed in `unsupported_ops`."
-                )
-            except Exception as fv_error:
-                stats["flops"] = None
-                stats["macs"] = None
-                stats["unsupported_ops"] = None
-                stats["flops_source"] = None
-                stats["flops_error"] = (
-                    "FLOPs unavailable. "
-                    f"thop error: {thop_error}. "
-                    f"fvcore error: {fv_error}. "
-                    "Try `%pip install thop` (or `%pip install fvcore iopath`) in the active notebook kernel."
-                )
-    finally:
-        model.train(was_training)
-
-    return stats
-

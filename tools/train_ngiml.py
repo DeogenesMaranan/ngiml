@@ -39,10 +39,45 @@ from src.model.hybrid_ngiml import HybridNGIML, HybridNGIMLConfig
 from src.model.losses import MultiStageManipulationLoss
 from src.training_cli import parse_args as _parse_args
 from src.training_types import Checkpoint, TrainConfig
-from src.training_loop_helpers import *
+from src.training_loop_helpers import (
+    PrefetchLoader,
+    _build_lr_scheduler,
+    _build_threshold_grid,
+    _coerce_loss_config,
+    _coerce_model_config,
+    _empty_bin_stats,
+    _finalize_bin_stats,
+    _initial_best_for_monitor,
+    _metric_for_monitor,
+    _metrics_from_counts,
+    _monitor_improved,
+    _parity_check,
+    _prepare_dataloaders,
+    _print_and_validate_train_dataset_integrity,
+    _print_resolved_config_summary,
+    _resolve_cuda_runtime_stability,
+    _resolve_manifest_for_training,
+    _segmentation_counts,
+    _select_threshold_with_precision_guard,
+    _set_backbone_trainability_for_epoch,
+    _should_disable_compile_for_device,
+    _size_bin_name,
+    _validate_startup_config,
+    _write_best_threshold_metadata,
+    format_status_flags,
+    infer_loader_total_batches,
+    resolve_gpu_aug_chunk_size,
+    should_chunk_gpu_aug,
+    to_float_label_ratio,
+)
 
 def parse_args() -> TrainConfig:
     return _parse_args()
+
+
+def _checkpoint_epoch(path: Path) -> int:
+    parsed = parse_checkpoint_epoch(path)
+    return int(parsed) if parsed is not None else -1
 
 
 def set_global_seed(seed: int, deterministic: bool = False) -> None:

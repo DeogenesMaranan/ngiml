@@ -14,7 +14,7 @@ if "matplotlib" not in sys.modules:
     sys.modules["matplotlib"] = matplotlib_stub
     sys.modules["matplotlib.pyplot"] = pyplot_stub
 
-from tools import infer_helpers
+from src import infer_helpers
 
 
 def test_build_model_config_from_checkpoint_restores_new_fusion_fields():

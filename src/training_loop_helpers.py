@@ -14,9 +14,11 @@ from typing import Dict, Optional, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
+from src.checkpoint_utils import disable_pretrained_backbones_for_checkpoint_load
 from src.data.dataloaders import AugmentationConfig, create_dataloaders, load_manifest
 from src.model.hybrid_ngiml import HybridNGIML, HybridNGIMLConfig
-from src.model.losses import MultiStageLossConfig
+from src.model_config_utils import coerce_loss_config as _coerce_loss_config
+from src.model_config_utils import coerce_model_config as _coerce_model_config
 from src.training_defaults import _coerce_aug as _shared_coerce_aug, build_default_components as _build_default_components
 from src.training_types import TrainConfig
 
@@ -402,90 +404,6 @@ def _collect_dataset_names(manifest_path: Path) -> Sequence[str]:
     if not names:
         raise ValueError("Manifest contains no samples")
     return names
-
-
-def _coerce_model_config(value) -> HybridNGIMLConfig:
-    if value is None:
-        return HybridNGIMLConfig()
-    if isinstance(value, HybridNGIMLConfig):
-        return value
-    if not isinstance(value, dict):
-        raise TypeError("Model config must be HybridNGIMLConfig or dict")
-
-    from src.model.backbones.efficientnet_backbone import EfficientNetBackboneConfig
-    from src.model.backbones.residual_noise_branch import ResidualNoiseConfig
-    from src.model.backbones.swin_backbone import SwinBackboneConfig
-    from src.model.feature_fusion import FeatureFusionConfig
-    from src.model.hybrid_ngiml import HybridNGIMLOptimizerConfig, OptimizerGroupConfig
-    from src.model.unet_decoder import UNetDecoderConfig
-
-    def _coerce_optimizer_config(opt_value) -> HybridNGIMLOptimizerConfig:
-        if opt_value is None:
-            return HybridNGIMLOptimizerConfig()
-        if isinstance(opt_value, HybridNGIMLOptimizerConfig):
-            return opt_value
-        if not isinstance(opt_value, dict):
-            raise TypeError("Optimizer config must be HybridNGIMLOptimizerConfig or dict")
-
-        default_opt = HybridNGIMLOptimizerConfig()
-
-        def _coerce_group(group_value, default_group: OptimizerGroupConfig) -> OptimizerGroupConfig:
-            if isinstance(group_value, OptimizerGroupConfig):
-                return group_value
-            if group_value is None:
-                return default_group
-            if isinstance(group_value, dict):
-                return OptimizerGroupConfig(**group_value)
-            raise TypeError("Optimizer group config must be OptimizerGroupConfig or dict")
-
-        betas_raw = opt_value.get("betas", default_opt.betas)
-        if isinstance(betas_raw, list):
-            betas = tuple(float(v) for v in betas_raw)
-        else:
-            betas = tuple(betas_raw)
-
-        return HybridNGIMLOptimizerConfig(
-            efficientnet=_coerce_group(opt_value.get("efficientnet"), default_opt.efficientnet),
-            swin=_coerce_group(opt_value.get("swin"), default_opt.swin),
-            residual=_coerce_group(opt_value.get("residual"), default_opt.residual),
-            fusion=_coerce_group(opt_value.get("fusion"), default_opt.fusion),
-            decoder=_coerce_group(opt_value.get("decoder"), default_opt.decoder),
-            betas=betas,
-            eps=float(opt_value.get("eps", default_opt.eps)),
-            freeze_backbone_epochs=int(opt_value.get("freeze_backbone_epochs", default_opt.freeze_backbone_epochs)),
-        )
-
-    default_model = HybridNGIMLConfig()
-    efficientnet = value.get("efficientnet", default_model.efficientnet)
-    swin = value.get("swin", default_model.swin)
-    residual = value.get("residual", default_model.residual)
-    fusion = value.get("fusion", default_model.fusion)
-    decoder = value.get("decoder", default_model.decoder)
-    optimizer = value.get("optimizer", default_model.optimizer)
-
-    return HybridNGIMLConfig(
-        efficientnet=efficientnet if isinstance(efficientnet, EfficientNetBackboneConfig) else EfficientNetBackboneConfig(**efficientnet),
-        swin=swin if isinstance(swin, SwinBackboneConfig) else SwinBackboneConfig(**swin),
-        residual=residual if isinstance(residual, ResidualNoiseConfig) else ResidualNoiseConfig(**residual),
-        fusion=fusion if isinstance(fusion, FeatureFusionConfig) else FeatureFusionConfig(**fusion),
-        decoder=decoder if isinstance(decoder, UNetDecoderConfig) else UNetDecoderConfig(**decoder),
-        optimizer=_coerce_optimizer_config(optimizer),
-        use_low_level=bool(value.get("use_low_level", default_model.use_low_level)),
-        use_context=bool(value.get("use_context", default_model.use_context)),
-        use_residual=bool(value.get("use_residual", default_model.use_residual)),
-        enable_residual_attention=bool(value.get("enable_residual_attention", default_model.enable_residual_attention)),
-        gradient_checkpointing=bool(value.get("gradient_checkpointing", default_model.gradient_checkpointing)),
-    )
-
-
-def _coerce_loss_config(value) -> MultiStageLossConfig:
-    if value is None:
-        return MultiStageLossConfig()
-    if isinstance(value, MultiStageLossConfig):
-        return value
-    if isinstance(value, dict):
-        return MultiStageLossConfig(**value)
-    raise TypeError("Loss config must be MultiStageLossConfig or dict")
 
 
 def _build_aug_map(names: Sequence[str], cfg: TrainConfig) -> Dict[str, AugmentationConfig]:
@@ -906,6 +824,212 @@ def _print_resolved_config_summary(cfg: TrainConfig, normalization_mode: str) ->
         f"threshold_mode={threshold_mode}"
     )
 
+
+def _resolve_checkpoint_path(checkpoint_dir: Path, target_epoch: int | None) -> Path:
+    if target_epoch is None:
+        best_ckpt = checkpoint_dir / "best_checkpoint.pt"
+        if not best_ckpt.exists():
+            raise FileNotFoundError("best_checkpoint.pt not found.")
+        return best_ckpt
+
+    target_ckpt = checkpoint_dir / f"checkpoint_epoch_{int(target_epoch):03d}.pt"
+    if target_ckpt.exists():
+        return target_ckpt
+
+    candidates = sorted(
+        checkpoint_dir.glob(f"checkpoint_epoch_{int(target_epoch)}*.pt"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not candidates:
+        raise FileNotFoundError(f"No checkpoint found for epoch {target_epoch}.")
+    return candidates[-1]
+
+
+def _human_compact(value: float | int | None) -> str:
+    if value is None:
+        return "N/A"
+    num = float(value)
+    abs_num = abs(num)
+    if abs_num >= 1e12:
+        return f"{num / 1e12:.3f}T"
+    if abs_num >= 1e9:
+        return f"{num / 1e9:.3f}G"
+    if abs_num >= 1e6:
+        return f"{num / 1e6:.3f}M"
+    if abs_num >= 1e3:
+        return f"{num / 1e3:.3f}K"
+    return f"{num:.3f}"
+
+
+def _infer_fusion_channels_from_state_dict(model_state: dict) -> tuple[int, ...] | None:
+    stage_channels: dict[int, int] = {}
+    pattern = re.compile(r"^fusion\.stages\.(\d+)\.projections\.[^.]+\.weight$")
+    for key, tensor in model_state.items():
+        match = pattern.match(key)
+        if not match or not isinstance(tensor, torch.Tensor):
+            continue
+        stage_idx = int(match.group(1))
+        stage_channels[stage_idx] = int(tensor.shape[0])
+    if not stage_channels:
+        return None
+    return tuple(stage_channels[idx] for idx in sorted(stage_channels))
+
+
+def _build_model_config_from_checkpoint_for_report(checkpoint: dict) -> HybridNGIMLConfig:
+    train_config = checkpoint.get("train_config") if isinstance(checkpoint, dict) else None
+    model_config = train_config.get("model_config") if isinstance(train_config, dict) else None
+    if isinstance(model_config, dict):
+        return _coerce_model_config(model_config)
+
+    model_cfg, _, _, _ = _build_default_components()
+    inferred_channels = _infer_fusion_channels_from_state_dict(checkpoint.get("model_state", {}))
+    if inferred_channels:
+        model_cfg.fusion.fusion_channels = inferred_channels
+    return model_cfg
+
+
+def _load_state_dict_with_fallback_for_report(model: HybridNGIML, model_state: dict) -> None:
+    try:
+        model.load_state_dict(model_state, strict=False)
+        return
+    except RuntimeError:
+        current_state = model.state_dict()
+        compatible_state = {
+            key: value
+            for key, value in model_state.items()
+            if key in current_state and hasattr(value, "shape") and current_state[key].shape == value.shape
+        }
+        model.load_state_dict(compatible_state, strict=False)
+
+
+def _normalize_profile_input_size(value: object) -> int | None:
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, (tuple, list)) and value:
+        try:
+            if len(value) >= 2:
+                return int(max(value[-2], value[-1]))
+            return int(value[0])
+        except Exception:
+            return None
+    return None
+
+
+def _resolve_profile_input_size_for_report(train_config: dict, model_cfg: HybridNGIMLConfig) -> int:
+    train_value = _normalize_profile_input_size(train_config.get("input_size"))
+    if train_value is not None:
+        return train_value
+
+    cfg_candidates = [
+        getattr(getattr(model_cfg, "swin", None), "input_size", None),
+        getattr(getattr(model_cfg, "efficientnet", None), "input_size", None),
+    ]
+    for candidate in cfg_candidates:
+        resolved = _normalize_profile_input_size(candidate)
+        if resolved is not None:
+            return resolved
+    return 448
+
+
+def _load_model_from_checkpoint_for_report(checkpoint_path: Path) -> tuple[HybridNGIML, dict]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    model_cfg = _build_model_config_from_checkpoint_for_report(checkpoint)
+    model_cfg = disable_pretrained_backbones_for_checkpoint_load(model_cfg)
+    model = HybridNGIML(model_cfg)
+    _load_state_dict_with_fallback_for_report(model, checkpoint["model_state"])
+    model = model.cpu().eval()
+
+    train_config = checkpoint.get("train_config") if isinstance(checkpoint, dict) else {}
+    if not isinstance(train_config, dict):
+        train_config = {}
+    info = {
+        "epoch": int(checkpoint.get("epoch", -1)),
+        "input_size": int(_resolve_profile_input_size_for_report(train_config, model_cfg)),
+    }
+    return model, info
+
+
+def _get_model_complexity_stats_for_report(
+    model: HybridNGIML,
+    input_size: tuple[int, int, int, int],
+) -> dict[str, object]:
+    total_params = sum(parameter.numel() for parameter in model.parameters())
+    trainable_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    frozen_params = total_params - trainable_params
+
+    stats: dict[str, object] = {
+        "total_params": int(total_params),
+        "trainable_params": int(trainable_params),
+        "frozen_params": int(frozen_params),
+        "input_size": tuple(int(v) for v in input_size),
+    }
+
+    sample = torch.randn(*input_size, dtype=torch.float32)
+
+    class _ProfileWrapper(torch.nn.Module):
+        def __init__(self, base_model: HybridNGIML):
+            super().__init__()
+            self.base_model = base_model
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            out = self.base_model(x, target_size=x.shape[-2:], residual_noise=None)
+            if isinstance(out, (list, tuple)):
+                return out[0]
+            return out
+
+    wrapper = _ProfileWrapper(model).eval()
+    try:
+        from thop import profile as thop_profile
+
+        with torch.no_grad():
+            macs, _params = thop_profile(wrapper, inputs=(sample,), verbose=False)
+        macs = float(macs)
+        stats["macs"] = macs
+        stats["flops"] = macs * 2.0
+        stats["flops_source"] = "thop"
+    except Exception as exc:
+        stats["macs"] = None
+        stats["flops"] = None
+        stats["flops_source"] = None
+        stats["flops_error"] = (
+            "FLOPs unavailable. Install thop in the active environment: "
+            "`pip install thop`. "
+            f"Error: {exc}"
+        )
+    return stats
+
+
+def report_checkpoint_complexity(checkpoint_dir: Path | str, target_epoch: int | None = None) -> dict[str, object]:
+    """Load a checkpointed model and print model complexity stats for notebook workflows."""
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+
+    ckpt_path = _resolve_checkpoint_path(checkpoint_dir, target_epoch)
+
+    model, ckpt_info = _load_model_from_checkpoint_for_report(ckpt_path)
+    input_size = int(ckpt_info.get("input_size", 448))
+    stats = _get_model_complexity_stats_for_report(model, input_size=(1, 3, input_size, input_size))
+
+    total_params = int(stats.get("total_params", 0) or 0)
+    trainable_params = int(stats.get("trainable_params", 0) or 0)
+    macs = stats.get("macs")
+    flops = stats.get("flops")
+
+    print("Checkpoint:", ckpt_path)
+    print("Target epoch:", target_epoch)
+    print("Input shape:", tuple(stats.get("input_size", (1, 3, input_size, input_size))))
+    print("Trainable params:", f"{trainable_params:,}")
+    print("Total params:", f"{total_params:,}")
+    print("MACs:", _human_compact(macs))
+    print("Approx FLOPs (2 * MACs):", _human_compact(flops))
+
+    return {
+        "checkpoint_path": str(ckpt_path),
+        "target_epoch": target_epoch,
+        **stats,
+    }
+
 __all__ = [
     "PrefetchLoader",
     "format_status_flags",
@@ -927,6 +1051,7 @@ __all__ = [
     "_prepare_dataloaders",
     "_print_and_validate_train_dataset_integrity",
     "_print_resolved_config_summary",
+    "report_checkpoint_complexity",
     "_resolve_cuda_runtime_stability",
     "_resolve_manifest_for_training",
     "_segmentation_counts",
