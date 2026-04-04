@@ -492,7 +492,6 @@ def run_prepared_dataset_inference(
 
     results_csv = csv_output_dir / "ngiml_hf_test_inference_results.csv"
     summary_csv = csv_output_dir / "ngiml_hf_test_inference_summary_by_dataset.csv"
-    comparison_csv = csv_output_dir / "ngiml_hf_test_inference_metric_mode_comparison.csv"
     results_df.to_csv(results_csv, index=False)
 
     summary_df = results_df.groupby("dataset", as_index=False).agg(
@@ -523,7 +522,6 @@ def run_prepared_dataset_inference(
             "gt_positive_ratio",
         ]
     ].copy()
-    comparison_df.to_csv(comparison_csv, index=False)
 
     for dataset_name, samples in sorted(plot_samples.items()):
         dataset_plot_dir = plot_output_dir / dataset_name
@@ -546,7 +544,6 @@ def run_prepared_dataset_inference(
         "comparison_df": comparison_df,
         "results_csv": results_csv,
         "summary_csv": summary_csv,
-        "comparison_csv": comparison_csv,
         "plot_output_dir": plot_output_dir,
     }
 
