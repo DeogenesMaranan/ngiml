@@ -3,8 +3,10 @@
 import io
 import json
 import logging
+import os
 import re
 import tarfile
+import warnings
 from collections import Counter
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -40,6 +42,36 @@ from src.checkpoint_utils import (
 from src.model_config_utils import coerce_model_config
 from src.model.hybrid_ngiml import HybridNGIML
 from src.training_defaults import build_default_components
+
+
+_HF_UNAUTH_WARN_TEXT = "unauthenticated requests to the HF Hub"
+
+
+def _snapshot_download_dataset(repo_id: str, local_dir: Path) -> Path:
+    """Download a dataset snapshot while keeping HF deprecation/auth warning noise out of logs."""
+    token = (os.getenv("HF_TOKEN") or "").strip() or None
+
+    hf_http_logger = logging.getLogger("huggingface_hub.utils._http")
+
+    class _SkipHfUnauthenticatedWarning(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return _HF_UNAUTH_WARN_TEXT not in record.getMessage().lower()
+
+    suppress_filter = _SkipHfUnauthenticatedWarning()
+    hf_http_logger.addFilter(suppress_filter)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=r".*unauthenticated requests to the HF Hub.*")
+            return Path(
+                snapshot_download(
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    local_dir=str(local_dir),
+                    token=token,
+                )
+            )
+    finally:
+        hf_http_logger.removeFilter(suppress_filter)
 
 
 def _require_matplotlib() -> None:
@@ -407,15 +439,7 @@ def run_prepared_dataset_inference(
     )
     resolved_threshold = float(ckpt_info.get("default_threshold", 0.5) if threshold_for_metrics is None else threshold_for_metrics)
 
-    snapshot_path = Path(
-        snapshot_download(
-            repo_id=hf_dataset_repo_id,
-            repo_type="dataset",
-            local_dir=str(hf_snapshot_local_dir),
-            token=False,
-            local_dir_use_symlinks=False,
-        )
-    )
+    snapshot_path = _snapshot_download_dataset(hf_dataset_repo_id, hf_snapshot_local_dir)
     total_samples = count_prepared_samples(snapshot_path)
 
     rows: list[dict[str, object]] = []
