@@ -1,4 +1,7 @@
-\usetikzlibrary{arrows.meta,positioning,calc}
+% :contentReference[oaicite:0]{index=0}
+\documentclass[tikz,border=4pt]{standalone}
+
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
 
 \definecolor{LowLevelColor}{RGB}{85,125,220}
 \definecolor{ContextColor}{RGB}{66,170,120}
@@ -13,8 +16,8 @@
         rounded corners=3pt,
         line width=0.9pt,
         align=center,
-        minimum width=2.6cm,
-        minimum height=1.05cm,
+        minimum width=2.15cm,
+        minimum height=0.82cm,
         font=\sffamily\footnotesize,
         fill=#1!20
     },
@@ -23,8 +26,8 @@
         rounded corners=3pt,
         line width=0.8pt,
         align=center,
-        minimum width=2.7cm,
-        minimum height=1.0cm,
+        minimum width=2.15cm,
+        minimum height=0.78cm,
         font=\sffamily\scriptsize,
         fill=#1!18
     },
@@ -33,161 +36,191 @@
         rounded corners=3pt,
         line width=0.8pt,
         align=center,
-        minimum width=2.5cm,
-        minimum height=0.95cm,
+        minimum width=2.1cm,
+        minimum height=0.75cm,
         font=\sffamily\scriptsize,
         fill=#1!14
     },
     flow/.style={
-        -{Latex[length=3.5mm,width=2.2mm]},
-        line width=1.1pt
+        -{Latex[length=3.2mm,width=2mm]},
+        line width=1pt
     },
     flow2/.style={
-        -{Latex[length=3mm,width=2mm]},
-        line width=0.9pt,
-        opacity=0.9
+        -{Latex[length=2.8mm,width=1.9mm]},
+        line width=0.85pt,
+        opacity=0.92
     },
     skipflow/.style={
-        -{Latex[length=2.6mm,width=1.8mm]},
-        line width=0.8pt,
+        -{Latex[length=2.4mm,width=1.6mm]},
+        line width=0.75pt,
         dashed,
-        opacity=0.8
-    }
+        opacity=0.85
+    },
+    groupEff/.style={
+        draw=LowLevelColor!80!black,
+        rounded corners=5pt,
+        thick,
+        dashed,
+        inner sep=6pt,
+        label={[font=\sffamily\small\bfseries]north:EfficientNet Branch}
+    },
+    groupSwin/.style={
+        draw=ContextColor!80!black,
+        rounded corners=5pt,
+        thick,
+        dashed,
+        inner sep=6pt,
+        label={[font=\sffamily\small\bfseries]north:Swin Transformer Branch}
+    },
+    groupRes/.style={
+        draw=ResidualColor!80!black,
+        rounded corners=5pt,
+        thick,
+        dashed,
+        inner sep=6pt,
+        label={[font=\sffamily\small\bfseries]north:Residual Branch}
+    },groupFusion/.style={
+        label={[font=\sffamily\small\bfseries]south:Feature Fusion}
+    },
+    groupDecoder/.style={
+        label={[font=\sffamily\small\bfseries]south:UNet-style Decoder}
+    },
 }
 
-\begin{tikzpicture}[x=1cm,y=1.05cm]
+\begin{document}
+\begin{tikzpicture}[x=0.9cm,y=0.9cm]
 
-% --------------------------------------------------
+% Coordinates (tighter spacing)
+\def\yCone{0.6}
+\def\yAone{0}
+\def\yRone{-0.6}
+
+\def\yCtwo{-1.2}
+\def\yAtwo{-1.8}
+\def\yRtwo{-2.4}
+
+\def\yCthree{-3.0}
+\def\yAthree{-3.6}
+\def\yRthree{-4.2}
+
+\def\yCfour{-4.8}
+\def\yAfour{-5.4}
+\def\yRfour{-6.0}
+
 % Inputs
-% --------------------------------------------------
-\node[nnbox=gray, minimum width=2.3cm] (input) at (-1.0,0.0) {Input RGB\\image};
-\node[nnbox=gray, minimum width=2.3cm] (hp)    at (0.0,-2.3) {Residual-noise};
+\node[nnbox=gray, minimum width=2.0cm] (input) at (7.8,3.7) {Input RGB\\image};
+\node[nnbox=gray, minimum width=2.0cm] (hp)    at (4.5,3) {Residual-noise};
 
-% --------------------------------------------------
-% Backbones / early processing
-% moved closer to their downstream stacks
-% --------------------------------------------------
-\node[nnbox=LowLevelColor, minimum width=3.2cm] (eff)    at (3.2,1.8)  {EfficientNet-B0\\low-level backbone};
-\node[nnbox=ContextColor,  minimum width=3.2cm] (swin)   at (3.2,-0.2) {Swin-Tiny\\context backbone};
-\node[nnbox=ResidualColor, minimum width=3.2cm] (srm)    at (3.2,-2.3) {SRM filters on $x$\\and $hp$};
-\node[nnbox=ResidualColor, minimum width=3.2cm] (rescnn) at (5,-5) {Residual CNN\\32, 64, 128, 256};
+% Preprocessing
+\node[nnbox=ResidualColor, minimum width=2.55cm] (srm)  at (4.5,1.6) {SRM filters on $x$\\and $hp$};
+\node[opbox=RefineColor, minimum width=2.0cm] (edge) at (11.8,3) {Sobel edge\\guidance};
 
-% Attention
-\node[opbox=RefineColor, minimum width=3.2cm] (attn) at (5,5) {Residual-guided attention\\on low-level features};
+% Low-level
+\node[stagebox=LowLevelColor] (a1) at (7.8,\yAone) {$A_1$\\attended low-level};
+\node[stagebox=LowLevelColor] (a2) at (7.8,\yAtwo) {$A_2$\\attended low-level};
+\node[stagebox=LowLevelColor] (a3) at (7.8,\yAthree) {$A_3$\\attended low-level};
+\node[stagebox=LowLevelColor] (a4) at (7.8,\yAfour) {$A_4$\\attended low-level};
 
-% --------------------------------------------------
-% Stage stacks
-% tighter vertical packing, no overlaps
-% --------------------------------------------------
-% Low-level attended stages
-\node[stagebox=LowLevelColor, minimum width=2.8cm] (a1) at (9,6.8) {$A_1$\\attended low-level\\64 ch};
-\node[stagebox=LowLevelColor, minimum width=2.8cm] (a2) at (9,5.6) {$A_2$\\attended low-level\\128 ch};
-\node[stagebox=LowLevelColor, minimum width=2.8cm] (a3) at (9,4.4) {$A_3$\\attended low-level\\192 ch};
-\node[stagebox=LowLevelColor, minimum width=2.8cm] (a4) at (9,3.2) {$A_4$\\attended low-level\\256 ch};
+% Context
+\node[stagebox=ContextColor] (c1) at (11.1,\yCone) {$C_1$\\context};
+\node[stagebox=ContextColor] (c2) at (11.1,\yCtwo) {$C_2$\\context};
+\node[stagebox=ContextColor] (c3) at (11.1,\yCthree) {$C_3$\\context};
+\node[stagebox=ContextColor] (c4) at (11.1,\yCfour) {$C_4$\\context};
 
-% Context stages
-\node[stagebox=ContextColor, minimum width=2.8cm] (c1) at (8,1.8) {$C_1$\\context stage};
-\node[stagebox=ContextColor, minimum width=2.8cm] (c2) at (8,0.6) {$C_2$\\context stage};
-\node[stagebox=ContextColor, minimum width=2.8cm] (c3) at (8,-0.6) {$C_3$\\context stage};
-\node[stagebox=ContextColor, minimum width=2.8cm] (c4) at (8,-1.8) {$C_4$\\context stage};
+% Residual
+\node[stagebox=ResidualColor] (r1) at (4.5,\yRone) {$R_1$\\residual};
+\node[stagebox=ResidualColor] (r2) at (4.5,\yRtwo) {$R_2$\\residual};
+\node[stagebox=ResidualColor] (r3) at (4.5,\yRthree) {$R_3$\\residual};
+\node[stagebox=ResidualColor] (r4) at (4.5,\yRfour) {$R_4$\\residual};
 
-% Residual stages
-\node[stagebox=ResidualColor, minimum width=2.8cm] (r1) at (9,-3.2) {$R_1$\\residual stage};
-\node[stagebox=ResidualColor, minimum width=2.8cm] (r2) at (9,-4.4) {$R_2$\\residual stage};
-\node[stagebox=ResidualColor, minimum width=2.8cm] (r3) at (9,-5.6) {$R_3$\\residual stage};
-\node[stagebox=ResidualColor, minimum width=2.8cm] (r4) at (9,-6.8) {$R_4$\\residual stage};
+% Fusion
+\node[stagebox=FusionColor] (f1) at (14.2,\yAone) {$F_1$\\adaptive fusion};
+\node[stagebox=FusionColor] (f2) at (14.2,\yAtwo) {$F_2$\\adaptive fusion};
+\node[stagebox=FusionColor] (f3) at (14.2,\yAthree) {$F_3$\\adaptive fusion};
+\node[stagebox=FusionColor] (f4) at (14.2,\yAfour) {$F_4$\\adaptive fusion};
 
-% --------------------------------------------------
-% Fusion centered vertically relative to stage region
-% Stage region center is about y = -2.9
-% --------------------------------------------------
-\node[stagebox=FusionColor, minimum width=2.35cm] (f1) at (15.5,3) {$F_1$\\adaptive fusion\\64 ch};
-\node[stagebox=FusionColor, minimum width=2.35cm] (f2) at (15.5,1) {$F_2$\\adaptive fusion\\128 ch};
-\node[stagebox=FusionColor, minimum width=2.35cm] (f3) at (15.5,-1) {$F_3$\\adaptive fusion\\192 ch};
-\node[stagebox=FusionColor, minimum width=2.35cm] (f4) at (15.5,-3) {$F_4$\\adaptive fusion\\256 ch};
+% Decoder
+\node[stagebox=DecoderColor, minimum width=2.45cm] (d1) at (17.5,\yAone)
+{Decode $D_1$\\upsample + concat $F_1$};
+\node[stagebox=DecoderColor, minimum width=2.45cm] (d2) at (17.5,\yAtwo)
+{Decode $D_2$\\upsample + concat $F_2$};
+\node[stagebox=DecoderColor, minimum width=2.45cm] (d3) at (17.5,\yAthree)
+{Decode $D_3$\\upsample + concat $F_3$};
+\node[stagebox=DecoderColor, minimum width=2.45cm] (d4) at (17.5,\yAfour)
+{Bottleneck};
 
-% Edge guidance
-\node[opbox=RefineColor, minimum width=2.5cm] (edge) at (15.5,5) {Sobel edge\\guidance};
-
-% --------------------------------------------------
-% Decoder + heads aligned around fusion center
-% --------------------------------------------------
-\node[stagebox=DecoderColor, minimum width=2.4cm] (d4) at (19,-3) {Bottleneck\\256 ch};
-\node[stagebox=DecoderColor, minimum width=2.4cm] (d3) at (19,-1) {Decode $D_3$\\192 ch};
-\node[stagebox=DecoderColor, minimum width=2.4cm] (d2) at (19,1) {Decode $D_2$\\128 ch};
-\node[stagebox=DecoderColor, minimum width=2.4cm] (d1) at (19,3) {Decode $D_1$\\64 ch};
-
-\node[opbox=DecoderColor, minimum width=2.3cm] (h4) at (22.5,-3) {$H_4$\\aux head H4};
-\node[opbox=DecoderColor, minimum width=2.3cm] (h3) at (22.5,-1) {$H_3$\\aux head H3};
-\node[opbox=DecoderColor, minimum width=2.3cm] (h2) at (22.5,1) {$H_2$\\aux head H2};
-\node[opbox=DecoderColor, minimum width=2.3cm] (h1) at (22.5,3) {$H_1$\\main logits};
+% Heads
+\node[opbox=DecoderColor, minimum width=1.95cm] (h1) at (20.8,\yAone) {$H_1$\\main logits};
+\node[opbox=DecoderColor, minimum width=1.95cm] (h2) at (20.8,\yAtwo) {$H_2$\\aux head};
+\node[opbox=DecoderColor, minimum width=1.95cm] (h3) at (20.8,\yAthree) {$H_3$\\aux head};
+\node[opbox=DecoderColor, minimum width=1.95cm] (h4) at (20.8,\yAfour) {$H_4$\\aux head};
 
 % Refinement / output
-\node[opbox=RefineColor, minimum width=3.0cm] (detail)   at (26.3,3.0) {Detail refinement\\$D_1 + F_1 + H_2$};
-\node[opbox=RefineColor, minimum width=3.4cm] (boundary) at (26.3,1) {Boundary refinement\\logits + Sobel(sigmoid)};
-\node[nnbox=gray, minimum width=2.3cm] (mask) at (26.3,-3) {Final mask\\prediction};
+\node[opbox=RefineColor, minimum width=3.0cm] (detail) at (24.2,\yAone)
+{Detail refinement\\$H_1 + D_1 + F_1 + H_2$};
+\node[opbox=RefineColor, minimum width=3.25cm] (boundary) at (24.2,\yAtwo)
+{Boundary refinement\\logits + Sobel(sigmoid(logits))};
+\node[opbox=RefineColor, minimum width=1.8cm] (sigm) at (24.2,\yAthree)
+{Sigmoid};
+\node[nnbox=gray, minimum width=2.1cm] (mask) at (24.2,\yAfour)
+{Final probability\\map};
 
-% --------------------------------------------------
-% Connections
-% --------------------------------------------------
+% Groups
+\begin{scope}[on background layer]
+\node[groupEff, fit=(a1) (a2) (a3) (a4)] (effgroup) {};
+\node[groupSwin, fit=(c1) (c2) (c3) (c4)] (swingroup) {};
+\node[groupRes, fit=(r1) (r2) (r3) (r4)] (resgroup) {};
+\node[groupFusion, fit=(f1) (f2) (f3) (f4)] (fusiongroup) {};
+\node[groupDecoder, fit=(d1) (d2) (d3) (d4) (h1) (h2) (h3) (h4)] (decgroup) {};
+\end{scope}
 
-% Inputs
-\draw[flow] (input) -- (eff);
-\draw[flow] (input) -- (swin);
-\draw[flow] (input) -- (srm);
-\draw[flow] (input) -- (hp);
+% Input / preprocessing
+\draw[flow, shorten >=10pt] (input) to[out=-90,in=90] (effgroup);
+\draw[flow, shorten >=10pt] (input) to[out=-90,in=90] (swingroup);
+
+\draw[flow] (input) to[out=-90,in=0] (srm);
+
 \draw[flow] (hp) -- (srm);
-\draw[flow] (srm) -- (rescnn);
+\draw[flow, shorten >=10pt] (srm) to[out=-90,in=90] (resgroup);
 
-% Attention
-\draw[flow] (eff) -- (attn);
-\draw[flow] (rescnn) to[out=75,in=-75] (attn);
+\draw[flow] (input) to[out=-90,in=180] (edge);
 
-% Attention to A stages
-\draw[flow] (attn) to[out=15,in=180] (a1);
-\draw[flow] (attn) to[out=5,in=180] (a2);
-\draw[flow] (attn) to[out=-5,in=180] (a3);
-\draw[flow] (attn) to[out=-15,in=180] (a4);
-
-% Swin to C stages
-\draw[flow2] (swin) to[out=15,in=180] (c1);
-\draw[flow2] (swin) to[out=5,in=180] (c2);
-\draw[flow2] (swin) to[out=-5,in=180] (c3);
-\draw[flow2] (swin) to[out=-15,in=180] (c4);
-
-% ResCNN to R stages
-\draw[flow2] (rescnn) to[out=15,in=180] (r1);
-\draw[flow2] (rescnn) to[out=5,in=180] (r2);
-\draw[flow2] (rescnn) to[out=-5,in=180] (r3);
-\draw[flow2] (rescnn) to[out=-15,in=180] (r4);
+% Residual-guided attention on low-level branch
+\draw[skipflow] (r1) to[out=22.5,in=180] (a1);
+\draw[skipflow] (r2) to[out=22.5,in=180] (a2);
+\draw[skipflow] (r3) to[out=22.5,in=180] (a3);
+\draw[skipflow] (r4) to[out=22.5,in=180] (a4);
 
 % Fusion inputs
-\draw[flow]  (a1) to[out=0,in=145] (f1);
-\draw[flow2] (c1) to[out=0,in=180] (f1);
-\draw[flow2] (r1) to[out=0,in=220] (f1);
+\draw[flow2] (a1) -- (f1);
+\draw[flow2] (c1) -- (f1);
+\draw[flow2] (r1) to[out=0,in=191.25] (f1);
 
-\draw[flow]  (a2) to[out=0,in=145] (f2);
-\draw[flow2] (c2) to[out=0,in=180] (f2);
-\draw[flow2] (r2) to[out=0,in=220] (f2);
+\draw[flow2] (a2) -- (f2);
+\draw[flow2] (c2) -- (f2);
+\draw[flow2] (r2) to[out=0,in=191.25] (f2);
 
-\draw[flow]  (a3) to[out=0,in=145] (f3);
-\draw[flow2] (c3) to[out=0,in=180] (f3);
-\draw[flow2] (r3) to[out=0,in=220] (f3);
+\draw[flow2] (a3) -- (f3);
+\draw[flow2] (c3) -- (f3);
+\draw[flow2] (r3) to[out=0,in=191.25] (f3);
 
-\draw[flow]  (a4) to[out=0,in=145] (f4);
-\draw[flow2] (c4) to[out=0,in=180] (f4);
-\draw[flow2] (r4) to[out=0,in=220] (f4);
+\draw[flow2] (a4) -- (f4);
+\draw[flow2] (c4) -- (f4);
+\draw[flow2] (r4) to[out=0,in=191.25] (f4);
 
-% Fusion to decoder
+% Edge guidance to finest skip path
+\draw[flow2] (edge) to[out=0,in=90] (f1);
+
+% Decoder
 \draw[flow] (f4) -- (d4);
-\draw[flow] (f3) -- (d3);
-\draw[flow] (f2) -- (d2);
-\draw[flow] (f1) -- (d1);
+\draw[flow] (d4) -- (d3);
+\draw[flow] (d3) -- (d2);
+\draw[flow] (d2) -- (d1);
 
-% Decoder chain
-\draw[flow] (d4) to[out=90,in=-90] (d3);
-\draw[flow] (d3) to[out=90,in=-90] (d2);
-\draw[flow] (d2) to[out=90,in=-90] (d1);
+% Decoder skip connections
+\draw[skipflow] (f3) -- (d3);
+\draw[skipflow] (f2) -- (d2);
+\draw[skipflow] (f1) -- (d1);
 
 % Heads
 \draw[flow] (d4) -- (h4);
@@ -195,26 +228,15 @@
 \draw[flow] (d2) -- (h2);
 \draw[flow] (d1) -- (h1);
 
-% Edge guidance
-\draw[flow2] (edge) to[out=-90,in=90] (d1);
-
-% Skip connections
-\draw[skipflow] (f3) to[out=0,in=180] (d3);
-\draw[skipflow] (f2) to[out=0,in=180] (d2);
-\draw[skipflow] (f1) to[out=0,in=180] (d1);
-
-% Final refinement
+% Refinement
 \draw[flow]     (h1) -- (detail);
-\draw[skipflow] (d1) to[out=22.5,in=157.5] (detail);
-\draw[skipflow] (f1) to[out=45,in=135] (detail);
-\draw[skipflow] (h2) to[out=90,in=-155] (detail);
+\draw[skipflow] (d1) to[out=15,in=165] (detail);
+\draw[skipflow] (f1) to[out=28,in=145] (detail);
+\draw[skipflow] (h2) to[out=65,in=-155] (detail);
 
 \draw[flow] (detail) -- (boundary);
-\draw[flow] (boundary) -- (mask);
-
-% Fusion note
-\node[align=center, font=\sffamily\scriptsize, anchor=west] at (12.65,-8)
-{Fusion stage: 1$\times$1 project $\rightarrow$ bilinear align $\rightarrow$ per-branch sigmoid gates\\
-$\rightarrow$ weighted average $\rightarrow$ 3$\times$3 refine $\rightarrow$ optional extra 3$\times$3 refine};
+\draw[flow] (boundary) -- (sigm);
+\draw[flow] (sigm) -- (mask);
 
 \end{tikzpicture}
+\end{document}

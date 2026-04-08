@@ -1,0 +1,87 @@
+\documentclass[tikz,border=10pt]{standalone}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+
+% Define a single spacing variable
+\newcommand{\gap}{10pt}
+
+\begin{document}
+
+\begin{tikzpicture}[
+  font=\sffamily,
+  >=Stealth,
+  % Define the style for the background containers
+  container/.style={
+    draw,
+    rounded corners=8pt,
+    thick,
+    minimum width=6cm,
+    minimum height=12cm
+  },
+  % Define the style for the header titles
+  title/.style={
+    font=\bfseries\Large,
+    align=center,
+    node distance=6mm
+  },
+  % Define the style for the list items
+  item/.style={
+    text width=5.2cm,
+    align=left,
+    anchor=center,
+    inner sep=0pt
+  },
+  flow/.style={
+    -{Stealth[length=3mm,width=2mm]},
+    line width=1.2pt
+  }
+]
+
+  % --- INPUT COLUMN ---
+  \node[container] (inputBox) {};
+  \node[title, above=of inputBox] {INPUT};
+  
+  \node[item] at (inputBox.center) {
+    $\bullet$ \textbf{Training Dataset:} CASIA2\\[\gap]
+    $\bullet$ \textbf{Testing Datasets:} CASIA1, COVERAGE, Columbia (colored)\\[\gap]
+    $\bullet$ RGB images \\[\gap]
+    $\bullet$ Ground-truth binary masks \\[\gap]
+    $\bullet$ Pretrained backbones: EfficientNet-B0 and Swin-Tiny \\[\gap]
+    $\bullet$ Training parameters and\\augmentation settings
+  };
+
+  % --- PROCESS COLUMN ---
+  \node[container, right=8mm of inputBox] (processBox) {};
+  \node[title, above=of processBox] {PROCESS};
+
+  \node[item] at (processBox.center) {
+    $\bullet$ Dataset preparation/\\preprocessing \\[\gap]
+    $\bullet$ Image resizing and normalization \\[\gap]
+    $\bullet$ Residual-noise extraction \\[\gap]
+    $\bullet$ EfficientNet-B0 local features \\[\gap]
+    $\bullet$ Swin-Tiny global context \\[\gap]
+    $\bullet$ Residual-noise branch \\[\gap]
+    $\bullet$ Multi-stage adaptive fusion \\[\gap]
+    $\bullet$ U-Net-style decoding \\[\gap]
+    $\bullet$ Edge/boundary refinement \\[\gap]
+    $\bullet$ Training and checkpointing
+  };
+
+  % --- OUTPUT COLUMN ---
+  \node[container, right=8mm of processBox] (outputBox) {};
+  \node[title, above=of outputBox] {OUTPUT};
+
+  \node[item] at (outputBox.center) {
+    $\bullet$ Pixel-level forgery masks \\[\gap]
+    $\bullet$ Evaluation metrics: IoU, F1\\Score, Precision and Recall \\[\gap]
+    $\bullet$ Efficiency: Params and GFLOPS \\[\gap]
+    $\bullet$ Results for comparison and\\ablation analysis
+  };
+
+  % --- CONNECTORS ---
+  \draw[flow] (inputBox.east) -- (processBox.west);
+  \draw[flow] (processBox.east) -- (outputBox.west);
+
+\end{tikzpicture}
+
+\end{document}
