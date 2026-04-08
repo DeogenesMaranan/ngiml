@@ -26,6 +26,57 @@ class _ConvBlock(nn.Module):
         return self.block(x)
 
 
+class _MBConvBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        norm: str,
+        activation: str,
+        expand_ratio: int = 4,
+        use_residual: bool = True,
+    ) -> None:
+        super().__init__()
+        hidden_channels = max(in_channels, int(in_channels * max(1, int(expand_ratio))))
+        layers: list[nn.Module] = []
+
+        if hidden_channels != in_channels:
+            layers.extend(
+                [
+                    nn.Conv2d(in_channels, hidden_channels, kernel_size=1, bias=False),
+                    build_norm(norm, hidden_channels),
+                    build_activation(activation),
+                ]
+            )
+
+        layers.extend(
+            [
+                nn.Conv2d(
+                    hidden_channels,
+                    hidden_channels,
+                    kernel_size=3,
+                    padding=1,
+                    groups=hidden_channels,
+                    bias=False,
+                ),
+                build_norm(norm, hidden_channels),
+                build_activation(activation),
+                nn.Conv2d(hidden_channels, out_channels, kernel_size=1, bias=False),
+                build_norm(norm, out_channels),
+            ]
+        )
+
+        self.block = nn.Sequential(*layers)
+        self.use_residual = bool(use_residual and in_channels == out_channels)
+        self.out_activation = build_activation(activation)
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = self.block(x)
+        if self.use_residual:
+            out = out + x
+        return self.out_activation(out)
+
+
 @dataclass
 class UNetDecoderConfig:
     """Configuration for UNetDecoder."""
@@ -44,6 +95,9 @@ class UNetDecoderConfig:
     enable_detail_refinement: bool = True
     detail_refine_channels: int = 16
     detail_refine_scale: float = 1.0
+    decoder_block_type: str = "conv"
+    mbconv_expand_ratio: int = 4
+    mbconv_use_residual: bool = True
 
 
 class UNetDecoder(nn.Module):
@@ -59,6 +113,9 @@ class UNetDecoder(nn.Module):
         if not stage_channels:
             raise ValueError("stage_channels must contain at least one entry")
         self.stage_channels = tuple(stage_channels)
+        self.decoder_block_type = str(getattr(self.cfg, "decoder_block_type", "conv")).strip().lower()
+        if self.decoder_block_type not in {"conv", "mbconv"}:
+            raise ValueError(f"Unsupported decoder block type: {self.decoder_block_type}")
 
         if self.cfg.decoder_channels is None:
             decoder_channels = self.stage_channels
@@ -91,20 +148,16 @@ class UNetDecoder(nn.Module):
             ]
         )
 
-        self.bottleneck = _ConvBlock(
+        self.bottleneck = self._make_decoder_block(
             self.decoder_channels[-1],
             self.decoder_channels[-1],
-            self.cfg.norm,
-            self.cfg.activation,
         )
 
         self.decode_blocks = nn.ModuleList(
             [
-                _ConvBlock(
+                self._make_decoder_block(
                     self.decoder_channels[idx] + self.decoder_channels[idx + 1],
                     self.decoder_channels[idx],
-                    self.cfg.norm,
-                    self.cfg.activation,
                 )
                 for idx in range(len(self.stage_channels) - 1)
             ]
@@ -149,6 +202,23 @@ class UNetDecoder(nn.Module):
             sobel_y = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3)
             self.register_buffer("boundary_sobel_x", sobel_x)
             self.register_buffer("boundary_sobel_y", sobel_y)
+
+    def _make_decoder_block(self, in_channels: int, out_channels: int) -> nn.Module:
+        if self.decoder_block_type == "conv":
+            return _ConvBlock(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                norm=self.cfg.norm,
+                activation=self.cfg.activation,
+            )
+        return _MBConvBlock(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            norm=self.cfg.norm,
+            activation=self.cfg.activation,
+            expand_ratio=int(getattr(self.cfg, "mbconv_expand_ratio", 4)),
+            use_residual=bool(getattr(self.cfg, "mbconv_use_residual", True)),
+        )
 
     def _refine_final_logits(self, logits: Tensor) -> Tensor:
         if not self.enable_boundary_refinement:

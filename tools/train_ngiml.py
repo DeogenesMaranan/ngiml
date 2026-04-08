@@ -583,8 +583,20 @@ def run_training(cfg: TrainConfig) -> None:
         from dataclasses import replace as _dc_replace
 
         model_cfg = _dc_replace(model_cfg, gradient_checkpointing=cfg.gradient_checkpointing)
+        model_cfg = _dc_replace(
+            model_cfg,
+            decoder=_dc_replace(
+                model_cfg.decoder,
+                decoder_block_type=str(cfg.decoder_block_type).strip().lower(),
+                mbconv_expand_ratio=max(1, int(cfg.mbconv_expand_ratio)),
+                mbconv_use_residual=bool(cfg.mbconv_use_residual),
+            ),
+        )
     except Exception:
         model_cfg.gradient_checkpointing = cfg.gradient_checkpointing
+        model_cfg.decoder.decoder_block_type = str(cfg.decoder_block_type).strip().lower()
+        model_cfg.decoder.mbconv_expand_ratio = max(1, int(cfg.mbconv_expand_ratio))
+        model_cfg.decoder.mbconv_use_residual = bool(cfg.mbconv_use_residual)
 
     model = HybridNGIML(model_cfg).to(device)
     if cfg.channels_last and device.type == "cuda":

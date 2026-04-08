@@ -175,6 +175,25 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--hard-mining-start-epoch", type=int, default=5, help="Epoch to start hard-example weighting")
     parser.add_argument("--hard-mining-weight", type=float, default=0.03, help="Weight of hard-example auxiliary loss")
     parser.add_argument("--hard-mining-gamma", type=float, default=2.0, help="Scale for low-IoU hard-example weights")
+    parser.add_argument(
+        "--decoder-block-type",
+        type=str,
+        default="conv",
+        choices=["conv", "mbconv"],
+        help="UNet decoder block family used in bottleneck and upsampling decode blocks",
+    )
+    parser.add_argument(
+        "--mbconv-expand-ratio",
+        type=int,
+        default=4,
+        help="Expansion ratio used when --decoder-block-type=mbconv",
+    )
+    parser.add_argument(
+        "--mbconv-use-residual",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable residual shortcut inside MBConv blocks when shapes match",
+    )
     args = parser.parse_args()
     resolved_resize_max_side = max(64, int(args.resize_max_side))
 
@@ -256,6 +275,9 @@ def parse_args() -> TrainConfig:
         hard_mining_start_epoch=args.hard_mining_start_epoch,
         hard_mining_weight=args.hard_mining_weight,
         hard_mining_gamma=args.hard_mining_gamma,
+        decoder_block_type=args.decoder_block_type,
+        mbconv_expand_ratio=max(1, int(args.mbconv_expand_ratio)),
+        mbconv_use_residual=args.mbconv_use_residual,
         scheduler_type=args.scheduler_type,
         precision=args.precision,
         gradient_checkpointing=args.gradient_checkpointing,

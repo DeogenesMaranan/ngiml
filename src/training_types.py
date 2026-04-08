@@ -91,6 +91,9 @@ class TrainConfig:
     hard_mining_start_epoch: int = 5
     hard_mining_weight: float = 0.03
     hard_mining_gamma: float = 2.0
+    decoder_block_type: str = "conv"
+    mbconv_expand_ratio: int = 4
+    mbconv_use_residual: bool = True
     default_aug: Optional[AugmentationConfig] = None
     per_dataset_aug: Optional[Dict[str, AugmentationConfig]] = None
     model_config: Optional[HybridNGIMLConfig] = None
