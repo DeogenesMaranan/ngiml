@@ -7,6 +7,7 @@ import math
 import re
 import shutil
 import tarfile
+import csv
 from dataclasses import replace
 from pathlib import Path
 from typing import Dict, Optional, Sequence
@@ -981,8 +982,8 @@ def _get_model_complexity_stats_for_report(
     return stats
 
 
-def report_checkpoint_complexity(checkpoint_dir: Path | str) -> dict[str, object]:
-    """Load a checkpointed model and print model complexity stats for notebook workflows."""
+def report_checkpoint_complexity(checkpoint_dir: Path | str, output_csv: Path | str | None = None) -> dict[str, object]:
+    """Load a checkpointed model, print complexity stats, and optionally save a one-row CSV."""
     checkpoint_dir = Path(checkpoint_dir)
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
@@ -1005,10 +1006,24 @@ def report_checkpoint_complexity(checkpoint_dir: Path | str) -> dict[str, object
     print("MACs:", _human_compact(macs))
     print("Approx FLOPs (2 * MACs):", _human_compact(flops))
 
-    return {
-        "checkpoint_path": str(ckpt_path)
+    result = {
+        "checkpoint_path": str(ckpt_path),
         **stats,
     }
+
+    output_csv_path = Path(output_csv) if output_csv is not None else ckpt_path.parent / "checkpoint_complexity.csv"
+    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_row = {
+        key: (json.dumps(value) if isinstance(value, (dict, list, tuple)) else value)
+        for key, value in result.items()
+    }
+    with output_csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(csv_row.keys()))
+        writer.writeheader()
+        writer.writerow(csv_row)
+    print("Saved complexity CSV to", output_csv_path)
+
+    return result
 
 __all__ = [
     "PrefetchLoader",
