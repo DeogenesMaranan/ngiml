@@ -827,27 +827,6 @@ def _print_resolved_config_summary(cfg: TrainConfig, normalization_mode: str) ->
         f"threshold_mode={threshold_mode}"
     )
 
-
-def _resolve_checkpoint_path(checkpoint_dir: Path, target_epoch: int | None) -> Path:
-    if target_epoch is None:
-        best_ckpt = checkpoint_dir / "best_checkpoint.pt"
-        if not best_ckpt.exists():
-            raise FileNotFoundError("best_checkpoint.pt not found.")
-        return best_ckpt
-
-    target_ckpt = checkpoint_dir / f"checkpoint_epoch_{int(target_epoch):03d}.pt"
-    if target_ckpt.exists():
-        return target_ckpt
-
-    candidates = sorted(
-        checkpoint_dir.glob(f"checkpoint_epoch_{int(target_epoch)}*.pt"),
-        key=lambda p: p.stat().st_mtime,
-    )
-    if not candidates:
-        raise FileNotFoundError(f"No checkpoint found for epoch {target_epoch}.")
-    return candidates[-1]
-
-
 def _human_compact(value: float | int | None) -> str:
     if value is None:
         return "N/A"
@@ -1002,13 +981,13 @@ def _get_model_complexity_stats_for_report(
     return stats
 
 
-def report_checkpoint_complexity(checkpoint_dir: Path | str, target_epoch: int | None = None) -> dict[str, object]:
+def report_checkpoint_complexity(checkpoint_dir: Path | str) -> dict[str, object]:
     """Load a checkpointed model and print model complexity stats for notebook workflows."""
     checkpoint_dir = Path(checkpoint_dir)
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
 
-    ckpt_path = _resolve_checkpoint_path(checkpoint_dir, target_epoch)
+    ckpt_path = checkpoint_dir
 
     model, ckpt_info = _load_model_from_checkpoint_for_report(ckpt_path)
     input_size = int(ckpt_info.get("input_size", 448))
@@ -1020,7 +999,6 @@ def report_checkpoint_complexity(checkpoint_dir: Path | str, target_epoch: int |
     flops = stats.get("flops")
 
     print("Checkpoint:", ckpt_path)
-    print("Target epoch:", target_epoch)
     print("Input shape:", tuple(stats.get("input_size", (1, 3, input_size, input_size))))
     print("Trainable params:", f"{trainable_params:,}")
     print("Total params:", f"{total_params:,}")
@@ -1028,8 +1006,7 @@ def report_checkpoint_complexity(checkpoint_dir: Path | str, target_epoch: int |
     print("Approx FLOPs (2 * MACs):", _human_compact(flops))
 
     return {
-        "checkpoint_path": str(ckpt_path),
-        "target_epoch": target_epoch,
+        "checkpoint_path": str(ckpt_path)
         **stats,
     }
 
