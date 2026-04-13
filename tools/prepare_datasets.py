@@ -39,11 +39,17 @@ from src.prepare_shared import (
 )
 
 
+def _clean_optional_token(text: str | None) -> str:
+    if text is None:
+        return ""
+    return text.lower().strip()
+
+
 def _build_grouping_rules(cfg: DatasetStructureConfig) -> tuple[set[str], tuple[str, ...]]:
     dir_tokens = {
-        cfg.real_subdir.lower().strip(),
-        cfg.fake_subdir.lower().strip(),
-        cfg.mask_subdir.lower().strip(),
+        _clean_optional_token(cfg.real_subdir),
+        _clean_optional_token(cfg.fake_subdir),
+        _clean_optional_token(cfg.mask_subdir),
     }
     dir_tokens = {token for token in dir_tokens if token}
 
@@ -241,13 +247,13 @@ def prepare_single_dataset(
     if not root.exists():
         raise FileNotFoundError(f"Dataset root missing: {root}")
 
-    real_dir = root / cfg.real_subdir
-    fake_dir = root / cfg.fake_subdir
-    mask_dir = root / cfg.mask_subdir
+    real_dir = (root / cfg.real_subdir) if cfg.real_subdir else None
+    fake_dir = (root / cfg.fake_subdir) if cfg.fake_subdir else None
+    mask_dir = (root / cfg.mask_subdir) if cfg.mask_subdir else None
 
-    real_images = discover_images(real_dir, IMAGE_EXTENSIONS) if real_dir.exists() else []
-    fake_images = discover_images(fake_dir, IMAGE_EXTENSIONS) if fake_dir.exists() else []
-    mask_index = build_mask_index(mask_dir, IMAGE_EXTENSIONS) if mask_dir.exists() else {}
+    real_images = discover_images(real_dir, IMAGE_EXTENSIONS) if real_dir is not None and real_dir.exists() else []
+    fake_images = discover_images(fake_dir, IMAGE_EXTENSIONS) if fake_dir is not None and fake_dir.exists() else []
+    mask_index = build_mask_index(mask_dir, IMAGE_EXTENSIONS) if mask_dir is not None and mask_dir.exists() else {}
     dir_tokens, stem_suffixes = _build_grouping_rules(cfg)
     target_sizes = sorted(prep_cfg.target_size_set())
     if len(target_sizes) != 1:
