@@ -392,7 +392,7 @@ def prepare_all(
 
 
 def build_default_configs() -> tuple[list[DatasetStructureConfig], dict[str, SplitConfig], PreparationConfig]:
-    shared_seed = 4
+    shared_seed = 42
     datasets = [
         # DatasetStructureConfig(
         #     dataset_root="./datasets",
