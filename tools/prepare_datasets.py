@@ -390,6 +390,15 @@ def build_default_configs() -> tuple[list[DatasetStructureConfig], dict[str, Spl
     datasets = [
         DatasetStructureConfig(
             dataset_root="./datasets",
+            dataset_name="CASIA1",
+            real_subdir="Au",
+            fake_subdir="Tp",
+            mask_subdir="Gt",
+            mask_suffix="_gt",
+            prepared_root="./prepared",
+        ),
+        DatasetStructureConfig(
+            dataset_root="./datasets",
             dataset_name="CASIA2",
             real_subdir="Au",
             fake_subdir="Tp",
@@ -400,7 +409,7 @@ def build_default_configs() -> tuple[list[DatasetStructureConfig], dict[str, Spl
         DatasetStructureConfig(
             dataset_root="./datasets",
             dataset_name="TampCOCO",
-            real_subdir="au",
+            real_subdir=None,
             fake_subdir="tp",
             mask_subdir="mask",
             mask_suffix="",
@@ -408,29 +417,30 @@ def build_default_configs() -> tuple[list[DatasetStructureConfig], dict[str, Spl
         ),
         DatasetStructureConfig(
             dataset_root="./datasets",
-            dataset_name="NIST",
-            real_subdir="au",
-            fake_subdir="tp",
-            mask_subdir="mask",
-            mask_suffix="",
-            prepared_root="./prepared",
-        ),
-        DatasetStructureConfig(
-            dataset_root="./datasets",
-            dataset_name="IMD2020",
-            real_subdir="au",
+            dataset_name="Columbia",
+            real_subdir=None,
             fake_subdir="fake",
             mask_subdir="mask",
-            mask_suffix="_mask",
+            mask_suffix="_edgemask",
             prepared_root="./prepared",
         ),
+        DatasetStructureConfig(
+            dataset_root="./datasets",
+            dataset_name="COVERAGE",
+            real_subdir="real",
+            fake_subdir="fake",
+            mask_subdir="mask",
+            mask_suffix="forged",
+            prepared_root="./prepared",
+        )
     ]
 
     per_dataset_splits = {
+        "CASIA1": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
         "CASIA2": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
         "TampCOCO": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
-        "NIST": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
-        "IMD2020": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
+        "Columbia": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
+        "COVERAGE": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
     }
 
     prep_cfg = PreparationConfig(
