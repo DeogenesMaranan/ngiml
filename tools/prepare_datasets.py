@@ -392,17 +392,17 @@ def prepare_all(
 
 
 def build_default_configs() -> tuple[list[DatasetStructureConfig], dict[str, SplitConfig], PreparationConfig]:
-    shared_seed = 42
+    shared_seed = 4
     datasets = [
-        DatasetStructureConfig(
-            dataset_root="./datasets",
-            dataset_name="CASIA1",
-            real_subdir="Au",
-            fake_subdir="Tp",
-            mask_subdir="Gt",
-            mask_suffix="_gt",
-            prepared_root="./prepared",
-        ),
+        # DatasetStructureConfig(
+        #     dataset_root="./datasets",
+        #     dataset_name="CASIA1",
+        #     real_subdir="Au",
+        #     fake_subdir="Tp",
+        #     mask_subdir="Gt",
+        #     mask_suffix="_gt",
+        #     prepared_root="./prepared",
+        # ),
         DatasetStructureConfig(
             dataset_root="./datasets",
             dataset_name="CASIA2",
@@ -412,41 +412,41 @@ def build_default_configs() -> tuple[list[DatasetStructureConfig], dict[str, Spl
             mask_suffix="_gt",
             prepared_root="./prepared",
         ),
-        DatasetStructureConfig(
-            dataset_root="./datasets",
-            dataset_name="TampCOCO",
-            real_subdir=None,
-            fake_subdir="tp",
-            mask_subdir="mask",
-            mask_suffix="",
-            prepared_root="./prepared",
-        ),
-        DatasetStructureConfig(
-            dataset_root="./datasets",
-            dataset_name="Columbia",
-            real_subdir=None,
-            fake_subdir="fake",
-            mask_subdir="mask",
-            mask_suffix="_edgemask",
-            prepared_root="./prepared",
-        ),
-        DatasetStructureConfig(
-            dataset_root="./datasets",
-            dataset_name="COVERAGE",
-            real_subdir="real",
-            fake_subdir="fake",
-            mask_subdir="mask",
-            mask_suffix="forged",
-            prepared_root="./prepared",
-        )
+        # DatasetStructureConfig(
+        #     dataset_root="./datasets",
+        #     dataset_name="TampCOCO",
+        #     real_subdir=None,
+        #     fake_subdir="tp",
+        #     mask_subdir="mask",
+        #     mask_suffix="",
+        #     prepared_root="./prepared",
+        # ),
+        # DatasetStructureConfig(
+        #     dataset_root="./datasets",
+        #     dataset_name="Columbia",
+        #     real_subdir=None,
+        #     fake_subdir="fake",
+        #     mask_subdir="mask",
+        #     mask_suffix="_edgemask",
+        #     prepared_root="./prepared",
+        # ),
+        # DatasetStructureConfig(
+        #     dataset_root="./datasets",
+        #     dataset_name="COVERAGE",
+        #     real_subdir="real",
+        #     fake_subdir="fake",
+        #     mask_subdir="mask",
+        #     mask_suffix="forged",
+        #     prepared_root="./prepared",
+        # )
     ]
 
     per_dataset_splits = {
-        "CASIA1": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
+        # "CASIA1": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
         "CASIA2": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
-        "TampCOCO": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
-        "Columbia": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
-        "COVERAGE": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
+        # "TampCOCO": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
+        # "Columbia": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
+        # "COVERAGE": SplitConfig(train=0.8, val=0.2, test=0.0, seed=shared_seed),
     }
 
     prep_cfg = PreparationConfig(
@@ -490,8 +490,6 @@ def main() -> None:
     prepared_root = Path(datasets[0].prepared_root)
     if args.manifest:
         manifest_out = Path(args.manifest)
-    elif len(datasets) == 1:
-        manifest_out = prepared_root / datasets[0].dataset_name / "manifest.parquet"
     else:
         manifest_out = prepared_root / "manifest.parquet"
 
