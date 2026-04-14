@@ -600,7 +600,12 @@ def _apply_gpu_augmentations(
     if cfg.enable_noise and cfg.noise_std_range[1] > 0:
         std = float(cfg.noise_std_range[0] + _rand_scalar() * (cfg.noise_std_range[1] - cfg.noise_std_range[0]))
         if std > 0:
-            noise = torch.randn_like(image) * std
+            noise = torch.randn(
+                image.shape,
+                device=image.device,
+                dtype=image.dtype,
+                generator=generator,
+            ) * std
             image = torch.clamp(image + noise, 0.0, 1.0)
 
     return image, mask, residual_noise
@@ -678,7 +683,12 @@ def _apply_gpu_augmentations_batch(
     if cfg.enable_noise and cfg.noise_std_range[1] > 0:
         stds = cfg.noise_std_range[0] + _rand_scalar() * (cfg.noise_std_range[1] - cfg.noise_std_range[0])
         stds = stds.view(B, 1, 1, 1)
-        noise = torch.randn_like(images) * stds
+        noise = torch.randn(
+            images.shape,
+            device=images.device,
+            dtype=images.dtype,
+            generator=generator,
+        ) * stds
         images = torch.clamp(images + noise, 0.0, 1.0)
 
     if cfg.enable_random_crop:

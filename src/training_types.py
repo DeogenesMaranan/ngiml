@@ -54,7 +54,7 @@ class TrainConfig:
     noise_std_max: float = 0.012
     disable_aug: bool = False
     device: Optional[str] = "cuda"
-    aug_seed: Optional[int] = 42
+    aug_seed: Optional[int] = None
     seed: int = 42
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 3e-3
