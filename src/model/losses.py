@@ -102,17 +102,16 @@ class MultiStageLossConfig:
 
     dice_weight: float = 1.0
     bce_weight: float = 1.0
+    focal_weight: float = 0.0
     pos_weight: float = 1.0
     stage_weights: Optional[Sequence[float]] = field(default_factory=lambda: [0.05, 0.1, 0.2, 1.0])
     smooth: float = 1e-6
-    hybrid_mode: str = "dice_bce"
     focal_gamma: float = 2.0
     focal_alpha: float = 0.25
     tversky_weight: float = 0.0
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.8
     lovasz_weight: float = 0.0
-    use_boundary_loss: bool = False
     boundary_weight: float = 0.03
     hard_pixel_mining: bool = False
     
@@ -133,13 +132,7 @@ class MultiStageManipulationLoss(nn.Module):
         )
         self.lovasz = LovaszHingeLoss()
         self.boundary_weight = float(max(0.0, getattr(self.cfg, "boundary_weight", 0.0)))
-        self.use_boundary_loss = bool(getattr(self.cfg, "use_boundary_loss", False)) and self.boundary_weight > 0.0
-        self.boundary_loss = SobelBoundaryLoss() if self.use_boundary_loss else None
-
-        mode = self.cfg.hybrid_mode.strip().lower()
-        if mode not in {"dice_bce", "dice_focal"}:
-            raise ValueError("hybrid_mode must be one of: 'dice_bce', 'dice_focal'")
-        self.hybrid_mode = mode
+        self.boundary_loss = SobelBoundaryLoss() if self.boundary_weight > 0.0 else None
 
     def _stage_weights(self, num_stages: int) -> List[float]:
         if self.cfg.stage_weights is None:
@@ -175,24 +168,33 @@ class MultiStageManipulationLoss(nn.Module):
                 )
 
             dice = self.dice(logits, target)
-            if self.hybrid_mode == "dice_bce":
-                bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight, reduction="none")
-                hybrid_term = self.cfg.bce_weight * bce
-            else:
-                focal = self.focal(logits, target)
-                hybrid_term = self.cfg.bce_weight * focal
+
+            hybrid_term = torch.zeros((), dtype=target.dtype, device=target.device)
+            bce_map = None
+            if float(self.cfg.bce_weight) > 0.0:
+                bce_map = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight, reduction="none")
+
+            focal_term = None
+            if float(getattr(self.cfg, "focal_weight", 0.0)) > 0.0:
+                focal_term = self.focal(logits, target)
 
             if getattr(self.cfg, "hard_pixel_mining", False):
                 with torch.no_grad():
                     pred_prob = torch.sigmoid(logits)
                     difficulty = torch.abs(pred_prob - target)
                     weight = 1.0 + 2.0 * (difficulty > 0.3).float()
-                hybrid_term = (hybrid_term * weight).mean()
+                if bce_map is not None:
+                    hybrid_term = hybrid_term + float(self.cfg.bce_weight) * (bce_map * weight).mean()
+                if focal_term is not None:
+                    hybrid_term = hybrid_term + float(getattr(self.cfg, "focal_weight", 0.0)) * focal_term
                 dice = (1.0 - ((1.0 - dice) * weight).mean())
             else:
-                hybrid_term = hybrid_term.mean() if hybrid_term.ndim > 0 else hybrid_term
+                if bce_map is not None:
+                    hybrid_term = hybrid_term + float(self.cfg.bce_weight) * bce_map.mean()
+                if focal_term is not None:
+                    hybrid_term = hybrid_term + float(getattr(self.cfg, "focal_weight", 0.0)) * focal_term
 
-            stage_loss = self.cfg.dice_weight * dice + hybrid_term
+            stage_loss = float(self.cfg.dice_weight) * dice + hybrid_term
             if self.cfg.tversky_weight > 0:
                 stage_loss = stage_loss + self.cfg.tversky_weight * self.tversky(logits, target)
             if getattr(self.cfg, "lovasz_weight", 0) > 0:
@@ -201,7 +203,7 @@ class MultiStageManipulationLoss(nn.Module):
             total_loss += stage_weight * stage_loss
             normalizer += stage_weight
 
-        if self.use_boundary_loss and self.boundary_loss is not None and preds:
+        if self.boundary_loss is not None and preds:
             boundary = self.boundary_loss(preds[0], target)
             total_loss += self.boundary_weight * boundary
 

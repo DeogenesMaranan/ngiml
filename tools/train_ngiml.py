@@ -615,16 +615,15 @@ def run_training(cfg: TrainConfig) -> None:
             ema_model = ema_model.to(memory_format=torch.channels_last)
     loss_cfg = replace(
         base_loss_cfg,
-        hybrid_mode=cfg.loss_hybrid_mode,
         dice_weight=cfg.dice_weight,
         bce_weight=cfg.bce_weight,
+        focal_weight=cfg.focal_weight,
         focal_gamma=cfg.focal_gamma,
         focal_alpha=cfg.focal_alpha,
         tversky_weight=cfg.tversky_weight,
         tversky_alpha=cfg.tversky_alpha,
         tversky_beta=cfg.tversky_beta,
         lovasz_weight=cfg.lovasz_weight,
-        use_boundary_loss=cfg.use_boundary_loss,
         boundary_weight=cfg.boundary_weight,
     )
     if cfg.auto_pos_weight and foreground_ratio is not None:

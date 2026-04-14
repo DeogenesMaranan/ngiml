@@ -74,16 +74,15 @@ class TrainConfig:
     pos_weight_min: float = 0.5
     pos_weight_max: float = 10.0
     balanced_pos_weight_cap: float = 0.0
-    loss_hybrid_mode: str = "dice_bce"
     dice_weight: float = 1.0
     bce_weight: float = 1.0
+    focal_weight: float = 0.0
     focal_gamma: float = 2.0
     focal_alpha: float = 0.25
     tversky_weight: float = 0.2
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.8
     lovasz_weight: float = 0.05
-    use_boundary_loss: bool = True
     boundary_weight: float = 0.03
     ema_enabled: bool = True
     ema_decay: float = 0.999

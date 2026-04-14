@@ -164,17 +164,16 @@ def parse_args() -> TrainConfig:
         default=0.0,
         help="When --balance-real-fake is enabled, cap auto pos_weight to this value (<=0 disables cap)",
     )
-    parser.add_argument("--loss-hybrid-mode", type=str, default="dice_bce", choices=["dice_bce", "dice_focal"], help="Hybrid loss type")
     parser.add_argument("--dice-weight", type=float, default=1.0, help="Dice loss weight")
-    parser.add_argument("--bce-weight", type=float, default=1.0, help="BCE/Focal term weight in hybrid loss")
-    parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (used when loss-hybrid-mode=dice_focal)")
-    parser.add_argument("--focal-alpha", type=float, default=0.25, help="Focal loss alpha (used when loss-hybrid-mode=dice_focal)")
+    parser.add_argument("--bce-weight", type=float, default=1.0, help="BCE term weight (0 disables)")
+    parser.add_argument("--focal-weight", type=float, default=0.0, help="Focal term weight (0 disables)")
+    parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma")
+    parser.add_argument("--focal-alpha", type=float, default=0.25, help="Focal loss alpha")
     parser.add_argument("--tversky-weight", type=float, default=0.2, help="Optional Tversky loss weight to improve recall")
     parser.add_argument("--tversky-alpha", type=float, default=0.3, help="Tversky alpha (FP penalty)")
     parser.add_argument("--tversky-beta", type=float, default=0.8, help="Tversky beta (FN penalty)")
     parser.add_argument("--lovasz-weight", type=float, default=0.05, help="Lovasz Hinge Loss weight for IoU optimization")
-    parser.add_argument("--use-boundary-loss", action=argparse.BooleanOptionalAction, default=True, help="Enable Sobel boundary loss on stage-0 (highest-resolution) prediction")
-    parser.add_argument("--boundary-weight", type=float, default=0.03, help="Boundary loss weight when --use-boundary-loss is enabled")
+    parser.add_argument("--boundary-weight", type=float, default=0.03, help="Boundary loss weight (0 disables)")
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=True, help="Use EMA weights for validation and best checkpoints")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay factor")
     parser.add_argument("--hard-mining-enabled", action=argparse.BooleanOptionalAction, default=False, help="Enable low-IoU hard-example weighting")
@@ -265,16 +264,15 @@ def parse_args() -> TrainConfig:
         pos_weight_min=args.pos_weight_min,
         pos_weight_max=args.pos_weight_max,
         balanced_pos_weight_cap=args.balanced_pos_weight_cap,
-        loss_hybrid_mode=args.loss_hybrid_mode,
         dice_weight=args.dice_weight,
         bce_weight=args.bce_weight,
+        focal_weight=args.focal_weight,
         focal_gamma=args.focal_gamma,
         focal_alpha=args.focal_alpha,
         tversky_weight=args.tversky_weight,
         tversky_alpha=args.tversky_alpha,
         tversky_beta=args.tversky_beta,
         lovasz_weight=args.lovasz_weight,
-        use_boundary_loss=args.use_boundary_loss,
         boundary_weight=args.boundary_weight,
         ema_enabled=args.ema_enabled,
         ema_decay=args.ema_decay,

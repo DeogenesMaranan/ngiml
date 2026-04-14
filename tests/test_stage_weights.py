@@ -17,7 +17,6 @@ def test_boundary_loss_uses_stage_zero_prediction(monkeypatch):
     loss = MultiStageManipulationLoss(
         MultiStageLossConfig(
             stage_weights=[1.0, 1.0],
-            use_boundary_loss=True,
             boundary_weight=1.0,
         )
     )
