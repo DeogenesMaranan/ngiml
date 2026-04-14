@@ -824,7 +824,7 @@ def run_training(cfg: TrainConfig) -> None:
                     cfg,
                     scheduler=scheduler,
                     ema_model=ema_model,
-                    use_ema_for_model_state=(ema_model is not None),
+                    use_ema_for_model_state=False,
                     training_state={
                         "best_monitor_value": best_monitor_value,
                         "best_val_iou": best_val_iou,
@@ -856,7 +856,7 @@ def run_training(cfg: TrainConfig) -> None:
                     cfg,
                     scheduler=scheduler,
                     ema_model=ema_model,
-                    use_ema_for_model_state=(ema_model is not None),
+                    use_ema_for_model_state=False,
                     training_state={
                         "best_monitor_value": best_monitor_value,
                         "best_val_iou": best_val_iou,
