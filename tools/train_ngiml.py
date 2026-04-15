@@ -773,10 +773,62 @@ def run_training(cfg: TrainConfig) -> None:
         val_accuracy = None
         val_threshold = None
         val_size_bins = None
+        val_source = "raw"
+        val_monitor_source = "raw"
+        val_overlap_source = "raw"
+        val_raw_metrics = None
+        val_ema_metrics = None
         epoch_status_flags: list[str] = []
         if "val" in loaders and (epoch + 1) % cfg.val_every == 0:
-            eval_model = ema_model if ema_model is not None else model
-            metrics = evaluate(eval_model, loaders["val"], loss_fn, device, cfg, normalization_mode=normalization_mode)
+            raw_metrics = evaluate(model, loaders["val"], loss_fn, device, cfg, normalization_mode=normalization_mode)
+            ema_metrics = None
+            if ema_model is not None:
+                ema_metrics = evaluate(ema_model, loaders["val"], loss_fn, device, cfg, normalization_mode=normalization_mode)
+
+            val_raw_metrics = {
+                "loss": float(raw_metrics["loss"]),
+                "iou": float(raw_metrics["iou"]),
+                "f1": float(raw_metrics["f1"]),
+                "precision": float(raw_metrics["precision"]),
+                "recall": float(raw_metrics["recall"]),
+                "accuracy": float(raw_metrics["accuracy"]),
+                "threshold": float(raw_metrics["threshold"]),
+            }
+            if ema_metrics is not None:
+                val_ema_metrics = {
+                    "loss": float(ema_metrics["loss"]),
+                    "iou": float(ema_metrics["iou"]),
+                    "f1": float(ema_metrics["f1"]),
+                    "precision": float(ema_metrics["precision"]),
+                    "recall": float(ema_metrics["recall"]),
+                    "accuracy": float(ema_metrics["accuracy"]),
+                    "threshold": float(ema_metrics["threshold"]),
+                }
+
+            def _prefer_source(a: dict, b: dict, monitor: str) -> bool:
+                if monitor == "loss":
+                    return float(a["loss"]) < float(b["loss"])
+                return float(_metric_for_monitor(a, monitor)) > float(_metric_for_monitor(b, monitor))
+
+            monitor_source = "raw"
+            monitor_metrics = raw_metrics
+            if ema_metrics is not None and _prefer_source(ema_metrics, raw_metrics, cfg.early_stopping_monitor):
+                monitor_source = "ema"
+                monitor_metrics = ema_metrics
+
+            overlap_source = "raw"
+            overlap_metrics = raw_metrics
+            if ema_metrics is not None:
+                raw_key = (float(raw_metrics["f1"]), float(raw_metrics["iou"]))
+                ema_key = (float(ema_metrics["f1"]), float(ema_metrics["iou"]))
+                if ema_key > raw_key:
+                    overlap_source = "ema"
+                    overlap_metrics = ema_metrics
+
+            val_source = monitor_source
+            val_monitor_source = monitor_source
+            val_overlap_source = overlap_source
+            metrics = monitor_metrics
             val_loss = float(metrics["loss"])
             val_iou = float(metrics["iou"])
             val_f1 = float(metrics["f1"])
@@ -785,30 +837,39 @@ def run_training(cfg: TrainConfig) -> None:
             val_accuracy = float(metrics["accuracy"])
             val_threshold = float(metrics["threshold"])
             val_size_bins = metrics.get("size_bins")
-            val_summary = (
-                f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} Val   | "
-                f"loss {val_loss:.4f} | iou {val_iou:.4f} | f1 {val_f1:.4f} | "
-                f"prec {val_precision:.4f} | rec {val_recall:.4f} | acc {val_accuracy:.4f} | "
-                f"thr {val_threshold:.2f}"
-            )
-            print(
-                val_summary
-            )
-            if isinstance(val_size_bins, dict):
-                small_iou = float(val_size_bins.get("small", {}).get("iou", 0.0))
-                medium_iou = float(val_size_bins.get("medium", {}).get("iou", 0.0))
-                large_iou = float(val_size_bins.get("large", {}).get("iou", 0.0))
-                print(
-                    "               bins | "
-                    f"small {small_iou:.4f} | medium {medium_iou:.4f} | large {large_iou:.4f}"
+
+            def _fmt_metrics(tag: str, m: dict) -> str:
+                return (
+                    f"{tag} | loss {float(m['loss']):.4f} | iou {float(m['iou']):.4f} | "
+                    f"f1 {float(m['f1']):.4f} | prec {float(m['precision']):.4f} | "
+                    f"rec {float(m['recall']):.4f} | acc {float(m['accuracy']):.4f} | "
+                    f"thr {float(m['threshold']):.2f}"
                 )
 
-            iou_improved = val_iou > (best_val_iou + cfg.early_stopping_min_delta)
-            f1_improved = val_f1 > (best_val_f1 + cfg.early_stopping_min_delta)
+            print(f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} Val   | " + _fmt_metrics("raw", raw_metrics))
+            if ema_metrics is not None:
+                print("               " + _fmt_metrics("ema", ema_metrics))
+            print(
+                "               select | "
+                f"monitor({cfg.early_stopping_monitor})={monitor_source} | "
+                f"overlap(iou/f1)={overlap_source}"
+            )
+
+            chosen_bins = overlap_metrics.get("size_bins") if isinstance(overlap_metrics, dict) else None
+            if isinstance(chosen_bins, dict):
+                small_iou = float(chosen_bins.get("small", {}).get("iou", 0.0))
+                medium_iou = float(chosen_bins.get("medium", {}).get("iou", 0.0))
+                large_iou = float(chosen_bins.get("large", {}).get("iou", 0.0))
+                print("               bins | " f"small {small_iou:.4f} | medium {medium_iou:.4f} | large {large_iou:.4f}")
+
+            overlap_iou = float(overlap_metrics["iou"])
+            overlap_f1 = float(overlap_metrics["f1"])
+            iou_improved = overlap_iou > (best_val_iou + cfg.early_stopping_min_delta)
+            f1_improved = overlap_f1 > (best_val_f1 + cfg.early_stopping_min_delta)
             if iou_improved:
-                best_val_iou = val_iou
+                best_val_iou = overlap_iou
             if f1_improved:
-                best_val_f1 = val_f1
+                best_val_f1 = overlap_f1
 
             overlap_improved = iou_improved or f1_improved
             if overlap_improved:
@@ -823,7 +884,7 @@ def run_training(cfg: TrainConfig) -> None:
                     cfg,
                     scheduler=scheduler,
                     ema_model=ema_model,
-                    use_ema_for_model_state=False,
+                    use_ema_for_model_state=(overlap_source == "ema"),
                     training_state={
                         "best_monitor_value": best_monitor_value,
                         "best_val_iou": best_val_iou,
@@ -833,7 +894,7 @@ def run_training(cfg: TrainConfig) -> None:
                 )
                 epoch_status_flags.append(f"best-overlap -> {best_f1_iou_path.name}")
 
-            monitor_value = _metric_for_monitor(metrics, cfg.early_stopping_monitor)
+            monitor_value = _metric_for_monitor(monitor_metrics, cfg.early_stopping_monitor)
             monitor_improved = _monitor_improved(
                 cfg.early_stopping_monitor,
                 monitor_value,
@@ -843,7 +904,7 @@ def run_training(cfg: TrainConfig) -> None:
 
             if monitor_improved:
                 monitor_for_metadata = str(getattr(cfg, "early_stopping_monitor", "loss")).strip().lower()
-                monitor_value_for_metadata = _metric_for_monitor(metrics, monitor_for_metadata)
+                monitor_value_for_metadata = _metric_for_monitor(monitor_metrics, monitor_for_metadata)
                 best_alias_path = checkpoint_dir / "best_checkpoint.pt"
                 save_checkpoint(
                     best_alias_path,
@@ -855,7 +916,7 @@ def run_training(cfg: TrainConfig) -> None:
                     cfg,
                     scheduler=scheduler,
                     ema_model=ema_model,
-                    use_ema_for_model_state=False,
+                    use_ema_for_model_state=(monitor_source == "ema"),
                     training_state={
                         "best_monitor_value": best_monitor_value,
                         "best_val_iou": best_val_iou,
@@ -871,7 +932,7 @@ def run_training(cfg: TrainConfig) -> None:
                         threshold_metric=str(metrics.get("threshold_metric", cfg.threshold_metric)),
                         monitor=monitor_for_metadata,
                         monitor_value=monitor_value_for_metadata,
-                        metrics=metrics,
+                        metrics=monitor_metrics,
                         checkpoint_path=best_alias_path,
                     )
                 epoch_status_flags.append(
@@ -925,6 +986,11 @@ def run_training(cfg: TrainConfig) -> None:
                     "val_accuracy": val_accuracy,
                     "val_threshold": val_threshold,
                     "val_size_bins": val_size_bins,
+                    "val_source": val_source,
+                    "val_monitor_source": val_monitor_source,
+                    "val_overlap_source": val_overlap_source,
+                    "val_raw_metrics": val_raw_metrics,
+                    "val_ema_metrics": val_ema_metrics,
                     "epoch_seconds": float(elapsed),
                     "checkpoint_path": str(ckpt_path),
                 },
