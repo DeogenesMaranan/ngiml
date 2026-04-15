@@ -70,6 +70,7 @@ class HybridNGIMLConfig:
     use_low_level: bool = True
     use_context: bool = True
     use_residual: bool = True
+    use_fusion: bool = True
     enable_residual_attention: bool = True
     enable_low_level_residual_attention: bool = True
     enable_context_residual_attention: bool = False
@@ -86,6 +87,9 @@ class HybridNGIML(nn.Module):
         self.efficientnet: Optional[EfficientNetBackbone] = None
         self.swin: Optional[SwinBackbone] = None
         self.noise: Optional[ResidualNoiseModule] = None
+        self.fusion: Optional[MultiStageFeatureFusion] = None
+        self.pre_decoder_adapters: Optional[nn.ModuleList] = None
+        self.direct_branch: Optional[str] = None
 
         if self.cfg.use_low_level:
             self.efficientnet = EfficientNetBackbone(self.cfg.efficientnet)
@@ -117,7 +121,27 @@ class HybridNGIML(nn.Module):
         if not branch_channels:
             raise ValueError("At least one backbone branch must be enabled for fusion")
 
-        self.fusion = MultiStageFeatureFusion(branch_channels, self.cfg.fusion)
+        if self.cfg.use_fusion:
+            self.fusion = MultiStageFeatureFusion(branch_channels, self.cfg.fusion)
+        else:
+            if len(branch_channels) != 1:
+                raise ValueError(
+                    "use_fusion=False currently requires exactly one enabled branch "
+                    "(e.g., Swin-only with use_context=True, use_low_level=False, use_residual=False)"
+                )
+            self.direct_branch = next(iter(branch_channels.keys()))
+            direct_channels = list(branch_channels[self.direct_branch])
+            if len(direct_channels) < self.num_stages:
+                raise ValueError(
+                    f"Branch '{self.direct_branch}' provides {len(direct_channels)} stages, "
+                    f"but decoder expects {self.num_stages}"
+                )
+            self.pre_decoder_adapters = nn.ModuleList(
+                [
+                    nn.Conv2d(direct_channels[stage_idx], self.cfg.fusion.fusion_channels[stage_idx], kernel_size=1, bias=False)
+                    for stage_idx in range(self.num_stages)
+                ]
+            )
         self.decoder = UNetDecoder(self.cfg.fusion.fusion_channels, self.cfg.decoder)
 
         self.enable_residual_attention = (
@@ -227,14 +251,32 @@ class HybridNGIML(nn.Module):
         residual_noise: Tensor | None = None,
     ) -> List[Tensor]:
         backbone_feats = self._extract_features(x, residual_noise=residual_noise)
-        fusion_inputs = {}
-        if self.cfg.use_low_level and backbone_feats["low_level"] is not None:
-            fusion_inputs["low_level"] = backbone_feats["low_level"]
-        if self.cfg.use_context and backbone_feats["context"] is not None:
-            fusion_inputs["context"] = backbone_feats["context"]
-        if self.cfg.use_residual and backbone_feats["residual"] is not None:
-            fusion_inputs["residual"] = backbone_feats["residual"]
-        return self.fusion(fusion_inputs, target_size=target_size)
+        if self.cfg.use_fusion:
+            fusion_inputs = {}
+            if self.cfg.use_low_level and backbone_feats["low_level"] is not None:
+                fusion_inputs["low_level"] = backbone_feats["low_level"]
+            if self.cfg.use_context and backbone_feats["context"] is not None:
+                fusion_inputs["context"] = backbone_feats["context"]
+            if self.cfg.use_residual and backbone_feats["residual"] is not None:
+                fusion_inputs["residual"] = backbone_feats["residual"]
+            if self.fusion is None:
+                raise RuntimeError("Fusion module is not initialized")
+            return self.fusion(fusion_inputs, target_size=target_size)
+
+        if self.direct_branch is None or self.pre_decoder_adapters is None:
+            raise RuntimeError("Direct no-fusion path is not initialized")
+        branch_features = backbone_feats.get(self.direct_branch)
+        if not isinstance(branch_features, list):
+            raise RuntimeError(f"Expected list features for branch '{self.direct_branch}'")
+        if len(branch_features) < len(self.pre_decoder_adapters):
+            raise RuntimeError(
+                f"Branch '{self.direct_branch}' returned {len(branch_features)} features, "
+                f"expected at least {len(self.pre_decoder_adapters)}"
+            )
+        return [
+            adapter(branch_features[idx])
+            for idx, adapter in enumerate(self.pre_decoder_adapters)
+        ]
 
     def forward(
         self,
@@ -275,7 +317,10 @@ class HybridNGIML(nn.Module):
         if self.cfg.use_residual and self.noise is not None:
             _append(self.noise.parameters(), self.cfg.optimizer.residual)
 
-        _append(self.fusion.parameters(), self.cfg.optimizer.fusion)
+        if self.fusion is not None:
+            _append(self.fusion.parameters(), self.cfg.optimizer.fusion)
+        if self.pre_decoder_adapters is not None:
+            _append(self.pre_decoder_adapters.parameters(), self.cfg.optimizer.fusion)
         _append(self.decoder.parameters(), self.cfg.optimizer.decoder)
 
         if not groups:

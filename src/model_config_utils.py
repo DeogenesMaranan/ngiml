@@ -71,6 +71,7 @@ def coerce_model_config(value) -> HybridNGIMLConfig:
         use_low_level=bool(value.get("use_low_level", default_model.use_low_level)),
         use_context=bool(value.get("use_context", default_model.use_context)),
         use_residual=bool(value.get("use_residual", default_model.use_residual)),
+        use_fusion=bool(value.get("use_fusion", default_model.use_fusion)),
         enable_residual_attention=bool(value.get("enable_residual_attention", default_model.enable_residual_attention)),
         gradient_checkpointing=bool(value.get("gradient_checkpointing", default_model.gradient_checkpointing)),
     )
