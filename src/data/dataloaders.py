@@ -123,6 +123,7 @@ def _compute_residual_noise(image: torch.Tensor) -> torch.Tensor:
 
 def _load_from_npz(
     path: str | io.BytesIO,
+    include_residual_noise: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Load image/mask tensors from NPZ and derive residual noise on the fly."""
     with np.load(path, allow_pickle=False) as data:
@@ -160,13 +161,14 @@ def _load_from_npz(
             if mask.shape[-2:] != image.shape[-2:]:
                 mask = F.resize(mask, list(image.shape[-2:]), interpolation=InterpolationMode.NEAREST)
 
-        residual_noise = _compute_residual_noise(image)
+        residual_noise = _compute_residual_noise(image) if include_residual_noise else None
 
     return image, mask, residual_noise
 
 
 def _load_from_tar_npz(
     tar_spec: str,
+    include_residual_noise: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Load NPZ sample from tar-member spec '<archive>::<member>'."""
     if "::" not in tar_spec:
@@ -177,7 +179,7 @@ def _load_from_tar_npz(
     if member is None:
         raise FileNotFoundError(f"Missing member {member_name} in {archive_path}")
     npz_bytes = member.read()
-    return _load_from_npz(io.BytesIO(npz_bytes))
+    return _load_from_npz(io.BytesIO(npz_bytes), include_residual_noise=include_residual_noise)
 
 
 class PerDatasetDataset(Dataset):
@@ -190,6 +192,7 @@ class PerDatasetDataset(Dataset):
         resize_max_side: int | None = None,
         aug_seed: int | None = None,
         apply_augmentations: bool = False,
+        include_residual_noise: bool = True,
     ) -> None:
         self.samples = list(samples)
         self.aug_cfg = aug_cfg
@@ -198,6 +201,7 @@ class PerDatasetDataset(Dataset):
         self.resize_max_side = int(resize_max_side) if resize_max_side is not None else None
         self.aug_seed = aug_seed
         self.apply_augmentations = bool(apply_augmentations)
+        self.include_residual_noise = bool(include_residual_noise)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -206,15 +210,21 @@ class PerDatasetDataset(Dataset):
         record = self.samples[index]
 
         if "::" in record.image_path and record.image_path.endswith(".npz"):
-            image, mask, residual_noise = _load_from_tar_npz(record.image_path)
+            image, mask, residual_noise = _load_from_tar_npz(
+                record.image_path,
+                include_residual_noise=self.include_residual_noise,
+            )
         elif record.image_path.endswith(".npz"):
-            image, mask, residual_noise = _load_from_npz(record.image_path)
+            image, mask, residual_noise = _load_from_npz(
+                record.image_path,
+                include_residual_noise=self.include_residual_noise,
+            )
         else:
             image = _load_image(record.image_path)
             mask = _load_mask(record.mask_path, image.shape[-2:])
-            residual_noise = _compute_residual_noise(image)
+            residual_noise = _compute_residual_noise(image) if self.include_residual_noise else None
 
-        if residual_noise is None:
+        if self.include_residual_noise and residual_noise is None:
             residual_noise = _compute_residual_noise(image)
 
         if mask is None:
@@ -994,6 +1004,7 @@ def create_dataloaders(
     size_bucketing: bool = True,
     short_side_probe_samples: int = 128,
     normalization_mode_override: str | None = None,
+    include_residual_noise: bool = True,
 ) -> Dict[str, DataLoader]:
     """Build split-specific dataloaders with round-robin sampling and optional bucketing."""
     manifest = load_manifest(manifest_path)
@@ -1029,6 +1040,7 @@ def create_dataloaders(
                     resize_max_side=resize_max_side,
                     aug_seed=aug_seed,
                     apply_augmentations=apply_in_worker,
+                    include_residual_noise=include_residual_noise,
                 )
             )
             for r in records:

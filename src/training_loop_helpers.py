@@ -433,6 +433,8 @@ def _prepare_dataloaders(cfg: TrainConfig, device: torch.device) -> tuple[object
     per_dataset_aug = _build_aug_map(dataset_names, cfg)
     manifest = load_manifest(manifest_path)
     normalization_mode = manifest.normalization_mode
+    model_cfg = _coerce_model_config(cfg.model_config)
+    include_residual_noise = bool(getattr(model_cfg, "use_residual", True))
     collate_aug_map = per_dataset_aug
     collate_norm_mode = normalization_mode
     if device.type == "cuda":
@@ -461,6 +463,7 @@ def _prepare_dataloaders(cfg: TrainConfig, device: torch.device) -> tuple[object
         resize_max_side=int(cfg.resize_max_side),
         short_side_probe_samples=cfg.short_side_probe_samples,
         normalization_mode_override=collate_norm_mode,
+        include_residual_noise=include_residual_noise,
     )
     return loaders, per_dataset_aug, normalization_mode
 
