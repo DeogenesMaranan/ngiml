@@ -805,25 +805,13 @@ def run_training(cfg: TrainConfig) -> None:
                     "threshold": float(ema_metrics["threshold"]),
                 }
 
-            def _prefer_source(a: dict, b: dict, monitor: str) -> bool:
-                if monitor == "loss":
-                    return float(a["loss"]) < float(b["loss"])
-                return float(_metric_for_monitor(a, monitor)) > float(_metric_for_monitor(b, monitor))
+            # IML-style policy: train on raw weights, but prefer EMA for
+            # model selection/reporting whenever EMA is available.
+            monitor_source = "ema" if ema_metrics is not None else "raw"
+            monitor_metrics = ema_metrics if ema_metrics is not None else raw_metrics
 
-            monitor_source = "raw"
-            monitor_metrics = raw_metrics
-            if ema_metrics is not None and _prefer_source(ema_metrics, raw_metrics, cfg.early_stopping_monitor):
-                monitor_source = "ema"
-                monitor_metrics = ema_metrics
-
-            overlap_source = "raw"
-            overlap_metrics = raw_metrics
-            if ema_metrics is not None:
-                raw_key = (float(raw_metrics["f1"]), float(raw_metrics["iou"]))
-                ema_key = (float(ema_metrics["f1"]), float(ema_metrics["iou"]))
-                if ema_key > raw_key:
-                    overlap_source = "ema"
-                    overlap_metrics = ema_metrics
+            overlap_source = "ema" if ema_metrics is not None else "raw"
+            overlap_metrics = ema_metrics if ema_metrics is not None else raw_metrics
 
             val_source = monitor_source
             val_monitor_source = monitor_source
