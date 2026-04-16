@@ -141,6 +141,20 @@ def parse_args() -> TrainConfig:
         choices=["loss", "iou", "f1", "recall", "precision", "accuracy"],
         help="Validation metric used for early stopping and best checkpoint",
     )
+    parser.add_argument(
+        "--monitor-source-policy",
+        type=str,
+        default="best",
+        choices=["best", "ema", "raw"],
+        help="Source for early-stopping monitor and best_checkpoint selection when EMA is enabled",
+    )
+    parser.add_argument(
+        "--overlap-source-policy",
+        type=str,
+        default="best",
+        choices=["best", "ema", "raw"],
+        help="Source for best_f1_iou_checkpoint selection when EMA is enabled",
+    )
     parser.add_argument("--metric-threshold", type=float, default=0.5, help="Fixed threshold for sigmoid outputs when threshold optimization is disabled")
     parser.add_argument("--optimize-threshold", action=argparse.BooleanOptionalAction, default=False, help="Search validation thresholds and use the best for metric reporting")
     parser.add_argument("--threshold-metric", type=str, default="f1", choices=["iou", "f1"], help="Metric used to select best threshold")
@@ -257,6 +271,8 @@ def parse_args() -> TrainConfig:
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
         early_stopping_monitor=args.early_stopping_monitor,
+        monitor_source_policy=args.monitor_source_policy,
+        overlap_source_policy=args.overlap_source_policy,
         metric_threshold=args.metric_threshold,
         optimize_threshold=args.optimize_threshold,
         threshold_metric=args.threshold_metric,

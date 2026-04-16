@@ -44,6 +44,8 @@ def test_overlap_focused_threshold_and_mining_defaults(monkeypatch):
     assert cfg.early_stopping_patience == 5
     assert cfg.early_stopping_monitor == "loss"
     assert cfg.early_stopping_min_delta == 3e-3
+    assert cfg.monitor_source_policy == "best"
+    assert cfg.overlap_source_policy == "best"
     assert cfg.optimize_threshold is False
     assert cfg.metric_threshold == 0.5
     assert cfg.threshold_metric == "f1"

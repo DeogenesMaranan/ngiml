@@ -55,8 +55,10 @@ from src.training_loop_helpers import (
     _prepare_dataloaders,
     _print_and_validate_train_dataset_integrity,
     _print_resolved_config_summary,
+    _resolve_overlap_source,
     _resolve_cuda_runtime_stability,
     _resolve_manifest_for_training,
+    _resolve_validation_source,
     _segmentation_counts,
     _select_threshold_with_precision_guard,
     _set_aux_trainability_for_epoch,
@@ -822,13 +824,17 @@ def run_training(cfg: TrainConfig) -> None:
                     "threshold": float(ema_metrics["threshold"]),
                 }
 
-            # IML-style policy: train on raw weights, but prefer EMA for
-            # model selection/reporting whenever EMA is available.
-            monitor_source = "ema" if ema_metrics is not None else "raw"
-            monitor_metrics = ema_metrics if ema_metrics is not None else raw_metrics
-
-            overlap_source = "ema" if ema_metrics is not None else "raw"
-            overlap_metrics = ema_metrics if ema_metrics is not None else raw_metrics
+            monitor_source, monitor_metrics = _resolve_validation_source(
+                raw_metrics=raw_metrics,
+                ema_metrics=ema_metrics,
+                policy=getattr(cfg, "monitor_source_policy", "best"),
+                metric_key=str(cfg.early_stopping_monitor).strip().lower(),
+            )
+            overlap_source, overlap_metrics = _resolve_overlap_source(
+                raw_metrics=raw_metrics,
+                ema_metrics=ema_metrics,
+                policy=getattr(cfg, "overlap_source_policy", "best"),
+            )
 
             val_source = monitor_source
             val_monitor_source = monitor_source
@@ -857,7 +863,10 @@ def run_training(cfg: TrainConfig) -> None:
             print(
                 "               select | "
                 f"monitor({cfg.early_stopping_monitor})={monitor_source} | "
-                f"overlap(iou/f1)={overlap_source}"
+                f"overlap(iou/f1)={overlap_source} | "
+                f"policy(monitor/overlap)="
+                f"{getattr(cfg, 'monitor_source_policy', 'best')}/"
+                f"{getattr(cfg, 'overlap_source_policy', 'best')}"
             )
 
             chosen_bins = overlap_metrics.get("size_bins") if isinstance(overlap_metrics, dict) else None

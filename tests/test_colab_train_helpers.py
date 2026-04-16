@@ -73,6 +73,8 @@ def test_build_training_config_uses_fixed_threshold_iou_early_stopping_defaults(
     assert cfg["early_stopping_patience"] == 5
     assert cfg["early_stopping_min_delta"] == 3e-3
     assert cfg["early_stopping_monitor"] == "loss"
+    assert cfg["monitor_source_policy"] == "best"
+    assert cfg["overlap_source_policy"] == "best"
     assert cfg["metric_threshold"] == 0.5
     assert cfg["optimize_threshold"] is False
 

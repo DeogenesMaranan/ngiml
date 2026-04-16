@@ -60,6 +60,8 @@ class TrainConfig:
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 3e-3
     early_stopping_monitor: str = "loss"
+    monitor_source_policy: str = "best"
+    overlap_source_policy: str = "best"
     metric_threshold: float = 0.5
     optimize_threshold: bool = False
     threshold_metric: str = "f1"
