@@ -460,6 +460,7 @@ def _prepare_dataloaders(cfg: TrainConfig, device: torch.device) -> tuple[object
         aug_seed=cfg.aug_seed if cfg.aug_seed is not None else cfg.seed,
         prefetch_factor=cfg.prefetch_factor,
         persistent_workers=cfg.persistent_workers,
+        multiprocessing_context=cfg.multiprocessing_context,
         resize_max_side=int(cfg.resize_max_side),
         short_side_probe_samples=cfg.short_side_probe_samples,
         normalization_mode_override=collate_norm_mode,

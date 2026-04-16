@@ -88,6 +88,13 @@ def parse_args() -> TrainConfig:
         help="Enable persistent DataLoader workers",
     )
     parser.add_argument(
+        "--multiprocessing-context",
+        type=str,
+        default=None,
+        choices=["fork", "spawn", "forkserver"],
+        help="Optional DataLoader multiprocessing context (recommended: spawn on notebook runtimes)",
+    )
+    parser.add_argument(
         "--drop-last",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -233,6 +240,7 @@ def parse_args() -> TrainConfig:
         balanced_sampler_num_samples=args.balanced_sampler_num_samples,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
+        multiprocessing_context=args.multiprocessing_context,
         drop_last=args.drop_last,
         auto_local_cache=args.auto_local_cache,
         local_cache_dir=args.local_cache_dir,

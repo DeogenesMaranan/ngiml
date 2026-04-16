@@ -43,6 +43,22 @@ def test_apply_colab_runtime_settings_caps_excessive_num_workers():
     assert updated["num_workers"] == 2
 
 
+def test_apply_colab_runtime_settings_sets_spawn_context_on_py312_plus():
+    cfg = {}
+    updated = apply_colab_runtime_settings(
+        cfg,
+        balance_sampling=False,
+        local_cache_dir="/content/cache",
+    )
+
+    import sys
+
+    if sys.version_info >= (3, 12):
+        assert updated["multiprocessing_context"] == "spawn"
+    else:
+        assert updated["multiprocessing_context"] is None
+
+
 def test_build_training_config_uses_fixed_threshold_iou_early_stopping_defaults():
     model_cfg, loss_cfg, default_aug, per_dataset_aug = build_default_components()
     cfg = build_training_config(

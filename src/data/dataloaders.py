@@ -2,6 +2,9 @@
 """Data loading, augmentation, and sampler utilities for NGIML training."""
 import io
 import json
+import multiprocessing as mp
+import os
+import sys
 import tarfile
 import atexit
 from collections import OrderedDict
@@ -996,6 +999,7 @@ def create_dataloaders(
     aug_seed: int | None = None,
     prefetch_factor: int | None = None,
     persistent_workers: bool = False,
+    multiprocessing_context: str | None = None,
     balance_real_fake: bool = True,
     balanced_positive_ratio: float = 0.5,
     balanced_sampler_seed: int | None = 42,
@@ -1120,33 +1124,56 @@ def create_dataloaders(
 
         pf = prefetch_factor if num_workers > 0 else None
         persistent = persistent_workers if num_workers > 0 else False
+        loader_multiprocessing_context: str | None = None
+        if num_workers > 0:
+            if multiprocessing_context is not None:
+                loader_multiprocessing_context = str(multiprocessing_context).strip().lower() or None
+            else:
+                is_colab = bool(os.environ.get("COLAB_RELEASE_TAG")) or ("google.colab" in sys.modules)
+                if is_colab and sys.version_info >= (3, 12):
+                    loader_multiprocessing_context = "spawn"
+
+            if loader_multiprocessing_context is not None:
+                available_contexts = set(mp.get_all_start_methods())
+                if loader_multiprocessing_context not in available_contexts:
+                    available = ", ".join(sorted(available_contexts))
+                    raise ValueError(
+                        f"Unsupported multiprocessing_context={loader_multiprocessing_context!r}. "
+                        f"Available contexts: {available}"
+                    )
 
         use_batch_sampler = bool(training and size_bucketing and sampler is not None)
         if use_batch_sampler:
             batch_sampler = SizeBucketingBatchSampler(sampler, combined_short_sides, batch_size=batch_size, drop_last=drop_last)
-            loader = DataLoader(
-                combined,
-                batch_sampler=batch_sampler,
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=collate_fn,
-                prefetch_factor=pf,
-                persistent_workers=persistent,
-            )
+            loader_kwargs = {
+                "dataset": combined,
+                "batch_sampler": batch_sampler,
+                "shuffle": False,
+                "num_workers": num_workers,
+                "pin_memory": pin_memory,
+                "collate_fn": collate_fn,
+                "prefetch_factor": pf,
+                "persistent_workers": persistent,
+            }
+            if loader_multiprocessing_context is not None:
+                loader_kwargs["multiprocessing_context"] = loader_multiprocessing_context
+            loader = DataLoader(**loader_kwargs)
         else:
-            loader = DataLoader(
-                combined,
-                batch_size=batch_size,
-                sampler=sampler,
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=collate_fn,
-                drop_last=drop_last if training else False,
-                prefetch_factor=pf,
-                persistent_workers=persistent,
-            )
+            loader_kwargs = {
+                "dataset": combined,
+                "batch_size": batch_size,
+                "sampler": sampler,
+                "shuffle": False,
+                "num_workers": num_workers,
+                "pin_memory": pin_memory,
+                "collate_fn": collate_fn,
+                "drop_last": drop_last if training else False,
+                "prefetch_factor": pf,
+                "persistent_workers": persistent,
+            }
+            if loader_multiprocessing_context is not None:
+                loader_kwargs["multiprocessing_context"] = loader_multiprocessing_context
+            loader = DataLoader(**loader_kwargs)
         loaders[split_name] = loader
 
     return loaders

@@ -1,6 +1,7 @@
 import os
 import shutil
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,7 @@ def apply_colab_runtime_settings(
     updates = {
         "num_workers": recommended_workers,
         "persistent_workers": False,
+        "multiprocessing_context": "spawn" if sys.version_info >= (3, 12) else None,
         "pin_memory": True,
         "auto_local_cache": True,
         "local_cache_dir": cache_dir,

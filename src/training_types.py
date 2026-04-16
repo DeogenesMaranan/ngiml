@@ -43,6 +43,7 @@ class TrainConfig:
     balanced_sampler_num_samples: Optional[int] = None
     prefetch_factor: Optional[int] = 2
     persistent_workers: bool = False
+    multiprocessing_context: Optional[str] = None
     drop_last: bool = True
     auto_local_cache: bool = True
     local_cache_dir: Optional[str] = "/cache"
