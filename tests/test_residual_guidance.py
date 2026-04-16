@@ -110,6 +110,26 @@ def test_residual_attention_zero_init_scale_starts_as_identity():
     assert torch.allclose(target[0], torch.ones_like(target[0]))
 
 
+def test_residual_attention_default_init_with_zero_scale_keeps_gradients_alive():
+    torch.manual_seed(0)
+    projections = HybridNGIML._build_residual_attention_proj([3], [2])
+    scales = nn.ParameterList([nn.Parameter(torch.zeros(1))])
+    target = [torch.randn((2, 2, 8, 8), dtype=torch.float32, requires_grad=True)]
+    residual = [torch.randn((2, 3, 8, 8), dtype=torch.float32)]
+
+    HybridNGIML._apply_residual_attention(target, residual, projections, scales)
+    loss = target[0].pow(2).mean()
+    loss.backward()
+
+    proj_grad = projections[0].weight.grad
+    scale_grad = scales[0].grad
+    assert proj_grad is not None
+    assert scale_grad is not None
+    # With zero scale, projection is gated but scale should receive signal.
+    assert float(proj_grad.abs().sum().item()) == 0.0
+    assert float(scale_grad.abs().sum().item()) > 0.0
+
+
 def test_hybrid_forward_passes_image_to_decoder():
     model = HybridNGIML.__new__(HybridNGIML)
     nn.Module.__init__(model)

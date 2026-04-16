@@ -31,11 +31,11 @@ def _default_swin_optim() -> OptimizerGroupConfig:
 
 
 def _default_residual_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=2.5e-4, weight_decay=2e-4)
+    return OptimizerGroupConfig(lr=8e-5, weight_decay=2e-4)
 
 
 def _default_fusion_optim() -> OptimizerGroupConfig:
-    return OptimizerGroupConfig(lr=1.2e-4, weight_decay=2e-4)
+    return OptimizerGroupConfig(lr=8e-5, weight_decay=2e-4)
 
 
 def _default_decoder_optim() -> OptimizerGroupConfig:
@@ -53,6 +53,7 @@ class HybridNGIMLOptimizerConfig:
     betas: Tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
     freeze_backbone_epochs: int = 3
+    freeze_residual_fusion_epochs: int = 1
 
 
 @dataclass
@@ -193,7 +194,8 @@ class HybridNGIML(nn.Module):
         projections = nn.ModuleList()
         for stage_idx in range(min(len(residual_channels), len(target_channels))):
             proj = nn.Conv2d(residual_channels[stage_idx], target_channels[stage_idx], kernel_size=1)
-            nn.init.zeros_(proj.weight)
+            # Keep attention identity at start via scale=0 while allowing gradients to flow.
+            nn.init.normal_(proj.weight, mean=0.0, std=1e-3)
             if proj.bias is not None:
                 nn.init.zeros_(proj.bias)
             projections.append(proj)

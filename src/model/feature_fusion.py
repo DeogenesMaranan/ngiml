@@ -21,6 +21,7 @@ class FeatureFusionConfig:
     activation: str = "relu"
     fusion_refinement: bool = True
     enable_joint_gating: bool = False
+    balance_branch_scales: bool = True
     late_residual_boost_start: int = 1
     late_residual_boost: float = 0.0
 
@@ -35,6 +36,7 @@ class _AdaptiveFusionStage(nn.Module):
         activation: str,
         fusion_refinement: bool = False,
         enable_joint_gating: bool = False,
+        balance_branch_scales: bool = True,
         late_residual_boost: float = 0.0,
     ) -> None:
         super().__init__()
@@ -57,6 +59,7 @@ class _AdaptiveFusionStage(nn.Module):
             }
         )
         self.enable_joint_gating = bool(enable_joint_gating) and len(self.branch_order) > 1
+        self.balance_branch_scales = bool(balance_branch_scales)
         if self.enable_joint_gating:
             joint_in_channels = out_channels * len(self.branch_order)
             self.joint_gate_generator = nn.Sequential(
@@ -123,6 +126,10 @@ class _AdaptiveFusionStage(nn.Module):
             proj = self.projections[branch](tensor)
             if proj.shape[-2:] != (align_h, align_w):
                 proj = F.interpolate(proj, size=(align_h, align_w), mode="bilinear", align_corners=False)
+            if self.balance_branch_scales:
+                # Normalize per-branch feature energy to reduce branch dominance during fusion.
+                rms = proj.pow(2).mean(dim=(2, 3), keepdim=True).sqrt().clamp_min(1e-5)
+                proj = proj / rms
             aligned_projections[branch] = proj
 
         if len(self.branch_order) > 1 and hasattr(self, "joint_gate_generator") and self.joint_gate_generator is not None:
@@ -203,6 +210,7 @@ class MultiStageFeatureFusion(nn.Module):
                     activation=config.activation,
                     fusion_refinement=getattr(config, 'fusion_refinement', False),
                     enable_joint_gating=getattr(config, "enable_joint_gating", False),
+                    balance_branch_scales=getattr(config, "balance_branch_scales", True),
                     late_residual_boost=(
                         getattr(config, "late_residual_boost", 0.0)
                         if (

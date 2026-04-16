@@ -51,6 +51,12 @@ def coerce_model_config(value) -> HybridNGIMLConfig:
             betas=betas,
             eps=float(opt_value.get("eps", default_opt.eps)),
             freeze_backbone_epochs=int(opt_value.get("freeze_backbone_epochs", default_opt.freeze_backbone_epochs)),
+            freeze_residual_fusion_epochs=int(
+                opt_value.get(
+                    "freeze_residual_fusion_epochs",
+                    getattr(default_opt, "freeze_residual_fusion_epochs", 0),
+                )
+            ),
         )
 
     default_model = HybridNGIMLConfig()

@@ -559,6 +559,34 @@ def _set_backbone_trainable(model: HybridNGIML, trainable: bool) -> None:
             param.requires_grad = bool(trainable)
 
 
+def _set_aux_trainable(model: HybridNGIML, trainable: bool) -> None:
+    """Set trainability for non-backbone modules that can dominate early training."""
+    aux_modules = (
+        getattr(model, "noise", None),
+        getattr(model, "fusion", None),
+        getattr(model, "pre_decoder_adapters", None),
+    )
+    for module in aux_modules:
+        if module is None:
+            continue
+        for param in module.parameters():
+            param.requires_grad = bool(trainable)
+
+
+def _set_aux_trainability_for_epoch(
+    model: HybridNGIML,
+    epoch: int,
+    freeze_aux_epochs: int,
+) -> str:
+    """Freeze residual/fusion modules briefly to reduce early optimization imbalance."""
+    freeze_aux_epochs = int(max(0, freeze_aux_epochs))
+    if epoch < freeze_aux_epochs:
+        _set_aux_trainable(model, trainable=False)
+        return "frozen"
+    _set_aux_trainable(model, trainable=True)
+    return "trainable"
+
+
 def _backbone_trainable_groups(module: nn.Module) -> list[nn.Module]:
     """Return progressively-unfreezable groups for a backbone wrapper."""
     if hasattr(module, "backbone"):
@@ -1055,6 +1083,7 @@ __all__ = [
     "_segmentation_counts",
     "_select_threshold_with_precision_guard",
     "_set_backbone_trainability_for_epoch",
+    "_set_aux_trainability_for_epoch",
     "_should_disable_compile_for_device",
     "_size_bin_name",
     "_validate_startup_config",

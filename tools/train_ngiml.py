@@ -59,6 +59,7 @@ from src.training_loop_helpers import (
     _resolve_manifest_for_training,
     _segmentation_counts,
     _select_threshold_with_precision_guard,
+    _set_aux_trainability_for_epoch,
     _set_backbone_trainability_for_epoch,
     _should_disable_compile_for_device,
     _size_bin_name,
@@ -711,13 +712,20 @@ def run_training(cfg: TrainConfig) -> None:
     best_threshold_path = checkpoint_dir / "best_threshold.json"
 
     freeze_backbone_epochs = int(max(0, getattr(model_cfg.optimizer, "freeze_backbone_epochs", 0)))
+    freeze_aux_epochs = int(max(0, getattr(model_cfg.optimizer, "freeze_residual_fusion_epochs", 0)))
     backbone_phase: Optional[str] = None
+    aux_phase: Optional[str] = None
 
     for epoch in range(start_epoch, cfg.epochs):
         current_backbone_phase = _set_backbone_trainability_for_epoch(
             model,
             epoch=epoch,
             freeze_backbone_epochs=freeze_backbone_epochs,
+        )
+        current_aux_phase = _set_aux_trainability_for_epoch(
+            model,
+            epoch=epoch,
+            freeze_aux_epochs=freeze_aux_epochs,
         )
         if current_backbone_phase != backbone_phase:
             if current_backbone_phase == "frozen":
@@ -733,6 +741,15 @@ def run_training(cfg: TrainConfig) -> None:
                     f"{current_backbone_phase} backbone groups trainable"
                 )
             backbone_phase = current_backbone_phase
+        if current_aux_phase != aux_phase:
+            if current_aux_phase == "frozen":
+                print(
+                    "Aux freeze enabled: freezing Residual/Fusion adapters "
+                    f"for first {freeze_aux_epochs} epochs"
+                )
+            else:
+                print("Aux freeze finished: residual/fusion modules trainable")
+            aux_phase = current_aux_phase
 
         start_time = time.time()
         train_loss, global_step, train_positive_ratio = train_one_epoch(
