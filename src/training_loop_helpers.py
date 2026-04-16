@@ -265,54 +265,6 @@ def _initial_best_for_monitor(monitor: str) -> float:
     return float("-inf")
 
 
-def _resolve_validation_source(
-    *,
-    raw_metrics: dict,
-    ema_metrics: dict | None,
-    policy: str,
-    metric_key: str,
-) -> tuple[str, dict]:
-    """Select validation source (raw/ema) using a policy for a target metric."""
-    resolved_policy = str(policy).strip().lower()
-    if ema_metrics is None or resolved_policy == "raw":
-        return "raw", raw_metrics
-    if resolved_policy == "ema":
-        return "ema", ema_metrics
-
-    # "best": pick the source that is better for the monitored metric.
-    if str(metric_key).strip().lower() == "loss":
-        if float(ema_metrics.get("loss", float("inf"))) < float(raw_metrics.get("loss", float("inf"))):
-            return "ema", ema_metrics
-        return "raw", raw_metrics
-
-    raw_val = float(raw_metrics.get(metric_key, float("-inf")))
-    ema_val = float(ema_metrics.get(metric_key, float("-inf")))
-    if ema_val > raw_val:
-        return "ema", ema_metrics
-    return "raw", raw_metrics
-
-
-def _resolve_overlap_source(
-    *,
-    raw_metrics: dict,
-    ema_metrics: dict | None,
-    policy: str,
-) -> tuple[str, dict]:
-    """Select validation source for overlap checkpointing (IoU/F1)."""
-    resolved_policy = str(policy).strip().lower()
-    if ema_metrics is None or resolved_policy == "raw":
-        return "raw", raw_metrics
-    if resolved_policy == "ema":
-        return "ema", ema_metrics
-
-    # "best": maximize combined overlap score.
-    raw_score = 0.5 * (float(raw_metrics.get("iou", 0.0)) + float(raw_metrics.get("f1", 0.0)))
-    ema_score = 0.5 * (float(ema_metrics.get("iou", 0.0)) + float(ema_metrics.get("f1", 0.0)))
-    if ema_score > raw_score:
-        return "ema", ema_metrics
-    return "raw", raw_metrics
-
-
 def _size_bin_name(fg_ratio: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
     small_max = float(max(0.0, cfg.small_mask_ratio_max))
     medium_max = float(max(small_max, cfg.medium_mask_ratio_max))
@@ -848,20 +800,6 @@ def _validate_startup_config(cfg: TrainConfig, manifest_path: Path, device: torc
                 f"Got {cfg.metric_threshold}."
             )
 
-    allowed_source_policies = {"best", "ema", "raw"}
-    monitor_policy = str(getattr(cfg, "monitor_source_policy", "best")).strip().lower()
-    overlap_policy = str(getattr(cfg, "overlap_source_policy", "best")).strip().lower()
-    if monitor_policy not in allowed_source_policies:
-        raise ValueError(
-            "Invalid monitor_source_policy. "
-            f"Expected one of {sorted(allowed_source_policies)}, got {monitor_policy!r}."
-        )
-    if overlap_policy not in allowed_source_policies:
-        raise ValueError(
-            "Invalid overlap_source_policy. "
-            f"Expected one of {sorted(allowed_source_policies)}, got {overlap_policy!r}."
-        )
-
     split_counts = _manifest_split_counts(manifest_path)
     train_count = int(split_counts.get("train", 0))
     val_count = int(split_counts.get("val", 0))
@@ -1136,8 +1074,6 @@ __all__ = [
     "_metric_for_monitor",
     "_metrics_from_counts",
     "_monitor_improved",
-    "_resolve_overlap_source",
-    "_resolve_validation_source",
     "_parity_check",
     "_prepare_dataloaders",
     "_print_and_validate_train_dataset_integrity",

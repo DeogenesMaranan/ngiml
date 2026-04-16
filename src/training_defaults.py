@@ -127,8 +127,6 @@ def build_training_config(
         "early_stopping_patience": 5,
         "early_stopping_min_delta": 3e-3,
         "early_stopping_monitor": "loss",
-        "monitor_source_policy": "best",
-        "overlap_source_policy": "best",
         "metric_threshold": 0.5,
         "optimize_threshold": False,
         "foreground_ratio_max_batches": 20,
