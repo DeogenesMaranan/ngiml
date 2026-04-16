@@ -94,18 +94,65 @@ def compute_foreground_pixel_ratio(loader, max_batches: int | None = 200) -> flo
 
     This avoids iterating the entire dataset in slow or memory-constrained environments.
     """
+    probe_loader = loader
+    try:
+        num_workers = int(getattr(loader, "num_workers", 0) or 0)
+    except Exception:
+        num_workers = 0
+
+    if num_workers > 0:
+        try:
+            probe_kwargs = {
+                "dataset": loader.dataset,
+                "num_workers": 0,
+                "pin_memory": False,
+                "collate_fn": loader.collate_fn,
+            }
+            batch_sampler = getattr(loader, "batch_sampler", None)
+            if batch_sampler is not None:
+                probe_kwargs["batch_sampler"] = batch_sampler
+            else:
+                probe_kwargs["batch_size"] = int(getattr(loader, "batch_size", 1) or 1)
+                sampler = getattr(loader, "sampler", None)
+                if sampler is not None:
+                    probe_kwargs["sampler"] = sampler
+                probe_kwargs["drop_last"] = bool(getattr(loader, "drop_last", False))
+            probe_loader = torch.utils.data.DataLoader(**probe_kwargs)
+            print("Foreground sampling: using single-process probe loader for stability")
+        except Exception as e:
+            print(f"Foreground sampling: fallback to original loader ({e})")
+
     foreground = 0.0
     total = 0.0
-    for i, batch in enumerate(loader):
-        masks = batch["masks"]
-        masks = (masks > 0.5).float()
-        foreground += float(masks.sum().item())
-        total += float(masks.numel())
-        if (i + 1) % 10 == 0:
-            print(f"Foreground sampling: processed {i+1} batches")
-        if max_batches is not None and (i + 1) >= int(max_batches):
-            print(f"Foreground sampling: reached max_batches={max_batches}, stopping early")
-            break
+    iterator = None
+    try:
+        iterator = iter(probe_loader)
+        i = 0
+        while True:
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                break
+            masks = batch["masks"]
+            masks = (masks > 0.5).float()
+            foreground += float(masks.sum().item())
+            total += float(masks.numel())
+            i += 1
+            if i % 10 == 0:
+                print(f"Foreground sampling: processed {i} batches")
+            if max_batches is not None and i >= int(max_batches):
+                print(f"Foreground sampling: reached max_batches={max_batches}, stopping early")
+                break
+    except RuntimeError as e:
+        print(f"Foreground sampling warning: stopped early due to runtime error: {e}")
+    finally:
+        shutdown_workers = getattr(iterator, "_shutdown_workers", None) if iterator is not None else None
+        if callable(shutdown_workers):
+            try:
+                shutdown_workers()
+            except Exception:
+                # Best-effort cleanup only; this path must not fail startup.
+                pass
     if total <= 0:
         return 0.0
     return foreground / total
