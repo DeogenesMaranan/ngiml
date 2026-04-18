@@ -149,6 +149,12 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--threshold-step", type=float, default=0.02, help="Threshold search step size")
     parser.add_argument("--small-mask-ratio-max", type=float, default=0.01, help="Upper foreground-ratio bound for small-mask validation bin")
     parser.add_argument("--medium-mask-ratio-max", type=float, default=0.05, help="Upper foreground-ratio bound for medium-mask validation bin")
+    parser.add_argument(
+        "--allow-extreme-class-ratio",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow training to continue even when train split class ratio is extremely imbalanced",
+    )
     parser.add_argument("--compute-foreground-ratio", action=argparse.BooleanOptionalAction, default=True, help="Compute foreground pixel ratio from train loader")
     parser.add_argument(
         "--foreground-ratio-max-batches",
@@ -265,6 +271,7 @@ def parse_args() -> TrainConfig:
         threshold_step=args.threshold_step,
         small_mask_ratio_max=args.small_mask_ratio_max,
         medium_mask_ratio_max=args.medium_mask_ratio_max,
+        allow_extreme_class_ratio=args.allow_extreme_class_ratio,
         compute_foreground_ratio=args.compute_foreground_ratio,
         foreground_ratio_max_batches=max(0, int(args.foreground_ratio_max_batches)),
         short_side_probe_samples=max(0, int(args.short_side_probe_samples)),

@@ -56,26 +56,33 @@ def _columbia_mask_candidates(fake_stem: str) -> Sequence[str]:
 
 def default_specs() -> list[DatasetSpec]:
     return [
+        # DatasetSpec(
+        #     name="CASIA1",
+        #     real_dir="Au",
+        #     fake_dir="Tp",
+        #     mask_dir="Gt",
+        #     mask_stem_candidates=_casia1_mask_candidates,
+        # ),
+        # DatasetSpec(
+        #     name="Columbia",
+        #     real_dir=None,  # fakes + masks only
+        #     fake_dir="fake",
+        #     mask_dir="mask",
+        #     mask_stem_candidates=_columbia_mask_candidates,
+        # ),
+        # DatasetSpec(
+        #     name="COVERAGE",
+        #     real_dir="real",
+        #     fake_dir="fake",
+        #     mask_dir="mask",
+        #     mask_stem_candidates=_coverage_mask_candidates,
+        # ),
         DatasetSpec(
-            name="CASIA1",
+            name="CASIA2",
             real_dir="Au",
             fake_dir="Tp",
             mask_dir="Gt",
             mask_stem_candidates=_casia1_mask_candidates,
-        ),
-        DatasetSpec(
-            name="Columbia",
-            real_dir=None,  # fakes + masks only
-            fake_dir="fake",
-            mask_dir="mask",
-            mask_stem_candidates=_columbia_mask_candidates,
-        ),
-        DatasetSpec(
-            name="COVERAGE",
-            real_dir="real",
-            fake_dir="fake",
-            mask_dir="mask",
-            mask_stem_candidates=_coverage_mask_candidates,
         ),
     ]
 
@@ -225,6 +232,7 @@ def prepare_test_datasets(
     size: int,
     split_name: str,
     dataset_name: str | None,
+    fake_only: bool,
     max_samples: int,
     clean_output: bool,
     fail_on_missing_mask: bool,
@@ -258,8 +266,15 @@ def prepare_test_datasets(
         entries: list[tuple[str, Path, Path | None, int]] = []
 
         if spec.real_dir:
-            for image_path in discover_images(dataset_root / spec.real_dir, IMAGE_EXTENSIONS, return_empty_if_missing=True):
-                entries.append(("real", image_path, None, 0))
+            if fake_only:
+                print(f"[{spec.name}] Skipping real images (fake-only mode)")
+            else:
+                for image_path in discover_images(
+                    dataset_root / spec.real_dir,
+                    IMAGE_EXTENSIONS,
+                    return_empty_if_missing=True,
+                ):
+                    entries.append(("real", image_path, None, 0))
 
         if spec.fake_dir:
             for image_path in discover_images(dataset_root / spec.fake_dir, IMAGE_EXTENSIONS, return_empty_if_missing=True):
@@ -418,6 +433,12 @@ def parse_args() -> argparse.Namespace:
         help="Single dataset to process: CASIA1, Columbia, COVERAGE (default: all)",
     )
     parser.add_argument(
+        "--fake-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Process fake images only and skip real images (default: true)",
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
         default=0,
@@ -463,6 +484,7 @@ def main() -> None:
         size=int(args.size),
         split_name=str(args.split),
         dataset_name=args.dataset,
+        fake_only=bool(args.fake_only),
         max_samples=int(args.max_samples),
         clean_output=bool(args.clean),
         fail_on_missing_mask=bool(args.fail_on_missing_mask),

@@ -685,7 +685,11 @@ def _sample_has_mask(record) -> bool:
     return has_mask
 
 
-def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
+def _print_and_validate_train_dataset_integrity(
+    manifest_path: Path,
+    *,
+    allow_extreme_class_ratio: bool = False,
+) -> None:
     manifest = load_manifest(manifest_path)
     train_samples = [sample for sample in manifest.samples if sample.split == "train"]
     if not train_samples:
@@ -736,11 +740,15 @@ def _print_and_validate_train_dataset_integrity(manifest_path: Path) -> None:
 
     minority_ratio = min(real_count, fake_count) / max(total, 1)
     if minority_ratio < 0.01:
-        raise ValueError(
+        message = (
             "Train split class ratio is extreme "
             f"(real={real_count}, fake={fake_count}, total={total}). "
-            "Please rebalance data before training."
+            "This can hurt generalization."
         )
+        if allow_extreme_class_ratio:
+            print(f"WARNING: {message} Proceeding because allow_extreme_class_ratio=True.")
+        else:
+            raise ValueError(f"{message} Please rebalance data before training.")
 
 
 def _manifest_split_counts(manifest_path: Path) -> dict[str, int]:

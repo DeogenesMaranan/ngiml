@@ -68,6 +68,7 @@ class TrainConfig:
     threshold_step: float = 0.02
     small_mask_ratio_max: float = 0.01
     medium_mask_ratio_max: float = 0.05
+    allow_extreme_class_ratio: bool = False
     compute_foreground_ratio: bool = True
     foreground_ratio_max_batches: int = 20
     short_side_probe_samples: int = 0

@@ -588,7 +588,10 @@ def run_training(cfg: TrainConfig) -> None:
     _print_resolved_config_summary(cfg, normalization_mode_checked)
     _parity_check(cfg, Path(cfg.manifest), normalization_mode_checked)
 
-    _print_and_validate_train_dataset_integrity(Path(cfg.manifest))
+    _print_and_validate_train_dataset_integrity(
+        Path(cfg.manifest),
+        allow_extreme_class_ratio=bool(getattr(cfg, "allow_extreme_class_ratio", False)),
+    )
 
     loaders, per_dataset_aug, normalization_mode = _prepare_dataloaders(cfg, device)
     t_after_dataloaders = time.time()
