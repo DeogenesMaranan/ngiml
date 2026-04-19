@@ -53,6 +53,9 @@ def _coverage_mask_candidates(fake_stem: str) -> Sequence[str]:
 def _columbia_mask_candidates(fake_stem: str) -> Sequence[str]:
     return (f"{fake_stem}_edgemask", fake_stem)
 
+def _tampcoco_mask_candidates(fake_stem: str) -> Sequence[str]:
+    return (f"{fake_stem}", fake_stem)
+
 
 def default_specs() -> list[DatasetSpec]:
     return [
@@ -84,6 +87,13 @@ def default_specs() -> list[DatasetSpec]:
             mask_dir="Gt",
             mask_stem_candidates=_casia1_mask_candidates,
         ),
+        # DatasetSpec(
+        #     name="TampCOCO",
+        #     real_dir="Au",
+        #     fake_dir="tp",
+        #     mask_dir="mask",
+        #     mask_stem_candidates=_tampcoco_mask_candidates,
+        # ),
     ]
 
 
@@ -435,8 +445,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fake-only",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Process fake images only and skip real images (default: true)",
+        default=False,
+        help="Process fake images only and skip real images (default: false)",
     )
     parser.add_argument(
         "--max-samples",
