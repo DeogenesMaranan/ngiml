@@ -87,13 +87,6 @@ def default_specs() -> list[DatasetSpec]:
             mask_dir="Gt",
             mask_stem_candidates=_casia1_mask_candidates,
         ),
-        # DatasetSpec(
-        #     name="TampCOCO",
-        #     real_dir="Au",
-        #     fake_dir="tp",
-        #     mask_dir="mask",
-        #     mask_stem_candidates=_tampcoco_mask_candidates,
-        # ),
     ]
 
 
