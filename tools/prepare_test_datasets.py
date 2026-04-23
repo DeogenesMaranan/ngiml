@@ -59,34 +59,34 @@ def _tampcoco_mask_candidates(fake_stem: str) -> Sequence[str]:
 
 def default_specs() -> list[DatasetSpec]:
     return [
-        # DatasetSpec(
-        #     name="CASIA1",
-        #     real_dir="Au",
-        #     fake_dir="Tp",
-        #     mask_dir="Gt",
-        #     mask_stem_candidates=_casia1_mask_candidates,
-        # ),
-        # DatasetSpec(
-        #     name="Columbia",
-        #     real_dir=None,  # fakes + masks only
-        #     fake_dir="fake",
-        #     mask_dir="mask",
-        #     mask_stem_candidates=_columbia_mask_candidates,
-        # ),
-        # DatasetSpec(
-        #     name="COVERAGE",
-        #     real_dir="real",
-        #     fake_dir="fake",
-        #     mask_dir="mask",
-        #     mask_stem_candidates=_coverage_mask_candidates,
-        # ),
         DatasetSpec(
-            name="CASIA2",
+            name="CASIA1",
             real_dir="Au",
             fake_dir="Tp",
             mask_dir="Gt",
             mask_stem_candidates=_casia1_mask_candidates,
         ),
+        DatasetSpec(
+            name="Columbia",
+            real_dir=None,  # fakes + masks only
+            fake_dir="fake",
+            mask_dir="mask",
+            mask_stem_candidates=_columbia_mask_candidates,
+        ),
+        DatasetSpec(
+            name="COVERAGE",
+            real_dir="real",
+            fake_dir="fake",
+            mask_dir="mask",
+            mask_stem_candidates=_coverage_mask_candidates,
+        ),
+        # DatasetSpec(
+        #     name="CASIA2",
+        #     real_dir="Au",
+        #     fake_dir="Tp",
+        #     mask_dir="Gt",
+        #     mask_stem_candidates=_casia1_mask_candidates,
+        # ),
     ]
 
 
@@ -125,6 +125,11 @@ def _process_mask(mask_path: Path, size: int, original_hw: tuple[int, int], prep
     """Load and bring mask to size x size using the image preprocessing path."""
     mask = Image.open(mask_path).convert("L")
     h, w = original_hw
+
+    # Align mask to the source image geometry first.
+    # Some datasets contain mask files with a different stored resolution.
+    if mask.size != (w, h):
+        mask = mask.resize((w, h), resample=Image.NEAREST)
 
     if preproc_mode == "resize":
         if mask.size != (size, size):
@@ -314,6 +319,13 @@ def prepare_test_datasets(
             mask_np: np.ndarray | None = None
             if mask_path is not None:
                 mask_np = _process_mask(mask_path, size, original_hw, preproc_mode)
+                if mask_np.shape != image_np.shape[:2]:
+                    raise ValueError(
+                        "Prepared mask/image shape mismatch for "
+                        f"image={image_path} mask={mask_path}: "
+                        f"mask={mask_np.shape} image={image_np.shape[:2]} "
+                        f"(mode={preproc_mode})"
+                    )
 
             metadata: dict[str, object] = {
                 "dataset": spec.name,
@@ -420,7 +432,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--size",
         type=int,
-        default=448,
+        default=512,
         help="Target square size - images resized or padded to size x size (default: 448)",
     )
     parser.add_argument(
