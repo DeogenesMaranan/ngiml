@@ -432,7 +432,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--size",
         type=int,
-        default=512,
+        default=448,
         help="Target square size - images resized or padded to size x size (default: 448)",
     )
     parser.add_argument(
